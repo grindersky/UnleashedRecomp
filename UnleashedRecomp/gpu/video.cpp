@@ -3,6 +3,7 @@
 #include "imgui/imgui_common.h"
 #include "imgui/imgui_snapshot.h"
 #include "imgui/imgui_font_builder.h"
+#include "tas_swap_chain.h"
 
 #include <app.h>
 #include <bc_diff.h>
@@ -32,6 +33,7 @@
 #include <sdl_listener.h>
 #include <xxHashMap.h>
 #include <os/process.h>
+#include <tas_mode.h>
 
 #if defined(ASYNC_PSO_DEBUG) || defined(PSO_CACHING)
 #include <magic_enum/magic_enum.hpp>
@@ -1875,7 +1877,11 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         break;
     }
 
-    g_swapChain = g_queue->createSwapChain(GameWindow::s_renderWindow, bufferCount, BACKBUFFER_FORMAT, Config::MaxFrameLatency);
+    if (IsTasMode())
+        g_swapChain = std::make_unique<TasSwapChain>(g_device.get(), g_queue.get(), GameWindow::s_renderWindow, GameWindow::s_pWindow, BACKBUFFER_FORMAT);
+    else
+        g_swapChain = g_queue->createSwapChain(GameWindow::s_renderWindow, bufferCount, BACKBUFFER_FORMAT, Config::MaxFrameLatency);
+
     g_swapChain->setVsyncEnabled(Config::VSync);
     g_swapChainValid = !g_swapChain->needsResize();
 
@@ -2853,7 +2859,8 @@ void Video::Present()
     cmd.type = RenderCommandType::BeginCommandList;
     g_renderQueue.enqueue(cmd);
 
-    if (Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX)
+    // libTAS controls the frame rate, and this limiter would spin on its frozen clock.
+    if (Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX && !IsTasMode())
     {
         using namespace std::chrono_literals;
 
@@ -2977,7 +2984,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
     commandList->end();
 
-    if (g_swapChainValid)
+    // The TAS swap chain doesn't use semaphores, it presents synchronously after this submission.
+    if (g_swapChainValid && !IsTasMode())
     {
         const RenderCommandList *commandLists[] = { commandList.get() };
         RenderCommandSemaphore *waitSemaphores[] = { g_acquireSemaphores[g_frame].get() };

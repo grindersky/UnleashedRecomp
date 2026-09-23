@@ -27,6 +27,16 @@
 #include <ui/installer_wizard.h>
 #include <mod/mod_loader.h>
 #include <preload_executable.h>
+#include <tas_mode.h>
+
+#ifdef __linux__
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
 
 #ifdef _WIN32
 #include <timeapi.h>
@@ -192,10 +202,64 @@ void init()
 }
 #endif
 
+#ifdef __linux__
+// In TAS mode, report where a crash happened, since libTAS only tells us that the game died.
+static void TasCrashHandler(int sig, siginfo_t* info, void* context)
+{
+    char buffer[256];
+    int length = snprintf(buffer, sizeof(buffer), "\n=== TAS mode crash: signal %d, fault address %p, thread %ld ===\n",
+        sig, info->si_addr, long(syscall(SYS_gettid)));
+    write(STDERR_FILENO, buffer, length);
+
+    // The instruction that faulted, which the backtrace may not include.
+    auto* ucontext = static_cast<ucontext_t*>(context);
+    void* faultingInstruction = reinterpret_cast<void*>(ucontext->uc_mcontext.gregs[REG_RIP]);
+    Dl_info dlInfo{};
+    if (dladdr(faultingInstruction, &dlInfo) && dlInfo.dli_fname != nullptr)
+    {
+        length = snprintf(buffer, sizeof(buffer), "faulting instruction: %s(+0x%lx)\n",
+            dlInfo.dli_fname, uintptr_t(faultingInstruction) - uintptr_t(dlInfo.dli_fbase));
+        write(STDERR_FILENO, buffer, length);
+    }
+
+    void* frames[64];
+    int frameCount = backtrace(frames, std::size(frames));
+    backtrace_symbols_fd(frames, frameCount, STDERR_FILENO);
+
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void InstallTasCrashHandler()
+{
+    struct sigaction action{};
+    action.sa_sigaction = TasCrashHandler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSEGV, &action, nullptr);
+    sigaction(SIGBUS, &action, nullptr);
+    sigaction(SIGILL, &action, nullptr);
+    sigaction(SIGABRT, &action, nullptr);
+}
+#endif
+
 int main(int argc, char *argv[])
 {
 #ifdef _WIN32
     timeBeginPeriod(1);
+#endif
+
+#ifdef __linux__
+    if (IsTasMode())
+    {
+        InstallTasCrashHandler();
+
+        // Make libTAS track the threads lavapipe creates, so savestates can restore them.
+        StartTasThreadSpawner();
+
+        // Mesa's shader disk cache starts and stops its own threads and writes files in the background.
+        setenv("MESA_SHADER_CACHE_DISABLE", "true", 0);
+    }
 #endif
 
     os::process::CheckConsole();

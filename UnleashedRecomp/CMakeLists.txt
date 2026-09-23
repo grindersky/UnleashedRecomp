@@ -113,6 +113,7 @@ set(UNLEASHED_RECOMP_CPU_CXX_SOURCES
 
 set(UNLEASHED_RECOMP_GPU_CXX_SOURCES
     "gpu/video.cpp"
+    "gpu/tas_swap_chain.cpp"
     "gpu/imgui/imgui_common.cpp"
     "gpu/imgui/imgui_font_builder.cpp"
     "gpu/imgui/imgui_snapshot.cpp"
@@ -228,6 +229,7 @@ set(UNLEASHED_RECOMP_CXX_SOURCES
     "preload_executable.cpp"
     "sdl_listener.cpp"
     "stdafx.cpp"
+    "tas_mode.cpp"
     "version.cpp"
     
     ${UNLEASHED_RECOMP_KERNEL_CXX_SOURCES}
@@ -413,6 +415,10 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     find_package(X11 REQUIRED)
     target_include_directories(UnleashedRecomp PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(UnleashedRecomp PRIVATE ${X11_LIBRARIES})
+
+    # TAS mode overrides pthread_create for threads the Vulkan driver creates (see tas_mode.cpp).
+    target_link_options(UnleashedRecomp PRIVATE "LINKER:--export-dynamic-symbol=pthread_create")
+    target_link_libraries(UnleashedRecomp PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 target_precompile_headers(UnleashedRecomp PUBLIC ${UNLEASHED_RECOMP_PRECOMPILED_HEADERS})
