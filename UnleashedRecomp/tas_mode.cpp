@@ -1,5 +1,20 @@
 #include "tas_mode.h"
 
+#include <chrono>
+
+static uint64_t TasReadTimebase()
+{
+    // The Xbox 360 timebase runs at 49.875 MHz (what KeQueryPerformanceFrequency reports),
+    // so convert nanoseconds with 49875000 / 1000000000 = 399 / 8000, without overflowing.
+    uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    return (ns / 8000) * 399 + (ns % 8000) * 399 / 8000;
+}
+
+void InstallTasTimebase()
+{
+    g_ppcTimebaseOverride = TasReadTimebase;
+}
+
 #ifdef __linux__
 
 #include <dlfcn.h>

@@ -254,6 +254,9 @@ int main(int argc, char *argv[])
     {
         InstallTasCrashHandler();
 
+        // The guest otherwise reads the CPU's time stamp counter, which libTAS can't control.
+        InstallTasTimebase();
+
         // Make libTAS track the threads lavapipe creates, so savestates can restore them.
         StartTasThreadSpawner();
 
