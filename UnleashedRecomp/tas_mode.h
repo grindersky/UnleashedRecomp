@@ -17,6 +17,10 @@ inline bool IsTasMode()
     return s_tasMode;
 }
 
+// Makes the guest timebase (mftb) follow std::chrono::steady_clock, which libTAS controls,
+// instead of the CPU's time stamp counter. Must be called before guest code runs.
+void InstallTasTimebase();
+
 // Starts the thread that creates the Vulkan driver's threads on its behalf (see tas_mode.cpp).
 // Must be called before the Vulkan device is created.
 void StartTasThreadSpawner();
