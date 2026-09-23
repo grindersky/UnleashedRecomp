@@ -3,6 +3,7 @@
 #include <kernel/heap.h>
 #include <os/logger.h>
 #include <user/config.h>
+#include <tas_mode.h>
 
 static PPCFunc* g_clientCallback{};
 static uint32_t g_clientCallbackParam{}; // pointer in guest memory
@@ -80,6 +81,17 @@ static void AudioThread()
 
         auto now = std::chrono::steady_clock::now();
         constexpr auto INTERVAL = 1000000000ns * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ;
+
+        if (IsTasMode())
+        {
+            // libTAS fakes the clock and freezes it between frames, so spinning until
+            // the clock reaches the next interval would never finish. Sleep a full
+            // interval instead; how much audio gets produced is still decided by
+            // SDL_GetQueuedAudioSize, which libTAS drains according to game time.
+            std::this_thread::sleep_for(INTERVAL);
+            continue;
+        }
+
         auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);
 
         std::this_thread::sleep_for(std::chrono::floor<std::chrono::milliseconds>(next - now));
