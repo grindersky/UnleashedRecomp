@@ -4,6 +4,7 @@
 #include <hid/hid.h>
 #include <ui/game_window.h>
 #include <tas_mode.h>
+#include <ui/tas_hud.h>
 #include <cpu/guest_thread.h>
 #include <ranges>
 #include <unordered_set>
@@ -480,6 +481,9 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
         state->Gamepad.sThumbRX = 0;
         state->Gamepad.sThumbRY = 0;
     }
+
+    if (userIndex == 0 && TasHud::IsEnabled())
+        TasHud::OnInputState(state->Gamepad.sThumbLX, state->Gamepad.sThumbLY);
 
     ByteSwapInplace(state->Gamepad.wButtons);
     ByteSwapInplace(state->Gamepad.sThumbLX);
