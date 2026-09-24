@@ -9,17 +9,37 @@ TasSwapChain::TasSwapChain(RenderDevice* device, RenderCommandQueue* queue, Rend
     m_commandList = m_queue->createCommandList();
     m_fence = m_device->createCommandFence();
 
+    // A software renderer draws to the window surface too, but libTAS can draw its OSD with it.
+    m_renderer = SDL_CreateRenderer(m_sdlWindow, -1, SDL_RENDERER_SOFTWARE);
+    if (m_renderer == nullptr)
+        fprintf(stderr, "TAS mode: couldn't create an SDL software renderer (%s), presenting without libTAS's OSD.\n", SDL_GetError());
+
     resize();
 
     // libTAS picks how to capture the screen on its first frame boundary, which it can also insert
     // on its own while the game is loading. The Vulkan device already exists at this point, so unless
-    // it has seen a window surface update by then, it picks Vulkan capture and later crashes looking
-    // for swap chain images that don't exist. Present a black frame right away to prevent that.
-    if (SDL_Surface* surface = SDL_GetWindowSurface(m_sdlWindow))
+    // it has seen a renderer or window surface present by then, it picks Vulkan capture and later
+    // crashes looking for swap chain images that don't exist. Present a black frame right away.
+    if (m_renderer != nullptr)
+    {
+        SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 255);
+        SDL_RenderClear(m_renderer);
+        SDL_RenderPresent(m_renderer);
+    }
+    else if (SDL_Surface* surface = SDL_GetWindowSurface(m_sdlWindow))
     {
         SDL_FillRect(surface, nullptr, SDL_MapRGB(surface->format, 0, 0, 0));
         SDL_UpdateWindowSurface(m_sdlWindow);
     }
+}
+
+TasSwapChain::~TasSwapChain()
+{
+    if (m_frameTexture != nullptr)
+        SDL_DestroyTexture(m_frameTexture);
+
+    if (m_renderer != nullptr)
+        SDL_DestroyRenderer(m_renderer);
 }
 
 void TasSwapChain::GetWindowPixelSize(uint32_t& width, uint32_t& height) const
@@ -47,6 +67,21 @@ bool TasSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore** waitS
 
     m_queue->executeCommandLists(m_commandList.get(), m_fence.get());
     m_queue->waitForCommandFence(m_fence.get());
+
+    if (m_renderer != nullptr)
+    {
+        if (m_frameTexture != nullptr)
+        {
+            // Scaled to the window, which may have been resized since the frame was rendered.
+            SDL_UpdateTexture(m_frameTexture, nullptr, m_readbackBuffer->map(), int(m_width * 4));
+            m_readbackBuffer->unmap();
+            SDL_RenderCopy(m_renderer, m_frameTexture, nullptr, nullptr);
+        }
+
+        // libTAS treats this call as the frame boundary, and draws its OSD before presenting.
+        SDL_RenderPresent(m_renderer);
+        return true;
+    }
 
     SDL_Surface* surface = SDL_GetWindowSurface(m_sdlWindow);
     if (surface != nullptr)
@@ -91,6 +126,12 @@ bool TasSwapChain::resize()
 
     m_readbackBuffer.reset();
 
+    if (m_frameTexture != nullptr)
+    {
+        SDL_DestroyTexture(m_frameTexture);
+        m_frameTexture = nullptr;
+    }
+
     if (isEmpty())
         return false;
 
@@ -98,6 +139,15 @@ bool TasSwapChain::resize()
         texture = m_device->createTexture(RenderTextureDesc::Texture2D(m_width, m_height, 1, m_format, RenderTextureFlag::RENDER_TARGET));
 
     m_readbackBuffer = m_device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(m_width) * m_height * 4));
+
+    if (m_renderer != nullptr)
+    {
+        // B8G8R8A8 in memory is SDL's RGB888 (XRGB8888) on little-endian hosts. It has no alpha, so the
+        // frame's alpha channel isn't blended against what was there before.
+        m_frameTexture = SDL_CreateTexture(m_renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, int(m_width), int(m_height));
+        if (m_frameTexture == nullptr)
+            fprintf(stderr, "TAS mode: couldn't create the frame texture: %s\n", SDL_GetError());
+    }
 
     return true;
 }
