@@ -485,6 +485,16 @@ namespace TasScheduler
         g_tokenHolder = g_self;
         g_audioStart = g_virtualTime;
 
+        // libTAS calls exit() itself, e.g. when it loses its connection to the game. That runs static
+        // destructors while guest threads are still running or blocked here, and destroying the audio
+        // thread's std::thread aborts. Registered after the statics, this runs first and ends the process
+        // right away instead, like App::Exit().
+        std::atexit([]()
+        {
+            std::fflush(nullptr);
+            std::_Exit(0);
+        });
+
         // Where to report threads that keep a frame from ending, written with raw system calls so libTAS
         // doesn't intercept it. backtrace() is called once here, as its first call isn't signal-safe.
         if (const char* home = std::getenv("HOME"))

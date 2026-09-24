@@ -5,6 +5,7 @@
 #include <os/version.h>
 #include <app.h>
 #include <sdl_listener.h>
+#include <tas_mode.h>
 #include <SDL_syswm.h>
 
 #if _WIN32
@@ -161,7 +162,21 @@ void GameWindow::Init(const char* sdlVideoDriver)
     SDL_SetHint("SDL_APP_ID", "io.github.hedge_dev.unleashedrecomp");
 #endif
 
-    if (SDL_VideoInit(sdlVideoDriver) != 0 && sdlVideoDriver)
+    if (IsTasMode())
+    {
+        // libTAS only treats the game as an SDL2 game, and sends it SDL events such as the SDL_QUIT from
+        // its Stop button, if video is initialised through SDL_InitSubSystem, which it intercepts.
+        if (sdlVideoDriver)
+            SDL_SetHint(SDL_HINT_VIDEODRIVER, sdlVideoDriver);
+
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0 && sdlVideoDriver)
+        {
+            LOGFN_ERROR("Failed to initialise the SDL video driver: \"{}\". Falling back to default.", sdlVideoDriver);
+            SDL_SetHint(SDL_HINT_VIDEODRIVER, nullptr);
+            SDL_InitSubSystem(SDL_INIT_VIDEO);
+        }
+    }
+    else if (SDL_VideoInit(sdlVideoDriver) != 0 && sdlVideoDriver)
     {
         LOGFN_ERROR("Failed to initialise the SDL video driver: \"{}\". Falling back to default.", sdlVideoDriver);
         SDL_VideoInit(nullptr);
