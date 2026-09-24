@@ -162,6 +162,7 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
     "ui/message_window.cpp"
     "ui/options_menu.cpp"
     "ui/options_menu_thumbnails.cpp"
+    "ui/tas_hud.cpp"
     "ui/tv_static.cpp"
 )
 
