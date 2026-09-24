@@ -3,6 +3,7 @@
 #include <ui/game_window.h>
 #include <user/config.h>
 #include <app.h>
+#include <tas_mode.h>
 
 void DownForceDeltaTimeFixMidAsmHook(PPCRegister& f0)
 {
@@ -106,7 +107,12 @@ bool LoadingUpdateMidAsmHook(PPCRegister& r31)
     g_memory.FindFunction(update)(*g_ppcContext, base);
 
     bool loading = *SWA::SGlobals::ms_IsLoading;
-    if (loading)
+    if (loading && IsTasMode())
+    {
+        // Another thread presents the loading screen and waits for this one to block; run again next frame.
+        TasScheduler::Sleep();
+    }
+    else if (loading)
     {
         now = std::chrono::steady_clock::now();
         constexpr auto INTERVAL = 1000000000ns / 30;
@@ -122,6 +128,14 @@ bool LoadingUpdateMidAsmHook(PPCRegister& r31)
 PPC_FUNC_IMPL(__imp__sub_8312DBF8);
 PPC_FUNC(sub_8312DBF8)
 {
+    // The middleware's service threads wait here. Run them again at the next frame instead of after
+    // a real-time delay, so the TAS scheduler sees them as blocked and each frame does the same work.
+    if (IsTasMode())
+    {
+        TasScheduler::Sleep();
+        return;
+    }
+
     auto now = std::chrono::steady_clock::now();
     constexpr auto INTERVAL = 1000000000ns / 60;
     auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);

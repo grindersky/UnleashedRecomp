@@ -3,6 +3,7 @@
 #include "xdm.h"
 #include <hid/hid.h>
 #include <ui/game_window.h>
+#include <tas_mode.h>
 #include <cpu/guest_thread.h>
 #include <ranges>
 #include <unordered_set>
@@ -410,7 +411,9 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
 
     auto keyboardState = SDL_GetKeyboardState(NULL);
 
-    if (GameWindow::s_isFocused && !keyboardState[SDL_SCANCODE_LALT])
+    // In TAS mode, inputs come from libTAS, and whether the window happens to have focus (the user may be
+    // looking at libTAS during playback) mustn't decide whether they count.
+    if ((GameWindow::s_isFocused || IsTasMode()) && !keyboardState[SDL_SCANCODE_LALT])
     {
         if (keyboardState[Config::Key_LeftStickUp])
             state->Gamepad.sThumbLY = 32767;

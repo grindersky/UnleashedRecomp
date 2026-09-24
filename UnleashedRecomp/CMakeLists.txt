@@ -146,6 +146,7 @@ set(UNLEASHED_RECOMP_PATCHES_CXX_SOURCES
     "patches/object_patches.cpp"
     "patches/player_patches.cpp"
     "patches/resident_patches.cpp"
+    "patches/tas_patches.cpp"
     "patches/video_patches.cpp"
 )
 

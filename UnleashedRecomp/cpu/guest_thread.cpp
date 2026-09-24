@@ -4,6 +4,7 @@
 #include <kernel/heap.h>
 #include <kernel/function.h>
 #include "ppc_context.h"
+#include <tas_mode.h>
 
 constexpr size_t PCR_SIZE = 0xAB0;
 constexpr size_t TLS_SIZE = 0x100;
@@ -71,15 +72,26 @@ static void* GuestThreadFunc(void* arg)
 static void GuestThreadFunc(GuestThreadHandle* hThread)
 {
 #endif
-    hThread->suspended.wait(true);
-    GuestThread::Start(hThread->params);
+    if (IsTasMode())
+    {
+        TasScheduler::OnThreadStarted(hThread->tasThread);
+        TasScheduler::Wait([hThread]() { return !hThread->suspended; });
+        GuestThread::Start(hThread->params);
+        TasScheduler::OnThreadExited([hThread]() { hThread->exited = true; });
+    }
+    else
+    {
+        hThread->suspended.wait(true);
+        GuestThread::Start(hThread->params);
+    }
 #ifdef USE_PTHREAD
     return nullptr;
 #endif
 }
 
 GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
-    : params(params), suspended((params.flags & 0x1) != 0)
+    : params(params), suspended((params.flags & 0x1) != 0),
+      tasThread(IsTasMode() ? TasScheduler::OnThreadCreated() : nullptr)
 #ifdef USE_PTHREAD
 {
     pthread_attr_t attr;
@@ -128,6 +140,9 @@ uint32_t GuestThreadHandle::GetThreadId() const
 uint32_t GuestThreadHandle::Wait(uint32_t timeout)
 {
     assert(timeout == INFINITE);
+
+    if (IsTasMode())
+        TasScheduler::Wait([this]() { return exited.load(); });
 
 #ifdef USE_PTHREAD
     pthread_join(thread, nullptr);

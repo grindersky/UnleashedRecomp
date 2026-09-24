@@ -58,12 +58,30 @@ void XAudioInitializeSystem()
 
 static std::unique_ptr<std::thread> g_audioThread;
 static volatile bool g_audioThreadShouldExit;
+static void* g_audioTasThread; // The TAS scheduler's record of the audio thread.
 
 static void AudioThread()
 {
     using namespace std::chrono_literals;
 
     GuestThreadContext ctx(0);
+
+    if (IsTasMode())
+    {
+        // Produce exactly as much audio as libTAS's clock says is due, at points the scheduler
+        // controls, instead of whenever the audio queue runs low in real time.
+        TasScheduler::OnThreadStarted(g_audioTasThread);
+
+        while (!g_audioThreadShouldExit)
+        {
+            TasScheduler::WaitForAudioCallback();
+
+            ctx.ppcContext.r3.u32 = g_clientCallbackParam;
+            g_clientCallback(ctx.ppcContext, g_memory.base);
+        }
+
+        return;
+    }
 
     size_t channels = g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS;
 
@@ -81,17 +99,6 @@ static void AudioThread()
 
         auto now = std::chrono::steady_clock::now();
         constexpr auto INTERVAL = 1000000000ns * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ;
-
-        if (IsTasMode())
-        {
-            // libTAS fakes the clock and freezes it between frames, so spinning until
-            // the clock reaches the next interval would never finish. Sleep a full
-            // interval instead; how much audio gets produced is still decided by
-            // SDL_GetQueuedAudioSize, which libTAS drains according to game time.
-            std::this_thread::sleep_for(INTERVAL);
-            continue;
-        }
-
         auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);
 
         std::this_thread::sleep_for(std::chrono::floor<std::chrono::milliseconds>(next - now));
@@ -105,6 +112,11 @@ static void CreateAudioThread()
 {
     SDL_PauseAudioDevice(g_audioDevice, 0);
     g_audioThreadShouldExit = false;
+
+    // The audio thread runs guest code, so the TAS scheduler counts it like a guest thread.
+    if (IsTasMode())
+        g_audioTasThread = TasScheduler::OnThreadCreated();
+
     g_audioThread = std::make_unique<std::thread>(AudioThread);
 }
 
@@ -121,6 +133,30 @@ void XAudioRegisterClient(PPCFunc* callback, uint32_t param)
 
 void XAudioSubmitFrame(void* samples)
 {
+    if (IsTasMode())
+    {
+        // The TAS scheduler can run the audio thread faster than libTAS plays audio back (while the game
+        // loads, for example), and the queue would then grow: audio falls behind the picture, and libTAS
+        // eventually runs out of buffers. Keep only a few callbacks' worth queued and drop the rest; libTAS
+        // drains its queue by its own clock, so this is deterministic. The scheduler keeps about two frames
+        // (6 callbacks) queued, plus up to 4 produced per frame, so this is only reached when loading.
+        constexpr uint32_t MAX_QUEUED_FRAMES = 16;
+
+        // libTAS returns the queue length in samples, not in bytes like SDL does.
+        static const bool s_underLibTAS = std::getenv("LIBTAS_LIBRARY_PATH") != nullptr;
+        const uint32_t channels = g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS;
+        const uint32_t frameSize = s_underLibTAS ? XAUDIO_NUM_SAMPLES : channels * XAUDIO_NUM_SAMPLES * uint32_t(sizeof(float));
+
+        const uint32_t queued = SDL_GetQueuedAudioSize(g_audioDevice);
+        const bool drop = queued / frameSize >= MAX_QUEUED_FRAMES;
+
+        if (TasTrace::IsEnabled())
+            TasTrace::OnAudioSubmit(drop, s_underLibTAS ? queued : queued / (channels * uint32_t(sizeof(float))));
+
+        if (drop)
+            return;
+    }
+
     auto floatSamples = reinterpret_cast<be<float>*>(samples);
 
     if (g_downMixToStereo)

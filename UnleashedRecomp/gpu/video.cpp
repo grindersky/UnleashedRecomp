@@ -2794,8 +2794,15 @@ void Video::WaitOnSwapChain()
 static bool g_shouldPrecompilePipelines;
 static std::atomic<bool> g_executedCommandList;
 
-void Video::Present() 
+void Video::Present()
 {
+    // Let background guest threads finish their work first, so every frame contains the same amount of it.
+    if (IsTasMode())
+    {
+        TasScheduler::WaitForOtherThreads();
+        TasTrace::OnFrame();
+    }
+
     g_readyForCommands = false;
 
     RenderCommand cmd;
@@ -2808,9 +2815,13 @@ void Video::Present()
     g_renderQueue.enqueue(cmd);
 
     // All the shaders are available at this point. We can precompile embedded PSOs then.
+    // Not in TAS mode, where it would create vertex declarations on another thread at a point
+    // depending on how fast the host is (see GetDatabaseDataMidAsmHook).
     if (g_shouldPrecompilePipelines)
     {
-        EnqueuePipelineTask(PipelineTaskType::PrecompilePipelines, {});
+        if (!IsTasMode())
+            EnqueuePipelineTask(PipelineTaskType::PrecompilePipelines, {});
+
         g_shouldPrecompilePipelines = false;
     }
 
@@ -2829,6 +2840,10 @@ void Video::Present()
         RenderCommandSemaphore* signalSemaphores[] = { g_renderSemaphores[g_frame].get() };
         g_swapChainValid = g_swapChain->present(g_backBufferIndex, signalSemaphores, std::size(signalSemaphores));
     }
+
+    // The frame boundary has passed: sleeping threads and audio may run again.
+    if (IsTasMode())
+        TasScheduler::AdvanceFrame();
 
     g_pendingWaitOnSwapChain = true;
 
@@ -6955,6 +6970,23 @@ PPC_FUNC(sub_825369A0)
     assert(std::this_thread::get_id() == g_mainThreadId);
 
     // Wait for pipeline compilations to finish.
+    if (IsTasMode())
+    {
+        // Compilation runs on host threads that may need other guest threads to make progress, so let
+        // them run meanwhile. Frames don't end while waiting, so compile times don't change the loading.
+        // More tasks can be queued while the run token is taken back, so only stop waiting once there are
+        // none left while holding it; waiting below while holding it would deadlock.
+        while (g_compilingPipelineTaskCount.load() != 0)
+        {
+            TasScheduler::WaitForHost([]()
+            {
+                SDL_PumpEvents();
+                SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+                return g_compilingPipelineTaskCount.load() == 0;
+            });
+        }
+    }
+
     uint32_t value;
     while ((value = g_compilingPipelineTaskCount.load()) != 0)
     {
@@ -6969,10 +7001,28 @@ PPC_FUNC(sub_825369A0)
     __imp__sub_825369A0(ctx, base);
 }
 
+// In TAS mode, wait for the data's pipelines to finish compiling instead of reporting it as not made yet.
+// Compilation runs on host threads, so otherwise the point where the game sees the data as ready would
+// depend on how fast the host compiles, and loading would take a different amount of work each run.
+static void TasWaitForPipelineCompilation(uint8_t* base, uint32_t databaseData)
+{
+    auto* data = reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + databaseData);
+
+    if (IsTasMode() && (data->m_Flags & eDatabaseDataFlags_CompilingPipelines))
+    {
+        TasScheduler::WaitForHost([data]()
+        {
+            return (std::atomic_ref(data->m_Flags).load() & eDatabaseDataFlags_CompilingPipelines) == 0;
+        });
+    }
+}
+
 // CModelData::CheckMadeAll
 PPC_FUNC_IMPL(__imp__sub_82E2EFB0);
 PPC_FUNC(sub_82E2EFB0)
-{   
+{
+    TasWaitForPipelineCompilation(base, ctx.r3.u32);
+
     if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
     {
         ctx.r3.u64 = 0;
@@ -6986,7 +7036,9 @@ PPC_FUNC(sub_82E2EFB0)
 // CTerrainModelData::CheckMadeAll
 PPC_FUNC_IMPL(__imp__sub_82E243D8);
 PPC_FUNC(sub_82E243D8)
-{   
+{
+    TasWaitForPipelineCompilation(base, ctx.r3.u32);
+
     if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
     {
         ctx.r3.u64 = 0;
@@ -7000,7 +7052,9 @@ PPC_FUNC(sub_82E243D8)
 // CParticleMaterial::CheckMadeAll
 PPC_FUNC_IMPL(__imp__sub_82E87598);
 PPC_FUNC(sub_82E87598)
-{   
+{
+    TasWaitForPipelineCompilation(base, ctx.r3.u32);
+
     if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
     {
         ctx.r3.u64 = 0;
@@ -7013,6 +7067,12 @@ PPC_FUNC(sub_82E87598)
 
 void GetDatabaseDataMidAsmHook(PPCRegister& r1, PPCRegister& r4)
 {
+    // In TAS mode, don't precompile the pipelines of data as it loads. That runs on host threads which
+    // read and release the game's data (possibly freeing it) at points depending on how fast the host is,
+    // which desyncs movies. Pipelines are then compiled when first drawn, which only affects visuals.
+    if (IsTasMode())
+        return;
+
     auto& databaseData = *reinterpret_cast<boost::shared_ptr<Hedgehog::Database::CDatabaseData>*>(
         g_memory.Translate(r1.u32 + 0x58));
 

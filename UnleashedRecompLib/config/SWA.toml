@@ -1153,3 +1153,16 @@ registers = ["f1"]
 name = "CEvilSonicContext_CStateWall_LeaveRotationMidAsmHook"
 address = 0x82406774
 registers = ["f1"]
+
+# TAS mode: the audio library spins here, polling a task's status until another thread has advanced it.
+# Only reached when the loop comes around again, so always yield.
+[[midasm_hook]]
+name = "TasSpinYieldMidAsmHook"
+address = 0x8316CFE0
+registers = ["r3"]
+
+# TAS mode: stopping a sound spins here, updating its streams until they have stopped, which needs the
+# audio thread to run. Let the thread yield so it can.
+[[midasm_hook]]
+name = "TasStreamStopWaitMidAsmHook"
+address = 0x83148E78
