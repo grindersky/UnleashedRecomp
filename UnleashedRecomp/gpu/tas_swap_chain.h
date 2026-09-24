@@ -11,10 +11,12 @@ using namespace plume;
 // A swap chain used in TAS mode (UNLEASHED_TAS_MODE=1) in place of the Vulkan one.
 //
 // Frames are rendered into ordinary textures, read back to CPU memory and shown with
-// SDL's window surface. This keeps every piece of presentation state inside the process
-// (no WSI threads, present fences or compositor round trips), which is what libTAS needs
-// to be able to save and load states. Presenting is synchronous, and semaphores are not
-// used: the frame's command list must be submitted to the same queue before present().
+// SDL's software renderer (or its window surface, if that can't be created). This keeps
+// every piece of presentation state inside the process (no WSI threads, present fences or
+// compositor round trips), which is what libTAS needs to be able to save and load states,
+// and SDL_RenderPresent is where libTAS draws its OSD. Presenting is synchronous, and
+// semaphores are not used: the frame's command list must be submitted to the same queue
+// before present().
 struct TasSwapChain : RenderSwapChain
 {
     static constexpr uint32_t TextureCount = 2;
@@ -24,6 +26,8 @@ struct TasSwapChain : RenderSwapChain
     RenderWindow m_renderWindow;
     SDL_Window* m_sdlWindow;
     RenderFormat m_format;
+    SDL_Renderer* m_renderer = nullptr;
+    SDL_Texture* m_frameTexture = nullptr;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -35,6 +39,7 @@ struct TasSwapChain : RenderSwapChain
     std::unique_ptr<RenderCommandFence> m_fence;
 
     TasSwapChain(RenderDevice* device, RenderCommandQueue* queue, RenderWindow renderWindow, SDL_Window* sdlWindow, RenderFormat format);
+    ~TasSwapChain() override;
 
     bool present(uint32_t textureIndex, RenderCommandSemaphore** waitSemaphores, uint32_t waitSemaphoreCount) override;
     void wait() override;
