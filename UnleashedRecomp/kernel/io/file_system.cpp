@@ -7,6 +7,7 @@
 #include <os/logger.h>
 #include <user/config.h>
 #include <stdafx.h>
+#include <tas_mode.h>
 
 struct FileHandle : KernelObject
 {
@@ -176,6 +177,9 @@ uint32_t XReadFile
         }
     }
 
+    if (TasTrace::IsEnabled())
+        TasTrace::OnFileRead(hFile->path.filename().string().c_str(), uint64_t(hFile->stream.tellg()), nNumberOfBytesToRead);
+
     uint32_t numberOfBytesRead;
     hFile->stream.read((char *)(lpBuffer), nNumberOfBytesToRead);
     if (!hFile->stream.bad())
@@ -319,6 +323,9 @@ uint32_t XReadFileEx(FileHandle* hFile, void* lpBuffer, uint32_t nNumberOfBytesT
     hFile->stream.seekg(streamOffset, std::ios::beg);
     if (hFile->stream.bad())
         return FALSE;
+
+    if (TasTrace::IsEnabled())
+        TasTrace::OnFileRead(hFile->path.filename().string().c_str(), uint64_t(streamOffset), nNumberOfBytesToRead);
 
     hFile->stream.read((char *)(lpBuffer), nNumberOfBytesToRead);
     if (!hFile->stream.bad())

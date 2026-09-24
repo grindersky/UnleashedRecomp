@@ -1,5 +1,6 @@
 #include "hid.h"
 #include <ui/game_window.h>
+#include <tas_mode.h>
 #include <user/config.h>
 
 hid::EInputDevice hid::g_inputDevice;
@@ -19,7 +20,8 @@ void hid::SetProhibitedInputs(uint16_t wButtons, bool leftStick, bool rightStick
 
 bool hid::IsInputAllowed()
 {
-    return GameWindow::s_isFocused || Config::AllowBackgroundInput;
+    // In TAS mode, inputs come from libTAS regardless of which window has focus.
+    return GameWindow::s_isFocused || Config::AllowBackgroundInput || IsTasMode();
 }
 
 bool hid::IsInputDeviceController()

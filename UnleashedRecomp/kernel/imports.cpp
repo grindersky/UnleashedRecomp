@@ -12,6 +12,7 @@
 #include "xdm.h"
 #include <user/config.h>
 #include <os/logger.h>
+#include <tas_mode.h>
 
 #ifdef _WIN32
 #include <ntstatus.h>
@@ -32,8 +33,27 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     {
     }
 
+    // Only used in TAS mode, under the scheduler lock.
+    bool TryAcquire()
+    {
+        if (manualReset)
+            return signaled;
+
+        return signaled.exchange(false);
+    }
+
     uint32_t Wait(uint32_t timeout) override
     {
+        if (IsTasMode())
+        {
+            if (timeout == 0)
+                return TasScheduler::Run([this]() { return TryAcquire(); }) ? STATUS_SUCCESS : STATUS_TIMEOUT;
+
+            assert(timeout == INFINITE && "Unhandled timeout value.");
+            TasScheduler::Wait([this]() { return TryAcquire(); });
+            return STATUS_SUCCESS;
+        }
+
         if (timeout == 0)
         {
             if (manualReset)
@@ -76,6 +96,12 @@ struct Event final : KernelObject, HostObject<XKEVENT>
 
     bool Set()
     {
+        if (IsTasMode())
+        {
+            TasScheduler::Modify([this]() { signaled = true; });
+            return TRUE;
+        }
+
         signaled = true;
 
         if (manualReset)
@@ -88,6 +114,12 @@ struct Event final : KernelObject, HostObject<XKEVENT>
 
     bool Reset()
     {
+        if (IsTasMode())
+        {
+            TasScheduler::Modify([this]() { signaled = false; });
+            return TRUE;
+        }
+
         signaled = false;
         return TRUE;
     }
@@ -110,8 +142,28 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
     {
     }
 
+    // Only used in TAS mode, under the scheduler lock.
+    bool TryAcquire()
+    {
+        if (count == 0)
+            return false;
+
+        count--;
+        return true;
+    }
+
     uint32_t Wait(uint32_t timeout) override
     {
+        if (IsTasMode())
+        {
+            if (timeout == 0)
+                return TasScheduler::Run([this]() { return TryAcquire(); }) ? STATUS_SUCCESS : STATUS_TIMEOUT;
+
+            assert(timeout == INFINITE && "Unhandled timeout value.");
+            TasScheduler::Wait([this]() { return TryAcquire(); });
+            return STATUS_SUCCESS;
+        }
+
         if (timeout == 0)
         {
             uint32_t currentCount = count.load();
@@ -151,6 +203,19 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 
     void Release(uint32_t releaseCount, uint32_t* previousCount)
     {
+        if (IsTasMode())
+        {
+            TasScheduler::Modify([&]()
+            {
+                if (previousCount != nullptr)
+                    *previousCount = count;
+
+                count += releaseCount;
+            });
+
+            return;
+        }
+
         if (previousCount != nullptr)
             *previousCount = count;
 
@@ -569,6 +634,13 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* 
 
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
+    if (IsTasMode())
+    {
+        // Sleep on the scheduler's virtual clock, not in real time, so the amount of work done per frame is fixed.
+        TasScheduler::SleepFor(timeout);
+        return STATUS_SUCCESS;
+    }
+
 #ifdef _WIN32
     Sleep(timeout);
 #else
@@ -662,6 +734,13 @@ uint32_t NtSuspendThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
 {
     assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE) && hThread->GetThreadId() == GuestThread::GetCurrentThreadId());
 
+    if (IsTasMode())
+    {
+        TasScheduler::Modify([hThread]() { hThread->suspended = true; });
+        TasScheduler::Wait([hThread]() { return !hThread->suspended; });
+        return S_OK;
+    }
+
     hThread->suspended = true;
     hThread->suspended.wait(true);
 
@@ -678,6 +757,19 @@ uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint32_t>* l
 
 void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 {
+    if (IsTasMode())
+    {
+        TasScheduler::Modify([cs]()
+        {
+            cs->RecursionCount--;
+
+            if (cs->RecursionCount == 0)
+                cs->OwningThread = 0;
+        });
+
+        return;
+    }
+
     cs->RecursionCount--;
 
     if (cs->RecursionCount != 0)
@@ -693,9 +785,27 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
     uint32_t thisThread = g_ppcContext->r13.u32;
     assert(thisThread != NULL);
 
+    if (IsTasMode())
+    {
+        TasScheduler::NoteWaitingOnLock(g_memory.MapVirtual(cs), cs->OwningThread);
+
+        TasScheduler::Wait([cs, thisThread]()
+        {
+            if (cs->OwningThread != 0 && cs->OwningThread != thisThread)
+                return false;
+
+            cs->OwningThread = thisThread;
+            cs->RecursionCount++;
+            return true;
+        });
+
+        TasScheduler::NoteWaitingOnLock(0, 0);
+        return;
+    }
+
     std::atomic_ref owningThread(cs->OwningThread);
 
-    while (true) 
+    while (true)
     {
         uint32_t previousOwner = 0;
 
@@ -754,14 +864,40 @@ void RtlRaiseException_x()
     LOG_UTILITY("!!! STUB !!!");
 }
 
+// Spinning would never let a lock's owner run under the TAS scheduler, so these wait through it instead.
+static void TasAcquireSpinLock(uint32_t* spinLock)
+{
+    uint32_t thisThread = g_ppcContext->r13.u32;
+
+    TasScheduler::Wait([spinLock, thisThread]()
+    {
+        if (*spinLock != 0)
+            return false;
+
+        *spinLock = thisThread;
+        return true;
+    });
+}
+
+static void TasReleaseSpinLock(uint32_t* spinLock)
+{
+    TasScheduler::Modify([spinLock]() { *spinLock = 0; });
+}
+
 void KfReleaseSpinLock(uint32_t* spinLock)
 {
+    if (IsTasMode())
+        return TasReleaseSpinLock(spinLock);
+
     std::atomic_ref spinLockRef(*spinLock);
     spinLockRef = 0;
 }
 
 void KfAcquireSpinLock(uint32_t* spinLock)
 {
+    if (IsTasMode())
+        return TasAcquireSpinLock(spinLock);
+
     std::atomic_ref spinLockRef(*spinLock);
 
     while (true)
@@ -803,12 +939,18 @@ void VdGetSystemCommandBuffer()
 
 void KeReleaseSpinLockFromRaisedIrql(uint32_t* spinLock)
 {
+    if (IsTasMode())
+        return TasReleaseSpinLock(spinLock);
+
     std::atomic_ref spinLockRef(*spinLock);
     spinLockRef = 0;
 }
 
 void KeAcquireSpinLockAtRaisedIrql(uint32_t* spinLock)
 {
+    if (IsTasMode())
+        return TasAcquireSpinLock(spinLock);
+
     std::atomic_ref spinLockRef(*spinLock);
 
     while (true)
@@ -1203,6 +1345,19 @@ bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
     uint32_t thisThread = g_ppcContext->r13.u32;
     assert(thisThread != NULL);
 
+    if (IsTasMode())
+    {
+        return TasScheduler::Run([cs, thisThread]()
+        {
+            if (cs->OwningThread != 0 && cs->OwningThread != thisThread)
+                return false;
+
+            cs->OwningThread = thisThread;
+            cs->RecursionCount++;
+            return true;
+        });
+    }
+
     std::atomic_ref owningThread(cs->OwningThread);
 
     uint32_t previousOwner = 0;
@@ -1316,6 +1471,12 @@ uint32_t NtClearEvent(Event* handle, uint32_t* previousState)
 uint32_t NtResumeThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
 {
     assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE));
+
+    if (IsTasMode())
+    {
+        TasScheduler::Modify([hThread]() { hThread->suspended = false; });
+        return S_OK;
+    }
 
     hThread->suspended = false;
     hThread->suspended.notify_all();
@@ -1518,6 +1679,29 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
 
         for (size_t i = 0; i < Count; i++)
             s_events[i] = QueryKernelObject<Event>(*Objects[i]);
+
+        if (IsTasMode())
+        {
+            // The check may run on whichever thread wakes this one, so don't use the thread-local vector in it.
+            std::vector<Event*> events(s_events);
+            size_t signaledIndex = 0;
+
+            TasScheduler::Wait([&]()
+            {
+                for (size_t i = 0; i < events.size(); i++)
+                {
+                    if (events[i]->TryAcquire())
+                    {
+                        signaledIndex = i;
+                        return true;
+                    }
+                }
+
+                return false;
+            });
+
+            return STATUS_WAIT_0 + signaledIndex;
+        }
 
         while (true)
         {

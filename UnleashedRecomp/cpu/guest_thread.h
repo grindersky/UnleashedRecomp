@@ -33,6 +33,10 @@ struct GuestThreadHandle : KernelObject
 {
     GuestThreadParams params;
     std::atomic<bool> suspended;
+    std::atomic<bool> exited{ false }; // Only used in TAS mode.
+    // The TAS scheduler's record of this thread. Must be declared before the thread member, so it's set
+    // before the thread starts.
+    void* tasThread = nullptr;
 #ifdef USE_PTHREAD
     pthread_t thread;
 #else

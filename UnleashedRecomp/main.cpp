@@ -428,6 +428,9 @@ int main(int argc, char *argv[])
 
     Video::StartPipelinePrecompilation();
 
+    if (IsTasMode())
+        TasScheduler::InitMainThread();
+
     GuestThread::Start({ entry, 0, 0 });
 
     return 0;
