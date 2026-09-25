@@ -1166,3 +1166,9 @@ registers = ["r3"]
 [[midasm_hook]]
 name = "TasStreamStopWaitMidAsmHook"
 address = 0x83148E78
+
+# TAS mode: another loop stopping a sound (in sub_8314A410), polling its status and updating its streams
+# until it has stopped. Reached when loading a stage while a sound is still stopping (e.g. on a fresh save).
+[[midasm_hook]]
+name = "TasStreamStopWaitMidAsmHook"
+address = 0x8314A498

@@ -7,8 +7,8 @@
 // spin-wait but drains a voice's list of consumed buffers, which always terminates. Yielding there made
 // the virtual clock jump to the next audio callback for every entry, running audio ~12x too fast.
 
-// The head of a loop in the audio library (in sub_83148E40) that stops a sound: it updates the sound's
-// streams, without ever blocking, until they've all stopped, which needs the audio thread to run.
+// The heads of loops in the audio library (in sub_83148E40 and sub_8314A410) that stop a sound: they update
+// the sound's streams, without ever blocking, until it has stopped, which needs the audio thread to run.
 void TasStreamStopWaitMidAsmHook()
 {
     if (IsTasMode())
