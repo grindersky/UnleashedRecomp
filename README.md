@@ -19,7 +19,7 @@ Put your own game files in `UnleashedRecompLib/private/` before building, as for
 ## Running it
 
 ```bash
-UNLEASHED_TAS_MODE=1 libTAS > ~/libtas.log 2>&1
+UNLEASHED_TAS_MODE=1 libTAS
 ```
 
 Add `UNLEASHED_TAS_HUD=1` for the speedometer and stick overlay (it's drawn into the frames, so it also shows up
