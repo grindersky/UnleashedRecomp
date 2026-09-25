@@ -1,0 +1,2757 @@
+diff --git a/UnleashedRecomp/CMakeLists.txt b/UnleashedRecomp/CMakeLists.txt
+index 01e040a..42e2099 100644
+--- a/UnleashedRecomp/CMakeLists.txt
++++ b/UnleashedRecomp/CMakeLists.txt
+@@ -113,6 +113,7 @@ set(UNLEASHED_RECOMP_CPU_CXX_SOURCES
+ 
+ set(UNLEASHED_RECOMP_GPU_CXX_SOURCES
+     "gpu/video.cpp"
++    "gpu/tas_swap_chain.cpp"
+     "gpu/imgui/imgui_common.cpp"
+     "gpu/imgui/imgui_font_builder.cpp"
+     "gpu/imgui/imgui_snapshot.cpp"
+@@ -145,6 +146,7 @@ set(UNLEASHED_RECOMP_PATCHES_CXX_SOURCES
+     "patches/object_patches.cpp"
+     "patches/player_patches.cpp"
+     "patches/resident_patches.cpp"
++    "patches/tas_patches.cpp"
+     "patches/video_patches.cpp"
+ )
+ 
+@@ -160,6 +162,7 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
+     "ui/message_window.cpp"
+     "ui/options_menu.cpp"
+     "ui/options_menu_thumbnails.cpp"
++    "ui/tas_hud.cpp"
+     "ui/tv_static.cpp"
+ )
+ 
+@@ -228,6 +231,7 @@ set(UNLEASHED_RECOMP_CXX_SOURCES
+     "preload_executable.cpp"
+     "sdl_listener.cpp"
+     "stdafx.cpp"
++    "tas_mode.cpp"
+     "version.cpp"
+     
+     ${UNLEASHED_RECOMP_KERNEL_CXX_SOURCES}
+@@ -413,6 +417,10 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+     find_package(X11 REQUIRED)
+     target_include_directories(UnleashedRecomp PRIVATE ${X11_INCLUDE_DIR})
+     target_link_libraries(UnleashedRecomp PRIVATE ${X11_LIBRARIES})
++
++    # TAS mode overrides pthread_create for threads the Vulkan driver creates (see tas_mode.cpp).
++    target_link_options(UnleashedRecomp PRIVATE "LINKER:--export-dynamic-symbol=pthread_create")
++    target_link_libraries(UnleashedRecomp PRIVATE ${CMAKE_DL_LIBS})
+ endif()
+ 
+ target_precompile_headers(UnleashedRecomp PUBLIC ${UNLEASHED_RECOMP_PRECOMPILED_HEADERS})
+diff --git a/UnleashedRecomp/apu/driver/sdl2_driver.cpp b/UnleashedRecomp/apu/driver/sdl2_driver.cpp
+index d104e81..9d91576 100644
+--- a/UnleashedRecomp/apu/driver/sdl2_driver.cpp
++++ b/UnleashedRecomp/apu/driver/sdl2_driver.cpp
+@@ -3,6 +3,7 @@
+ #include <kernel/heap.h>
+ #include <os/logger.h>
+ #include <user/config.h>
++#include <tas_mode.h>
+ 
+ static PPCFunc* g_clientCallback{};
+ static uint32_t g_clientCallbackParam{}; // pointer in guest memory
+@@ -57,6 +58,7 @@ void XAudioInitializeSystem()
+ 
+ static std::unique_ptr<std::thread> g_audioThread;
+ static volatile bool g_audioThreadShouldExit;
++static void* g_audioTasThread; // The TAS scheduler's record of the audio thread.
+ 
+ static void AudioThread()
+ {
+@@ -64,6 +66,23 @@ static void AudioThread()
+ 
+     GuestThreadContext ctx(0);
+ 
++    if (IsTasMode())
++    {
++        // Produce exactly as much audio as libTAS's clock says is due, at points the scheduler
++        // controls, instead of whenever the audio queue runs low in real time.
++        TasScheduler::OnThreadStarted(g_audioTasThread);
++
++        while (!g_audioThreadShouldExit)
++        {
++            TasScheduler::WaitForAudioCallback();
++
++            ctx.ppcContext.r3.u32 = g_clientCallbackParam;
++            g_clientCallback(ctx.ppcContext, g_memory.base);
++        }
++
++        return;
++    }
++
+     size_t channels = g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS;
+ 
+     while (!g_audioThreadShouldExit)
+@@ -93,6 +112,11 @@ static void CreateAudioThread()
+ {
+     SDL_PauseAudioDevice(g_audioDevice, 0);
+     g_audioThreadShouldExit = false;
++
++    // The audio thread runs guest code, so the TAS scheduler counts it like a guest thread.
++    if (IsTasMode())
++        g_audioTasThread = TasScheduler::OnThreadCreated();
++
+     g_audioThread = std::make_unique<std::thread>(AudioThread);
+ }
+ 
+@@ -109,6 +133,30 @@ void XAudioRegisterClient(PPCFunc* callback, uint32_t param)
+ 
+ void XAudioSubmitFrame(void* samples)
+ {
++    if (IsTasMode())
++    {
++        // The TAS scheduler can run the audio thread faster than libTAS plays audio back (while the game
++        // loads, for example), and the queue would then grow: audio falls behind the picture, and libTAS
++        // eventually runs out of buffers. Keep only a few callbacks' worth queued and drop the rest; libTAS
++        // drains its queue by its own clock, so this is deterministic. The scheduler keeps about two frames
++        // (6 callbacks) queued, plus up to 4 produced per frame, so this is only reached when loading.
++        constexpr uint32_t MAX_QUEUED_FRAMES = 16;
++
++        // libTAS returns the queue length in samples, not in bytes like SDL does.
++        static const bool s_underLibTAS = std::getenv("LIBTAS_LIBRARY_PATH") != nullptr;
++        const uint32_t channels = g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS;
++        const uint32_t frameSize = s_underLibTAS ? XAUDIO_NUM_SAMPLES : channels * XAUDIO_NUM_SAMPLES * uint32_t(sizeof(float));
++
++        const uint32_t queued = SDL_GetQueuedAudioSize(g_audioDevice);
++        const bool drop = queued / frameSize >= MAX_QUEUED_FRAMES;
++
++        if (TasTrace::IsEnabled())
++            TasTrace::OnAudioSubmit(drop, s_underLibTAS ? queued : queued / (channels * uint32_t(sizeof(float))));
++
++        if (drop)
++            return;
++    }
++
+     auto floatSamples = reinterpret_cast<be<float>*>(samples);
+ 
+     if (g_downMixToStereo)
+diff --git a/UnleashedRecomp/cpu/guest_thread.cpp b/UnleashedRecomp/cpu/guest_thread.cpp
+index 3dbe915..0749e17 100644
+--- a/UnleashedRecomp/cpu/guest_thread.cpp
++++ b/UnleashedRecomp/cpu/guest_thread.cpp
+@@ -4,6 +4,7 @@
+ #include <kernel/heap.h>
+ #include <kernel/function.h>
+ #include "ppc_context.h"
++#include <tas_mode.h>
+ 
+ constexpr size_t PCR_SIZE = 0xAB0;
+ constexpr size_t TLS_SIZE = 0x100;
+@@ -71,15 +72,26 @@ static void* GuestThreadFunc(void* arg)
+ static void GuestThreadFunc(GuestThreadHandle* hThread)
+ {
+ #endif
+-    hThread->suspended.wait(true);
+-    GuestThread::Start(hThread->params);
++    if (IsTasMode())
++    {
++        TasScheduler::OnThreadStarted(hThread->tasThread);
++        TasScheduler::Wait([hThread]() { return !hThread->suspended; });
++        GuestThread::Start(hThread->params);
++        TasScheduler::OnThreadExited([hThread]() { hThread->exited = true; });
++    }
++    else
++    {
++        hThread->suspended.wait(true);
++        GuestThread::Start(hThread->params);
++    }
+ #ifdef USE_PTHREAD
+     return nullptr;
+ #endif
+ }
+ 
+ GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
+-    : params(params), suspended((params.flags & 0x1) != 0)
++    : params(params), suspended((params.flags & 0x1) != 0),
++      tasThread(IsTasMode() ? TasScheduler::OnThreadCreated() : nullptr)
+ #ifdef USE_PTHREAD
+ {
+     pthread_attr_t attr;
+@@ -129,6 +141,9 @@ uint32_t GuestThreadHandle::Wait(uint32_t timeout)
+ {
+     assert(timeout == INFINITE);
+ 
++    if (IsTasMode())
++        TasScheduler::Wait([this]() { return exited.load(); });
++
+ #ifdef USE_PTHREAD
+     pthread_join(thread, nullptr);
+ #else
+diff --git a/UnleashedRecomp/cpu/guest_thread.h b/UnleashedRecomp/cpu/guest_thread.h
+index e12e91a..b5fbf3b 100644
+--- a/UnleashedRecomp/cpu/guest_thread.h
++++ b/UnleashedRecomp/cpu/guest_thread.h
+@@ -33,6 +33,10 @@ struct GuestThreadHandle : KernelObject
+ {
+     GuestThreadParams params;
+     std::atomic<bool> suspended;
++    std::atomic<bool> exited{ false }; // Only used in TAS mode.
++    // The TAS scheduler's record of this thread. Must be declared before the thread member, so it's set
++    // before the thread starts.
++    void* tasThread = nullptr;
+ #ifdef USE_PTHREAD
+     pthread_t thread;
+ #else
+diff --git a/UnleashedRecomp/gpu/tas_swap_chain.cpp b/UnleashedRecomp/gpu/tas_swap_chain.cpp
+new file mode 100644
+index 0000000..49c1a58
+--- /dev/null
++++ b/UnleashedRecomp/gpu/tas_swap_chain.cpp
+@@ -0,0 +1,216 @@
++#include "tas_swap_chain.h"
++
++TasSwapChain::TasSwapChain(RenderDevice* device, RenderCommandQueue* queue, RenderWindow renderWindow, SDL_Window* sdlWindow, RenderFormat format)
++    : m_device(device), m_queue(queue), m_renderWindow(renderWindow), m_sdlWindow(sdlWindow), m_format(format)
++{
++    // Draw to the window with plain X11 calls instead of letting SDL create its own GPU renderer.
++    SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
++
++    m_commandList = m_queue->createCommandList();
++    m_fence = m_device->createCommandFence();
++
++    // A software renderer draws to the window surface too, but libTAS can draw its OSD with it.
++    m_renderer = SDL_CreateRenderer(m_sdlWindow, -1, SDL_RENDERER_SOFTWARE);
++    if (m_renderer == nullptr)
++        fprintf(stderr, "TAS mode: couldn't create an SDL software renderer (%s), presenting without libTAS's OSD.\n", SDL_GetError());
++
++    resize();
++
++    // libTAS picks how to capture the screen on its first frame boundary, which it can also insert
++    // on its own while the game is loading. The Vulkan device already exists at this point, so unless
++    // it has seen a renderer or window surface present by then, it picks Vulkan capture and later
++    // crashes looking for swap chain images that don't exist. Present a black frame right away.
++    if (m_renderer != nullptr)
++    {
++        SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 255);
++        SDL_RenderClear(m_renderer);
++        SDL_RenderPresent(m_renderer);
++    }
++    else if (SDL_Surface* surface = SDL_GetWindowSurface(m_sdlWindow))
++    {
++        SDL_FillRect(surface, nullptr, SDL_MapRGB(surface->format, 0, 0, 0));
++        SDL_UpdateWindowSurface(m_sdlWindow);
++    }
++}
++
++TasSwapChain::~TasSwapChain()
++{
++    if (m_frameTexture != nullptr)
++        SDL_DestroyTexture(m_frameTexture);
++
++    if (m_renderer != nullptr)
++        SDL_DestroyRenderer(m_renderer);
++}
++
++void TasSwapChain::GetWindowPixelSize(uint32_t& width, uint32_t& height) const
++{
++    int w = 0, h = 0;
++    SDL_GetWindowSizeInPixels(m_sdlWindow, &w, &h);
++    width = uint32_t(std::max(w, 0));
++    height = uint32_t(std::max(h, 0));
++}
++
++bool TasSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore** waitSemaphores, uint32_t waitSemaphoreCount)
++{
++    if (isEmpty() || textureIndex >= TextureCount)
++        return false;
++
++    RenderTexture* texture = m_textures[textureIndex].get();
++
++    // The frame was submitted to the same queue before this, so the barrier orders the copy after it.
++    m_commandList->begin();
++    m_commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(texture, RenderTextureLayout::COPY_SOURCE));
++    m_commandList->copyTextureRegion(
++        RenderTextureCopyLocation::PlacedFootprint(m_readbackBuffer.get(), m_format, m_width, m_height, 1, m_width),
++        RenderTextureCopyLocation::Subresource(texture));
++    m_commandList->end();
++
++    m_queue->executeCommandLists(m_commandList.get(), m_fence.get());
++    m_queue->waitForCommandFence(m_fence.get());
++
++    if (m_renderer != nullptr)
++    {
++        if (m_frameTexture != nullptr)
++        {
++            // Scaled to the window, which may have been resized since the frame was rendered.
++            SDL_UpdateTexture(m_frameTexture, nullptr, m_readbackBuffer->map(), int(m_width * 4));
++            m_readbackBuffer->unmap();
++            SDL_RenderCopy(m_renderer, m_frameTexture, nullptr, nullptr);
++        }
++
++        // libTAS treats this call as the frame boundary, and draws its OSD before presenting.
++        SDL_RenderPresent(m_renderer);
++        return true;
++    }
++
++    SDL_Surface* surface = SDL_GetWindowSurface(m_sdlWindow);
++    if (surface != nullptr)
++    {
++        const void* pixels = m_readbackBuffer->map();
++
++        // Copy what fits; the window may have been resized since the frame was rendered.
++        int width = std::min(int(m_width), surface->w);
++        int height = std::min(int(m_height), surface->h);
++
++        if (width > 0 && height > 0)
++        {
++            SDL_LockSurface(surface);
++
++            // B8G8R8A8 in memory is SDL's ARGB8888 on little-endian hosts.
++            SDL_ConvertPixels(width, height, SDL_PIXELFORMAT_ARGB8888, pixels, int(m_width * 4),
++                surface->format->format, surface->pixels, surface->pitch);
++
++            SDL_UnlockSurface(surface);
++        }
++
++        m_readbackBuffer->unmap();
++
++        // libTAS treats this call as the frame boundary.
++        SDL_UpdateWindowSurface(m_sdlWindow);
++    }
++
++    return true;
++}
++
++void TasSwapChain::wait()
++{
++    // present() is synchronous, so there is never anything to wait for.
++}
++
++bool TasSwapChain::resize()
++{
++    GetWindowPixelSize(m_width, m_height);
++
++    for (auto& texture : m_textures)
++        texture.reset();
++
++    m_readbackBuffer.reset();
++
++    if (m_frameTexture != nullptr)
++    {
++        SDL_DestroyTexture(m_frameTexture);
++        m_frameTexture = nullptr;
++    }
++
++    if (isEmpty())
++        return false;
++
++    for (auto& texture : m_textures)
++        texture = m_device->createTexture(RenderTextureDesc::Texture2D(m_width, m_height, 1, m_format, RenderTextureFlag::RENDER_TARGET));
++
++    m_readbackBuffer = m_device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(m_width) * m_height * 4));
++
++    if (m_renderer != nullptr)
++    {
++        // B8G8R8A8 in memory is SDL's RGB888 (XRGB8888) on little-endian hosts. It has no alpha, so the
++        // frame's alpha channel isn't blended against what was there before.
++        m_frameTexture = SDL_CreateTexture(m_renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, int(m_width), int(m_height));
++        if (m_frameTexture == nullptr)
++            fprintf(stderr, "TAS mode: couldn't create the frame texture: %s\n", SDL_GetError());
++    }
++
++    return true;
++}
++
++bool TasSwapChain::needsResize() const
++{
++    uint32_t width, height;
++    GetWindowPixelSize(width, height);
++    return isEmpty() || width != m_width || height != m_height;
++}
++
++void TasSwapChain::setVsyncEnabled(bool vsyncEnabled)
++{
++    // libTAS controls the frame rate.
++}
++
++bool TasSwapChain::isVsyncEnabled() const
++{
++    return false;
++}
++
++uint32_t TasSwapChain::getWidth() const
++{
++    return m_width;
++}
++
++uint32_t TasSwapChain::getHeight() const
++{
++    return m_height;
++}
++
++RenderTexture* TasSwapChain::getTexture(uint32_t textureIndex)
++{
++    return textureIndex < TextureCount ? m_textures[textureIndex].get() : nullptr;
++}
++
++uint32_t TasSwapChain::getTextureCount() const
++{
++    return TextureCount;
++}
++
++bool TasSwapChain::acquireTexture(RenderCommandSemaphore* signalSemaphore, uint32_t* textureIndex)
++{
++    // No semaphore is signalled; in TAS mode the frame is submitted without waiting on one.
++    if (isEmpty())
++        return false;
++
++    *textureIndex = m_nextTextureIndex;
++    m_nextTextureIndex = (m_nextTextureIndex + 1) % TextureCount;
++    return true;
++}
++
++RenderWindow TasSwapChain::getWindow() const
++{
++    return m_renderWindow;
++}
++
++bool TasSwapChain::isEmpty() const
++{
++    return m_width == 0 || m_height == 0;
++}
++
++uint32_t TasSwapChain::getRefreshRate() const
++{
++    return 60;
++}
+diff --git a/UnleashedRecomp/gpu/tas_swap_chain.h b/UnleashedRecomp/gpu/tas_swap_chain.h
+new file mode 100644
+index 0000000..956be45
+--- /dev/null
++++ b/UnleashedRecomp/gpu/tas_swap_chain.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <algorithm>
++#include <memory>
++
++#include <SDL.h>
++#include <plume_render_interface.h>
++
++using namespace plume;
++
++// A swap chain used in TAS mode (UNLEASHED_TAS_MODE=1) in place of the Vulkan one.
++//
++// Frames are rendered into ordinary textures, read back to CPU memory and shown with
++// SDL's software renderer (or its window surface, if that can't be created). This keeps
++// every piece of presentation state inside the process (no WSI threads, present fences or
++// compositor round trips), which is what libTAS needs to be able to save and load states,
++// and SDL_RenderPresent is where libTAS draws its OSD. Presenting is synchronous, and
++// semaphores are not used: the frame's command list must be submitted to the same queue
++// before present().
++struct TasSwapChain : RenderSwapChain
++{
++    static constexpr uint32_t TextureCount = 2;
++
++    RenderDevice* m_device;
++    RenderCommandQueue* m_queue;
++    RenderWindow m_renderWindow;
++    SDL_Window* m_sdlWindow;
++    RenderFormat m_format;
++    SDL_Renderer* m_renderer = nullptr;
++    SDL_Texture* m_frameTexture = nullptr;
++
++    uint32_t m_width = 0;
++    uint32_t m_height = 0;
++    uint32_t m_nextTextureIndex = 0;
++
++    std::unique_ptr<RenderTexture> m_textures[TextureCount];
++    std::unique_ptr<RenderBuffer> m_readbackBuffer;
++    std::unique_ptr<RenderCommandList> m_commandList;
++    std::unique_ptr<RenderCommandFence> m_fence;
++
++    TasSwapChain(RenderDevice* device, RenderCommandQueue* queue, RenderWindow renderWindow, SDL_Window* sdlWindow, RenderFormat format);
++    ~TasSwapChain() override;
++
++    bool present(uint32_t textureIndex, RenderCommandSemaphore** waitSemaphores, uint32_t waitSemaphoreCount) override;
++    void wait() override;
++    bool resize() override;
++    bool needsResize() const override;
++    void setVsyncEnabled(bool vsyncEnabled) override;
++    bool isVsyncEnabled() const override;
++    uint32_t getWidth() const override;
++    uint32_t getHeight() const override;
++    RenderTexture* getTexture(uint32_t textureIndex) override;
++    uint32_t getTextureCount() const override;
++    bool acquireTexture(RenderCommandSemaphore* signalSemaphore, uint32_t* textureIndex) override;
++    RenderWindow getWindow() const override;
++    bool isEmpty() const override;
++    uint32_t getRefreshRate() const override;
++
++private:
++    void GetWindowPixelSize(uint32_t& width, uint32_t& height) const;
++};
+diff --git a/UnleashedRecomp/gpu/video.cpp b/UnleashedRecomp/gpu/video.cpp
+index a9edd0b..bac590e 100644
+--- a/UnleashedRecomp/gpu/video.cpp
++++ b/UnleashedRecomp/gpu/video.cpp
+@@ -3,6 +3,7 @@
+ #include "imgui/imgui_common.h"
+ #include "imgui/imgui_snapshot.h"
+ #include "imgui/imgui_font_builder.h"
++#include "tas_swap_chain.h"
+ 
+ #include <app.h>
+ #include <bc_diff.h>
+@@ -27,11 +28,13 @@
+ #include <ui/options_menu.h>
+ #include <ui/game_window.h>
+ #include <ui/black_bar.h>
++#include <ui/tas_hud.h>
+ #include <patches/aspect_ratio_patches.h>
+ #include <user/config.h>
+ #include <sdl_listener.h>
+ #include <xxHashMap.h>
+ #include <os/process.h>
++#include <tas_mode.h>
+ 
+ #if defined(ASYNC_PSO_DEBUG) || defined(PSO_CACHING)
+ #include <magic_enum/magic_enum.hpp>
+@@ -1875,7 +1878,11 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
+         break;
+     }
+ 
+-    g_swapChain = g_queue->createSwapChain(GameWindow::s_renderWindow, bufferCount, BACKBUFFER_FORMAT, Config::MaxFrameLatency);
++    if (IsTasMode())
++        g_swapChain = std::make_unique<TasSwapChain>(g_device.get(), g_queue.get(), GameWindow::s_renderWindow, GameWindow::s_pWindow, BACKBUFFER_FORMAT);
++    else
++        g_swapChain = g_queue->createSwapChain(GameWindow::s_renderWindow, bufferCount, BACKBUFFER_FORMAT, Config::MaxFrameLatency);
++
+     g_swapChain->setVsyncEnabled(Config::VSync);
+     g_swapChainValid = !g_swapChain->needsResize();
+ 
+@@ -2603,6 +2610,7 @@ static void DrawImGui()
+     assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
+ 
+     DrawFPS();
++    TasHud::Draw();
+     DrawProfiler();
+     ImGui::Render();
+ 
+@@ -2788,8 +2796,15 @@ void Video::WaitOnSwapChain()
+ static bool g_shouldPrecompilePipelines;
+ static std::atomic<bool> g_executedCommandList;
+ 
+-void Video::Present() 
++void Video::Present()
+ {
++    // Let background guest threads finish their work first, so every frame contains the same amount of it.
++    if (IsTasMode())
++    {
++        TasScheduler::WaitForOtherThreads();
++        TasTrace::OnFrame();
++    }
++
+     g_readyForCommands = false;
+ 
+     RenderCommand cmd;
+@@ -2802,9 +2817,13 @@ void Video::Present()
+     g_renderQueue.enqueue(cmd);
+ 
+     // All the shaders are available at this point. We can precompile embedded PSOs then.
++    // Not in TAS mode, where it would create vertex declarations on another thread at a point
++    // depending on how fast the host is (see GetDatabaseDataMidAsmHook).
+     if (g_shouldPrecompilePipelines)
+     {
+-        EnqueuePipelineTask(PipelineTaskType::PrecompilePipelines, {});
++        if (!IsTasMode())
++            EnqueuePipelineTask(PipelineTaskType::PrecompilePipelines, {});
++
+         g_shouldPrecompilePipelines = false;
+     }
+ 
+@@ -2824,6 +2843,10 @@ void Video::Present()
+         g_swapChainValid = g_swapChain->present(g_backBufferIndex, signalSemaphores, std::size(signalSemaphores));
+     }
+ 
++    // The frame boundary has passed: sleeping threads and audio may run again.
++    if (IsTasMode())
++        TasScheduler::AdvanceFrame();
++
+     g_pendingWaitOnSwapChain = true;
+ 
+     g_frame = g_nextFrame;
+@@ -2853,7 +2876,8 @@ void Video::Present()
+     cmd.type = RenderCommandType::BeginCommandList;
+     g_renderQueue.enqueue(cmd);
+ 
+-    if (Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX)
++    // libTAS controls the frame rate, and this limiter would spin on its frozen clock.
++    if (Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX && !IsTasMode())
+     {
+         using namespace std::chrono_literals;
+ 
+@@ -2977,7 +3001,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
+     commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
+     commandList->end();
+ 
+-    if (g_swapChainValid)
++    // The TAS swap chain doesn't use semaphores, it presents synchronously after this submission.
++    if (g_swapChainValid && !IsTasMode())
+     {
+         const RenderCommandList *commandLists[] = { commandList.get() };
+         RenderCommandSemaphore *waitSemaphores[] = { g_acquireSemaphores[g_frame].get() };
+@@ -6947,6 +6972,23 @@ PPC_FUNC(sub_825369A0)
+     assert(std::this_thread::get_id() == g_mainThreadId);
+ 
+     // Wait for pipeline compilations to finish.
++    if (IsTasMode())
++    {
++        // Compilation runs on host threads that may need other guest threads to make progress, so let
++        // them run meanwhile. Frames don't end while waiting, so compile times don't change the loading.
++        // More tasks can be queued while the run token is taken back, so only stop waiting once there are
++        // none left while holding it; waiting below while holding it would deadlock.
++        while (g_compilingPipelineTaskCount.load() != 0)
++        {
++            TasScheduler::WaitForHost([]()
++            {
++                SDL_PumpEvents();
++                SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
++                return g_compilingPipelineTaskCount.load() == 0;
++            });
++        }
++    }
++
+     uint32_t value;
+     while ((value = g_compilingPipelineTaskCount.load()) != 0)
+     {
+@@ -6961,10 +7003,28 @@ PPC_FUNC(sub_825369A0)
+     __imp__sub_825369A0(ctx, base);
+ }
+ 
++// In TAS mode, wait for the data's pipelines to finish compiling instead of reporting it as not made yet.
++// Compilation runs on host threads, so otherwise the point where the game sees the data as ready would
++// depend on how fast the host compiles, and loading would take a different amount of work each run.
++static void TasWaitForPipelineCompilation(uint8_t* base, uint32_t databaseData)
++{
++    auto* data = reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + databaseData);
++
++    if (IsTasMode() && (data->m_Flags & eDatabaseDataFlags_CompilingPipelines))
++    {
++        TasScheduler::WaitForHost([data]()
++        {
++            return (std::atomic_ref(data->m_Flags).load() & eDatabaseDataFlags_CompilingPipelines) == 0;
++        });
++    }
++}
++
+ // CModelData::CheckMadeAll
+ PPC_FUNC_IMPL(__imp__sub_82E2EFB0);
+ PPC_FUNC(sub_82E2EFB0)
+-{   
++{
++    TasWaitForPipelineCompilation(base, ctx.r3.u32);
++
+     if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
+     {
+         ctx.r3.u64 = 0;
+@@ -6978,7 +7038,9 @@ PPC_FUNC(sub_82E2EFB0)
+ // CTerrainModelData::CheckMadeAll
+ PPC_FUNC_IMPL(__imp__sub_82E243D8);
+ PPC_FUNC(sub_82E243D8)
+-{   
++{
++    TasWaitForPipelineCompilation(base, ctx.r3.u32);
++
+     if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
+     {
+         ctx.r3.u64 = 0;
+@@ -6992,7 +7054,9 @@ PPC_FUNC(sub_82E243D8)
+ // CParticleMaterial::CheckMadeAll
+ PPC_FUNC_IMPL(__imp__sub_82E87598);
+ PPC_FUNC(sub_82E87598)
+-{   
++{
++    TasWaitForPipelineCompilation(base, ctx.r3.u32);
++
+     if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
+     {
+         ctx.r3.u64 = 0;
+@@ -7005,6 +7069,12 @@ PPC_FUNC(sub_82E87598)
+ 
+ void GetDatabaseDataMidAsmHook(PPCRegister& r1, PPCRegister& r4)
+ {
++    // In TAS mode, don't precompile the pipelines of data as it loads. That runs on host threads which
++    // read and release the game's data (possibly freeing it) at points depending on how fast the host is,
++    // which desyncs movies. Pipelines are then compiled when first drawn, which only affects visuals.
++    if (IsTasMode())
++        return;
++
+     auto& databaseData = *reinterpret_cast<boost::shared_ptr<Hedgehog::Database::CDatabaseData>*>(
+         g_memory.Translate(r1.u32 + 0x58));
+ 
+diff --git a/UnleashedRecomp/hid/hid.cpp b/UnleashedRecomp/hid/hid.cpp
+index 900de32..95f2e12 100644
+--- a/UnleashedRecomp/hid/hid.cpp
++++ b/UnleashedRecomp/hid/hid.cpp
+@@ -1,5 +1,6 @@
+ #include "hid.h"
+ #include <ui/game_window.h>
++#include <tas_mode.h>
+ #include <user/config.h>
+ 
+ hid::EInputDevice hid::g_inputDevice;
+@@ -19,7 +20,8 @@ void hid::SetProhibitedInputs(uint16_t wButtons, bool leftStick, bool rightStick
+ 
+ bool hid::IsInputAllowed()
+ {
+-    return GameWindow::s_isFocused || Config::AllowBackgroundInput;
++    // In TAS mode, inputs come from libTAS regardless of which window has focus.
++    return GameWindow::s_isFocused || Config::AllowBackgroundInput || IsTasMode();
+ }
+ 
+ bool hid::IsInputDeviceController()
+diff --git a/UnleashedRecomp/kernel/imports.cpp b/UnleashedRecomp/kernel/imports.cpp
+index 58b33fa..3481a75 100644
+--- a/UnleashedRecomp/kernel/imports.cpp
++++ b/UnleashedRecomp/kernel/imports.cpp
+@@ -12,6 +12,7 @@
+ #include "xdm.h"
+ #include <user/config.h>
+ #include <os/logger.h>
++#include <tas_mode.h>
+ 
+ #ifdef _WIN32
+ #include <ntstatus.h>
+@@ -32,8 +33,27 @@ struct Event final : KernelObject, HostObject<XKEVENT>
+     {
+     }
+ 
++    // Only used in TAS mode, under the scheduler lock.
++    bool TryAcquire()
++    {
++        if (manualReset)
++            return signaled;
++
++        return signaled.exchange(false);
++    }
++
+     uint32_t Wait(uint32_t timeout) override
+     {
++        if (IsTasMode())
++        {
++            if (timeout == 0)
++                return TasScheduler::Run([this]() { return TryAcquire(); }) ? STATUS_SUCCESS : STATUS_TIMEOUT;
++
++            assert(timeout == INFINITE && "Unhandled timeout value.");
++            TasScheduler::Wait([this]() { return TryAcquire(); });
++            return STATUS_SUCCESS;
++        }
++
+         if (timeout == 0)
+         {
+             if (manualReset)
+@@ -76,6 +96,12 @@ struct Event final : KernelObject, HostObject<XKEVENT>
+ 
+     bool Set()
+     {
++        if (IsTasMode())
++        {
++            TasScheduler::Modify([this]() { signaled = true; });
++            return TRUE;
++        }
++
+         signaled = true;
+ 
+         if (manualReset)
+@@ -88,6 +114,12 @@ struct Event final : KernelObject, HostObject<XKEVENT>
+ 
+     bool Reset()
+     {
++        if (IsTasMode())
++        {
++            TasScheduler::Modify([this]() { signaled = false; });
++            return TRUE;
++        }
++
+         signaled = false;
+         return TRUE;
+     }
+@@ -110,8 +142,28 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
+     {
+     }
+ 
++    // Only used in TAS mode, under the scheduler lock.
++    bool TryAcquire()
++    {
++        if (count == 0)
++            return false;
++
++        count--;
++        return true;
++    }
++
+     uint32_t Wait(uint32_t timeout) override
+     {
++        if (IsTasMode())
++        {
++            if (timeout == 0)
++                return TasScheduler::Run([this]() { return TryAcquire(); }) ? STATUS_SUCCESS : STATUS_TIMEOUT;
++
++            assert(timeout == INFINITE && "Unhandled timeout value.");
++            TasScheduler::Wait([this]() { return TryAcquire(); });
++            return STATUS_SUCCESS;
++        }
++
+         if (timeout == 0)
+         {
+             uint32_t currentCount = count.load();
+@@ -151,6 +203,19 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
+ 
+     void Release(uint32_t releaseCount, uint32_t* previousCount)
+     {
++        if (IsTasMode())
++        {
++            TasScheduler::Modify([&]()
++            {
++                if (previousCount != nullptr)
++                    *previousCount = count;
++
++                count += releaseCount;
++            });
++
++            return;
++        }
++
+         if (previousCount != nullptr)
+             *previousCount = count;
+ 
+@@ -569,6 +634,13 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>*
+ 
+     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+ 
++    if (IsTasMode())
++    {
++        // Sleep on the scheduler's virtual clock, not in real time, so the amount of work done per frame is fixed.
++        TasScheduler::SleepFor(timeout);
++        return STATUS_SUCCESS;
++    }
++
+ #ifdef _WIN32
+     Sleep(timeout);
+ #else
+@@ -662,6 +734,13 @@ uint32_t NtSuspendThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
+ {
+     assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE) && hThread->GetThreadId() == GuestThread::GetCurrentThreadId());
+ 
++    if (IsTasMode())
++    {
++        TasScheduler::Modify([hThread]() { hThread->suspended = true; });
++        TasScheduler::Wait([hThread]() { return !hThread->suspended; });
++        return S_OK;
++    }
++
+     hThread->suspended = true;
+     hThread->suspended.wait(true);
+ 
+@@ -678,6 +757,19 @@ uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint32_t>* l
+ 
+ void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
+ {
++    if (IsTasMode())
++    {
++        TasScheduler::Modify([cs]()
++        {
++            cs->RecursionCount--;
++
++            if (cs->RecursionCount == 0)
++                cs->OwningThread = 0;
++        });
++
++        return;
++    }
++
+     cs->RecursionCount--;
+ 
+     if (cs->RecursionCount != 0)
+@@ -693,9 +785,27 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
+     uint32_t thisThread = g_ppcContext->r13.u32;
+     assert(thisThread != NULL);
+ 
++    if (IsTasMode())
++    {
++        TasScheduler::NoteWaitingOnLock(g_memory.MapVirtual(cs), cs->OwningThread);
++
++        TasScheduler::Wait([cs, thisThread]()
++        {
++            if (cs->OwningThread != 0 && cs->OwningThread != thisThread)
++                return false;
++
++            cs->OwningThread = thisThread;
++            cs->RecursionCount++;
++            return true;
++        });
++
++        TasScheduler::NoteWaitingOnLock(0, 0);
++        return;
++    }
++
+     std::atomic_ref owningThread(cs->OwningThread);
+ 
+-    while (true) 
++    while (true)
+     {
+         uint32_t previousOwner = 0;
+ 
+@@ -754,14 +864,40 @@ void RtlRaiseException_x()
+     LOG_UTILITY("!!! STUB !!!");
+ }
+ 
++// Spinning would never let a lock's owner run under the TAS scheduler, so these wait through it instead.
++static void TasAcquireSpinLock(uint32_t* spinLock)
++{
++    uint32_t thisThread = g_ppcContext->r13.u32;
++
++    TasScheduler::Wait([spinLock, thisThread]()
++    {
++        if (*spinLock != 0)
++            return false;
++
++        *spinLock = thisThread;
++        return true;
++    });
++}
++
++static void TasReleaseSpinLock(uint32_t* spinLock)
++{
++    TasScheduler::Modify([spinLock]() { *spinLock = 0; });
++}
++
+ void KfReleaseSpinLock(uint32_t* spinLock)
+ {
++    if (IsTasMode())
++        return TasReleaseSpinLock(spinLock);
++
+     std::atomic_ref spinLockRef(*spinLock);
+     spinLockRef = 0;
+ }
+ 
+ void KfAcquireSpinLock(uint32_t* spinLock)
+ {
++    if (IsTasMode())
++        return TasAcquireSpinLock(spinLock);
++
+     std::atomic_ref spinLockRef(*spinLock);
+ 
+     while (true)
+@@ -803,12 +939,18 @@ void VdGetSystemCommandBuffer()
+ 
+ void KeReleaseSpinLockFromRaisedIrql(uint32_t* spinLock)
+ {
++    if (IsTasMode())
++        return TasReleaseSpinLock(spinLock);
++
+     std::atomic_ref spinLockRef(*spinLock);
+     spinLockRef = 0;
+ }
+ 
+ void KeAcquireSpinLockAtRaisedIrql(uint32_t* spinLock)
+ {
++    if (IsTasMode())
++        return TasAcquireSpinLock(spinLock);
++
+     std::atomic_ref spinLockRef(*spinLock);
+ 
+     while (true)
+@@ -1203,6 +1345,19 @@ bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
+     uint32_t thisThread = g_ppcContext->r13.u32;
+     assert(thisThread != NULL);
+ 
++    if (IsTasMode())
++    {
++        return TasScheduler::Run([cs, thisThread]()
++        {
++            if (cs->OwningThread != 0 && cs->OwningThread != thisThread)
++                return false;
++
++            cs->OwningThread = thisThread;
++            cs->RecursionCount++;
++            return true;
++        });
++    }
++
+     std::atomic_ref owningThread(cs->OwningThread);
+ 
+     uint32_t previousOwner = 0;
+@@ -1317,6 +1472,12 @@ uint32_t NtResumeThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
+ {
+     assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE));
+ 
++    if (IsTasMode())
++    {
++        TasScheduler::Modify([hThread]() { hThread->suspended = false; });
++        return S_OK;
++    }
++
+     hThread->suspended = false;
+     hThread->suspended.notify_all();
+ 
+@@ -1519,6 +1680,29 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>*
+         for (size_t i = 0; i < Count; i++)
+             s_events[i] = QueryKernelObject<Event>(*Objects[i]);
+ 
++        if (IsTasMode())
++        {
++            // The check may run on whichever thread wakes this one, so don't use the thread-local vector in it.
++            std::vector<Event*> events(s_events);
++            size_t signaledIndex = 0;
++
++            TasScheduler::Wait([&]()
++            {
++                for (size_t i = 0; i < events.size(); i++)
++                {
++                    if (events[i]->TryAcquire())
++                    {
++                        signaledIndex = i;
++                        return true;
++                    }
++                }
++
++                return false;
++            });
++
++            return STATUS_WAIT_0 + signaledIndex;
++        }
++
+         while (true)
+         {
+             uint32_t generation = g_keSetEventGeneration.load();
+diff --git a/UnleashedRecomp/kernel/io/file_system.cpp b/UnleashedRecomp/kernel/io/file_system.cpp
+index a765d12..3a71ef1 100644
+--- a/UnleashedRecomp/kernel/io/file_system.cpp
++++ b/UnleashedRecomp/kernel/io/file_system.cpp
+@@ -7,6 +7,7 @@
+ #include <os/logger.h>
+ #include <user/config.h>
+ #include <stdafx.h>
++#include <tas_mode.h>
+ 
+ struct FileHandle : KernelObject
+ {
+@@ -176,6 +177,9 @@ uint32_t XReadFile
+         }
+     }
+ 
++    if (TasTrace::IsEnabled())
++        TasTrace::OnFileRead(hFile->path.filename().string().c_str(), uint64_t(hFile->stream.tellg()), nNumberOfBytesToRead);
++
+     uint32_t numberOfBytesRead;
+     hFile->stream.read((char *)(lpBuffer), nNumberOfBytesToRead);
+     if (!hFile->stream.bad())
+@@ -320,6 +324,9 @@ uint32_t XReadFileEx(FileHandle* hFile, void* lpBuffer, uint32_t nNumberOfBytesT
+     if (hFile->stream.bad())
+         return FALSE;
+ 
++    if (TasTrace::IsEnabled())
++        TasTrace::OnFileRead(hFile->path.filename().string().c_str(), uint64_t(streamOffset), nNumberOfBytesToRead);
++
+     hFile->stream.read((char *)(lpBuffer), nNumberOfBytesToRead);
+     if (!hFile->stream.bad())
+     {
+diff --git a/UnleashedRecomp/kernel/xam.cpp b/UnleashedRecomp/kernel/xam.cpp
+index 357b791..3ccb0c5 100644
+--- a/UnleashedRecomp/kernel/xam.cpp
++++ b/UnleashedRecomp/kernel/xam.cpp
+@@ -3,6 +3,8 @@
+ #include "xdm.h"
+ #include <hid/hid.h>
+ #include <ui/game_window.h>
++#include <tas_mode.h>
++#include <ui/tas_hud.h>
+ #include <cpu/guest_thread.h>
+ #include <ranges>
+ #include <unordered_set>
+@@ -410,7 +412,9 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
+ 
+     auto keyboardState = SDL_GetKeyboardState(NULL);
+ 
+-    if (GameWindow::s_isFocused && !keyboardState[SDL_SCANCODE_LALT])
++    // In TAS mode, inputs come from libTAS, and whether the window happens to have focus (the user may be
++    // looking at libTAS during playback) mustn't decide whether they count.
++    if ((GameWindow::s_isFocused || IsTasMode()) && !keyboardState[SDL_SCANCODE_LALT])
+     {
+         if (keyboardState[Config::Key_LeftStickUp])
+             state->Gamepad.sThumbLY = 32767;
+@@ -478,6 +482,9 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
+         state->Gamepad.sThumbRY = 0;
+     }
+ 
++    if (userIndex == 0 && TasHud::IsEnabled())
++        TasHud::OnInputState(state->Gamepad.sThumbLX, state->Gamepad.sThumbLY);
++
+     ByteSwapInplace(state->Gamepad.wButtons);
+     ByteSwapInplace(state->Gamepad.sThumbLX);
+     ByteSwapInplace(state->Gamepad.sThumbLY);
+diff --git a/UnleashedRecomp/main.cpp b/UnleashedRecomp/main.cpp
+index bb24176..30ad11d 100644
+--- a/UnleashedRecomp/main.cpp
++++ b/UnleashedRecomp/main.cpp
+@@ -27,6 +27,16 @@
+ #include <ui/installer_wizard.h>
+ #include <mod/mod_loader.h>
+ #include <preload_executable.h>
++#include <tas_mode.h>
++
++#ifdef __linux__
++#include <dlfcn.h>
++#include <execinfo.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <ucontext.h>
++#include <unistd.h>
++#endif
+ 
+ #ifdef _WIN32
+ #include <timeapi.h>
+@@ -192,12 +202,69 @@ void init()
+ }
+ #endif
+ 
++#ifdef __linux__
++// In TAS mode, report where a crash happened, since libTAS only tells us that the game died.
++static void TasCrashHandler(int sig, siginfo_t* info, void* context)
++{
++    char buffer[256];
++    int length = snprintf(buffer, sizeof(buffer), "\n=== TAS mode crash: signal %d, fault address %p, thread %ld ===\n",
++        sig, info->si_addr, long(syscall(SYS_gettid)));
++    write(STDERR_FILENO, buffer, length);
++
++    // The instruction that faulted, which the backtrace may not include.
++    auto* ucontext = static_cast<ucontext_t*>(context);
++    void* faultingInstruction = reinterpret_cast<void*>(ucontext->uc_mcontext.gregs[REG_RIP]);
++    Dl_info dlInfo{};
++    if (dladdr(faultingInstruction, &dlInfo) && dlInfo.dli_fname != nullptr)
++    {
++        length = snprintf(buffer, sizeof(buffer), "faulting instruction: %s(+0x%lx)\n",
++            dlInfo.dli_fname, uintptr_t(faultingInstruction) - uintptr_t(dlInfo.dli_fbase));
++        write(STDERR_FILENO, buffer, length);
++    }
++
++    void* frames[64];
++    int frameCount = backtrace(frames, std::size(frames));
++    backtrace_symbols_fd(frames, frameCount, STDERR_FILENO);
++
++    signal(sig, SIG_DFL);
++    raise(sig);
++}
++
++static void InstallTasCrashHandler()
++{
++    struct sigaction action{};
++    action.sa_sigaction = TasCrashHandler;
++    action.sa_flags = SA_SIGINFO;
++    sigemptyset(&action.sa_mask);
++    sigaction(SIGSEGV, &action, nullptr);
++    sigaction(SIGBUS, &action, nullptr);
++    sigaction(SIGILL, &action, nullptr);
++    sigaction(SIGABRT, &action, nullptr);
++}
++#endif
++
+ int main(int argc, char *argv[])
+ {
+ #ifdef _WIN32
+     timeBeginPeriod(1);
+ #endif
+ 
++#ifdef __linux__
++    if (IsTasMode())
++    {
++        InstallTasCrashHandler();
++
++        // The guest otherwise reads the CPU's time stamp counter, which libTAS can't control.
++        InstallTasTimebase();
++
++        // Make libTAS track the threads lavapipe creates, so savestates can restore them.
++        StartTasThreadSpawner();
++
++        // Mesa's shader disk cache starts and stops its own threads and writes files in the background.
++        setenv("MESA_SHADER_CACHE_DISABLE", "true", 0);
++    }
++#endif
++
+     os::process::CheckConsole();
+ 
+     if (!os::registry::Init())
+@@ -361,6 +428,9 @@ int main(int argc, char *argv[])
+ 
+     Video::StartPipelinePrecompilation();
+ 
++    if (IsTasMode())
++        TasScheduler::InitMainThread();
++
+     GuestThread::Start({ entry, 0, 0 });
+ 
+     return 0;
+diff --git a/UnleashedRecomp/patches/fps_patches.cpp b/UnleashedRecomp/patches/fps_patches.cpp
+index 322073c..37f695e 100644
+--- a/UnleashedRecomp/patches/fps_patches.cpp
++++ b/UnleashedRecomp/patches/fps_patches.cpp
+@@ -3,6 +3,7 @@
+ #include <ui/game_window.h>
+ #include <user/config.h>
+ #include <app.h>
++#include <tas_mode.h>
+ 
+ void DownForceDeltaTimeFixMidAsmHook(PPCRegister& f0)
+ {
+@@ -106,7 +107,12 @@ bool LoadingUpdateMidAsmHook(PPCRegister& r31)
+     g_memory.FindFunction(update)(*g_ppcContext, base);
+ 
+     bool loading = *SWA::SGlobals::ms_IsLoading;
+-    if (loading)
++    if (loading && IsTasMode())
++    {
++        // Another thread presents the loading screen and waits for this one to block; run again next frame.
++        TasScheduler::Sleep();
++    }
++    else if (loading)
+     {
+         now = std::chrono::steady_clock::now();
+         constexpr auto INTERVAL = 1000000000ns / 30;
+@@ -122,6 +128,14 @@ bool LoadingUpdateMidAsmHook(PPCRegister& r31)
+ PPC_FUNC_IMPL(__imp__sub_8312DBF8);
+ PPC_FUNC(sub_8312DBF8)
+ {
++    // The middleware's service threads wait here. Run them again at the next frame instead of after
++    // a real-time delay, so the TAS scheduler sees them as blocked and each frame does the same work.
++    if (IsTasMode())
++    {
++        TasScheduler::Sleep();
++        return;
++    }
++
+     auto now = std::chrono::steady_clock::now();
+     constexpr auto INTERVAL = 1000000000ns / 60;
+     auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);
+diff --git a/UnleashedRecomp/patches/tas_patches.cpp b/UnleashedRecomp/patches/tas_patches.cpp
+new file mode 100644
+index 0000000..f1edc93
+--- /dev/null
++++ b/UnleashedRecomp/patches/tas_patches.cpp
+@@ -0,0 +1,25 @@
++#include <kernel/memory.h>
++#include <tas_mode.h>
++
++// Patches that only do something in TAS mode (see tas_mode.cpp).
++
++// Not every loop in the audio library needs a yield: the one at 0x8315D8E8 (in sub_8315D800) looks like a
++// spin-wait but drains a voice's list of consumed buffers, which always terminates. Yielding there made
++// the virtual clock jump to the next audio callback for every entry, running audio ~12x too fast.
++
++// The heads of loops in the audio library (in sub_83148E40 and sub_8314A410) that stop a sound: they update
++// the sound's streams, without ever blocking, until it has stopped, which needs the audio thread to run.
++void TasStreamStopWaitMidAsmHook()
++{
++    if (IsTasMode())
++        TasScheduler::YieldIfPolling();
++}
++
++// A loop in the audio library (in sub_8316CF50) that polls a task's status, without ever blocking, until
++// another thread has advanced it to 2. The hook is only reached when the loop comes around again, with the
++// status just polled in r3.
++void TasSpinYieldMidAsmHook(PPCRegister& r3)
++{
++    if (IsTasMode() && r3.s32 != 2)
++        TasScheduler::SleepFor(0);
++}
+diff --git a/UnleashedRecomp/tas_mode.cpp b/UnleashedRecomp/tas_mode.cpp
+new file mode 100644
+index 0000000..5fe283b
+--- /dev/null
++++ b/UnleashedRecomp/tas_mode.cpp
+@@ -0,0 +1,1020 @@
++#include "tas_mode.h"
++
++#include <chrono>
++
++static std::atomic<uint64_t> g_timebaseReads;
++
++static uint64_t TasReadTimebase()
++{
++    g_timebaseReads.fetch_add(1, std::memory_order_relaxed);
++
++    // The Xbox 360 timebase runs at 49.875 MHz (what KeQueryPerformanceFrequency reports),
++    // so convert nanoseconds with 49875000 / 1000000000 = 399 / 8000, without overflowing.
++    uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    return (ns / 8000) * 399 + (ns % 8000) * 399 / 8000;
++}
++
++void InstallTasTimebase()
++{
++    g_ppcTimebaseOverride = TasReadTimebase;
++}
++
++#ifdef __linux__
++
++#include <dlfcn.h>
++#include <pthread.h>
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++
++// libTAS creates the Vulkan device in "native" mode, and treats every thread created in native mode
++// as a native thread: it never suspends, saves or restores it. Lavapipe (the software Vulkan driver)
++// creates its queue and rendering threads inside vkCreateDevice, so they all end up untracked, and
++// loading a savestate rewinds their memory while they keep running, which deadlocks the next frame.
++//
++// To avoid that, in TAS mode this executable exports its own pthread_create, which takes precedence
++// over libTAS's and glibc's. Threads requested by the Mesa driver are handed to a spawner thread that
++// was started normally, so libTAS registers them as ordinary game threads. Everything else goes
++// straight through to libTAS (or glibc when not running under libTAS).
++
++using PthreadCreateFunc = int (*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
++
++static PthreadCreateFunc GetRealPthreadCreate()
++{
++    static const PthreadCreateFunc s_pthreadCreate = []() -> PthreadCreateFunc
++    {
++        // Under libTAS, look the function up in libtas.so itself. dlsym(RTLD_NEXT, ...) can't be used for
++        // that: libTAS hooks dlsym and resolves RTLD_NEXT relative to itself, which would skip its hook.
++        const char* libtasPath = std::getenv("LIBTAS_LIBRARY_PATH");
++        if (libtasPath != nullptr && libtasPath[0] != '\0')
++        {
++            if (void* libtas = dlopen(libtasPath, RTLD_NOW | RTLD_NOLOAD))
++            {
++                if (void* function = dlsym(libtas, "pthread_create"))
++                    return reinterpret_cast<PthreadCreateFunc>(function);
++            }
++        }
++
++        void* function = dlvsym(RTLD_NEXT, "pthread_create", "GLIBC_2.34");
++        if (function == nullptr)
++            function = dlvsym(RTLD_NEXT, "pthread_create", "GLIBC_2.2.5");
++
++        return reinterpret_cast<PthreadCreateFunc>(function);
++    }();
++
++    return s_pthreadCreate;
++}
++
++static bool IsCalledFromMesa(void* returnAddress)
++{
++    Dl_info info{};
++    if (!dladdr(returnAddress, &info) || info.dli_fname == nullptr)
++        return false;
++
++    return strstr(info.dli_fname, "libvulkan_lvp") != nullptr || strstr(info.dli_fname, "libgallium") != nullptr;
++}
++
++struct SpawnRequest
++{
++    pthread_t* thread;
++    const pthread_attr_t* attr;
++    void* (*start)(void*);
++    void* arg;
++    int result;
++    bool done;
++};
++
++static std::atomic<bool> g_spawnerRunning;
++static std::mutex g_spawnCallMutex;
++static std::mutex g_spawnMutex;
++static std::condition_variable g_spawnCondition;
++static SpawnRequest* g_spawnRequest;
++
++static void* SpawnerThread(void*)
++{
++    std::unique_lock lock(g_spawnMutex);
++
++    while (true)
++    {
++        g_spawnCondition.wait(lock, []() { return g_spawnRequest != nullptr && !g_spawnRequest->done; });
++
++        SpawnRequest* request = g_spawnRequest;
++        request->result = GetRealPthreadCreate()(request->thread, request->attr, request->start, request->arg);
++        request->done = true;
++
++        g_spawnCondition.notify_all();
++    }
++
++    return nullptr;
++}
++
++void StartTasThreadSpawner()
++{
++    pthread_t thread;
++    if (GetRealPthreadCreate()(&thread, nullptr, SpawnerThread, nullptr) == 0)
++    {
++        pthread_detach(thread);
++        g_spawnerRunning = true;
++    }
++    else
++    {
++        fprintf(stderr, "TAS mode: failed to start the thread spawner, driver threads will be untracked by libTAS.\n");
++    }
++}
++
++extern "C" int pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) __THROWNL
++{
++    if (g_spawnerRunning.load(std::memory_order_acquire) && IsCalledFromMesa(__builtin_return_address(0)))
++    {
++        std::lock_guard callLock(g_spawnCallMutex);
++
++        SpawnRequest request{ thread, attr, start, arg, 0, false };
++
++        std::unique_lock lock(g_spawnMutex);
++        g_spawnRequest = &request;
++        g_spawnCondition.notify_all();
++        g_spawnCondition.wait(lock, [&]() { return request.done; });
++        g_spawnRequest = nullptr;
++
++        static std::atomic<int> s_count;
++        fprintf(stderr, "TAS mode: driver thread %d created through the spawner (result %d)\n", ++s_count, request.result);
++
++        return request.result;
++    }
++
++    return GetRealPthreadCreate()(thread, attr, start, arg);
++}
++
++// The game loads data, mixes audio and runs jobs on background threads that run at the speed of the
++// host CPU and race each other, while libTAS advances frames on its own schedule. Which thread gets a
++// lock first, or how much a background thread gets done before a frame ends, then varies between runs,
++// which desyncs movies.
++//
++// The scheduler removes that. Only one guest thread runs at a time: the one holding the run token. The
++// token is only handed on when its holder blocks, sleeps or exits, and it goes to the thread that has
++// been runnable the longest. Threads become runnable at points that only depend on what the guest does
++// (being created, or another thread changing what they wait for), so the order is the same every run.
++//
++// Every guest-level wait goes through the scheduler. Whoever changes state tries every waiter's
++// tryAcquire() under the scheduler lock, in the order they started waiting, and queues the ones that
++// succeed. Before presenting, the presenting thread gives up the token until every other guest thread is
++// blocked, so each frame contains the same work. Threads that sleep or yield, and the audio thread, run
++// again at the next frame, or earlier if every thread is blocked (so a thread waiting on them can't
++// deadlock). Savestates are always taken while every other guest thread is blocked in the scheduler.
++
++#include <cpu/ppc_context.h>
++
++#include <execinfo.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <deque>
++#include <thread>
++#include <vector>
++
++namespace TasScheduler
++{
++    struct TrackedThread
++    {
++        pthread_t thread{};
++        pid_t tid{};
++        bool blocked = false;
++        // Signalled when this thread is given the run token.
++        std::condition_variable tokenCondition;
++    };
++
++    struct Waiter
++    {
++        const std::function<bool()>* tryAcquire;
++        TrackedThread* tracked;
++        bool done;
++        // Only used by threads the scheduler doesn't track; tracked ones wait for the token instead.
++        std::condition_variable condition;
++        // For timed sleeps: the virtual time (in microseconds) to wake up at, or 0.
++        uint64_t deadline = 0;
++    };
++
++    static std::vector<TrackedThread*> g_trackedThreads;
++    static thread_local TrackedThread* g_self;
++    static thread_local uint32_t g_pollsSinceBlocked;
++    // Scheduler operations (locks, events, ...) the thread did since it last blocked. A thread that does
++    // this many without ever blocking is probably waiting in a loop for another thread, which can't run
++    // while it holds the token, so it's made to sleep briefly. Counting operations rather than time keeps
++    // the point where that happens the same on every run.
++    static thread_local uint32_t g_operationsSinceBlocked;
++    static constexpr uint32_t OperationsBeforePreempting = 10000;
++    static int g_stallFile = -1;
++
++    static std::mutex g_mutex;
++    static std::condition_variable g_presenterCondition; // Wakes a thread in WaitForOtherThreads().
++    static std::vector<Waiter*> g_waiters;
++
++    // The thread allowed to run guest code, and the ones waiting for it in order.
++    static TrackedThread* g_tokenHolder;
++    static std::deque<TrackedThread*> g_runnable;
++    // Set if a thread held the token too long: threads then run in parallel as a fallback.
++    static bool g_serialDisabled;
++    // Counts token hand-offs, so the watchdog can tell when the token stopped moving.
++    static uint64_t g_tokenPasses;
++    // Threads in WaitForHost(). While there are any, frames don't end and blocked threads aren't released,
++    // as how often that would happen would depend on how long the host takes.
++    static int g_hostWaiters;
++
++    static bool g_presenterWaiting;
++    // Threads between WaitForOtherThreads() and AdvanceFrame(). Nothing else is released while one is
++    // presenting, as libTAS does its frame processing (audio mixing, savestates) in the middle of that.
++    static int g_presenting;
++    // Incremented every frame: wakes threads waiting for the next frame (vsync waits, the loading loop).
++    static uint64_t g_sleepGeneration;
++
++    // Timed sleeps run on a virtual clock, in microseconds, so a thread sleeping 1 ms in a loop gets as
++    // many iterations per frame as it would on the real hardware, however long frames take to render. It
++    // only moves at deterministic points: stepping through a frame when it ends, or jumping to the next
++    // wake-up when every thread is blocked.
++    static constexpr uint64_t FrameLength = 1000000 / 60;
++    static uint64_t g_virtualTime = 1;
++    static uint64_t g_frameStart = 1;
++
++    // Reported by TasTrace: jumps of the virtual clock made because every thread was blocked.
++    static uint64_t g_statJumps;
++    static uint64_t g_statJumpedTime;
++    static uint64_t g_framesAdvanced;
++    static int g_longFrameDumps;
++    static void DumpAllThreads(const char* reason);
++
++    // Totals reported by TasTrace.
++    static uint64_t g_statBlocked;
++    static uint64_t g_statSleeps;
++    static uint64_t g_statGaveUp;
++
++    // Virtual time the guest started at, and audio callbacks run since.
++    static uint64_t g_audioStart;
++    static uint64_t g_audioCallbacksDone;
++
++    // Real time and sleeps that bypass libTAS, which would otherwise count them as game time.
++    static uint64_t RealTimeMilliseconds()
++    {
++        timespec ts{};
++        syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
++        return uint64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
++    }
++
++    static void RealSleepMilliseconds(uint32_t milliseconds)
++    {
++        timespec ts{ milliseconds / 1000, long(milliseconds % 1000) * 1000000 };
++        syscall(SYS_nanosleep, &ts, nullptr);
++    }
++
++    static bool IsIdle()
++    {
++        if (g_serialDisabled)
++        {
++            // Threads don't take turns anymore, so check that each one is actually blocked.
++            return std::all_of(g_trackedThreads.begin(), g_trackedThreads.end(), [](TrackedThread* thread) { return thread->blocked; });
++        }
++
++        return g_tokenHolder == nullptr && g_runnable.empty();
++    }
++
++    // Lock held.
++    static void PassToken()
++    {
++        if (g_serialDisabled || g_tokenHolder != nullptr || g_runnable.empty())
++            return;
++
++        g_tokenHolder = g_runnable.front();
++        g_runnable.pop_front();
++        g_tokenPasses++;
++        g_tokenHolder->tokenCondition.notify_one();
++    }
++
++    // Lock held. Blocks until the calling thread holds the token.
++    static void WaitForToken(std::unique_lock<std::mutex>& lock)
++    {
++        if (g_serialDisabled)
++            return;
++
++        g_self->tokenCondition.wait(lock, []() { return g_tokenHolder == g_self || g_serialDisabled; });
++    }
++
++    // Lock held.
++    static void ReleaseToken()
++    {
++        if (g_tokenHolder == g_self)
++        {
++            g_tokenHolder = nullptr;
++            PassToken();
++        }
++    }
++
++    static bool WakeReadyWaiters()
++    {
++        bool woke = false;
++
++        for (auto it = g_waiters.begin(); it != g_waiters.end();)
++        {
++            Waiter* waiter = *it;
++
++            if ((*waiter->tryAcquire)())
++            {
++                waiter->done = true;
++
++                if (waiter->tracked != nullptr)
++                {
++                    waiter->tracked->blocked = false;
++
++                    // Without turns, wake it directly rather than queueing it for the token.
++                    if (g_serialDisabled)
++                        waiter->tracked->tokenCondition.notify_one();
++                    else
++                        g_runnable.push_back(waiter->tracked);
++                }
++                else
++                {
++                    waiter->condition.notify_one();
++                }
++
++                it = g_waiters.erase(it);
++                woke = true;
++            }
++            else
++            {
++                ++it;
++            }
++        }
++
++        return woke;
++    }
++
++    // The earliest virtual time a timed sleep wakes up at, if any.
++    static uint64_t NextDeadline()
++    {
++        uint64_t next = UINT64_MAX;
++
++        for (Waiter* waiter : g_waiters)
++        {
++            if (waiter->deadline != 0)
++                next = std::min(next, waiter->deadline);
++        }
++
++        return next;
++    }
++
++    // Must be called with the lock held after anything that can unblock a waiter or stop a thread.
++    static void Update()
++    {
++        WakeReadyWaiters();
++
++        // Every guest thread is blocked, and none is presenting: nothing will happen until time passes.
++        // Jump to the next timed wake-up. Without one, let threads waiting for the next frame and the audio
++        // thread run once more, as one of them may be what the others are waiting for.
++        if (IsIdle() && g_presenting == 0 && g_hostWaiters == 0 && !g_waiters.empty())
++        {
++            uint64_t next = NextDeadline();
++
++            if (next != UINT64_MAX)
++            {
++                if (next > g_virtualTime)
++                {
++                    g_statJumps++;
++                    g_statJumpedTime += next - g_virtualTime;
++                }
++
++                g_virtualTime = std::max(g_virtualTime, next);
++
++                // UNLEASHED_TAS_DUMP_LONG_FRAMES=<frame>: once past that many frames, dump every thread the
++                // first few times a frame takes more than three frames of virtual time, to see what waits.
++                static const uint64_t s_dumpAfter = []()
++                {
++                    const char* value = std::getenv("UNLEASHED_TAS_DUMP_LONG_FRAMES");
++                    return value != nullptr ? std::strtoull(value, nullptr, 10) : UINT64_MAX;
++                }();
++
++                if (g_framesAdvanced >= s_dumpAfter && g_virtualTime > g_frameStart + 3 * FrameLength && g_longFrameDumps < 3)
++                {
++                    g_longFrameDumps++;
++                    DumpAllThreads("frame took more than three frames of virtual time");
++                }
++            }
++            else
++            {
++                g_sleepGeneration++;
++            }
++
++            WakeReadyWaiters();
++        }
++
++        PassToken();
++
++        if (g_presenterWaiting)
++            g_presenterCondition.notify_one();
++    }
++
++    static void WaitLocked(std::unique_lock<std::mutex>& lock, const std::function<bool()>& tryAcquire, uint64_t deadline = 0)
++    {
++        if (tryAcquire())
++            return;
++
++        Waiter waiter{ &tryAcquire, g_self, false };
++        waiter.deadline = deadline;
++        g_waiters.push_back(&waiter);
++        g_statBlocked++;
++        g_pollsSinceBlocked = 0;
++        g_operationsSinceBlocked = 0;
++
++        if (g_self != nullptr)
++        {
++            g_self->blocked = true;
++            ReleaseToken();
++        }
++
++        Update();
++
++        if (g_self != nullptr)
++        {
++            // Woken threads are queued for the token by whoever woke them.
++            g_self->tokenCondition.wait(lock, [&]() { return waiter.done && (g_tokenHolder == g_self || g_serialDisabled); });
++        }
++        else
++        {
++            waiter.condition.wait(lock, [&]() { return waiter.done; });
++        }
++    }
++
++    static thread_local uint32_t g_waitingLock;
++    static thread_local uint32_t g_waitingLockOwner;
++
++    void NoteWaitingOnLock(uint32_t lockAddress, uint32_t owner)
++    {
++        g_waitingLock = lockAddress;
++        g_waitingLockOwner = owner;
++    }
++
++    // Writes the calling thread's stack to the stall report. Runs in a signal handler.
++    static void StallBacktraceHandler(int)
++    {
++        // r13 is the guest's thread pointer, which is also what critical sections record as their owner.
++        char header[160];
++        int length = snprintf(header, sizeof(header), "--- thread %ld --- r13=0x%08X waiting_on_lock=0x%08X lock_owner=0x%08X\n",
++            long(syscall(SYS_gettid)), g_ppcContext != nullptr ? g_ppcContext->r13.u32 : 0u, g_waitingLock, g_waitingLockOwner);
++        syscall(SYS_write, g_stallFile, header, size_t(length));
++
++        void* frames[48];
++        int frameCount = backtrace(frames, int(std::size(frames)));
++        backtrace_symbols_fd(frames, frameCount, g_stallFile);
++    }
++
++    static void FallBackToParallel(const char* reason);
++
++    void InitMainThread()
++    {
++        std::lock_guard lock(g_mutex);
++
++        g_self = new TrackedThread();
++        g_self->thread = pthread_self();
++        g_self->tid = pid_t(syscall(SYS_gettid));
++        g_trackedThreads.push_back(g_self);
++
++        // The main thread starts out holding the token.
++        g_tokenHolder = g_self;
++        g_audioStart = g_virtualTime;
++
++        // libTAS calls exit() itself, e.g. when it loses its connection to the game. That runs static
++        // destructors while guest threads are still running or blocked here, and destroying the audio
++        // thread's std::thread aborts. Registered after the statics, this runs first and ends the process
++        // right away instead, like App::Exit().
++        std::atexit([]()
++        {
++            std::fflush(nullptr);
++            std::_Exit(0);
++        });
++
++        // Where to report threads that keep a frame from ending, written with raw system calls so libTAS
++        // doesn't intercept it. backtrace() is called once here, as its first call isn't signal-safe.
++        if (const char* home = std::getenv("HOME"))
++        {
++            std::string path = fmt::format("{}/tas_stall.txt", home);
++            g_stallFile = int(syscall(SYS_openat, AT_FDCWD, path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644));
++        }
++
++        void* frames[1];
++        backtrace(frames, 1);
++
++        struct sigaction action{};
++        action.sa_handler = StallBacktraceHandler;
++        action.sa_flags = SA_RESTART;
++        sigemptyset(&action.sa_mask);
++        sigaction(SIGURG, &action, nullptr);
++
++        // Wakes a presenter that has been waiting for a long time, so it can give up (see below), and
++        // notices when a thread keeps the token without blocking while others wait for it (a spin loop).
++        std::thread([]()
++        {
++            uint64_t lastPasses = 0;
++            uint64_t lastChange = RealTimeMilliseconds();
++
++            while (true)
++            {
++                RealSleepMilliseconds(500);
++                g_presenterCondition.notify_all();
++
++                std::lock_guard lock(g_mutex);
++
++                // While a frame is being presented, the holder may be inside libTAS's frame boundary for as
++                // long as libTAS stays paused, so only count time outside of that.
++                if (g_serialDisabled || g_presenting > 0 || g_hostWaiters > 0 || g_tokenPasses != lastPasses || g_tokenHolder == nullptr || g_runnable.empty())
++                {
++                    lastPasses = g_tokenPasses;
++                    lastChange = RealTimeMilliseconds();
++                }
++                else if (RealTimeMilliseconds() - lastChange > 60000)
++                {
++                    FallBackToParallel("a guest thread kept the run token for 60 seconds without blocking");
++                }
++            }
++        }).detach();
++    }
++
++    void* OnThreadCreated()
++    {
++        std::lock_guard lock(g_mutex);
++
++        auto* thread = new TrackedThread();
++        g_trackedThreads.push_back(thread);
++
++        if (!g_serialDisabled)
++            g_runnable.push_back(thread);
++
++        return thread;
++    }
++
++    void OnThreadStarted(void* thread)
++    {
++        std::unique_lock lock(g_mutex);
++
++        g_self = static_cast<TrackedThread*>(thread);
++        g_self->thread = pthread_self();
++        g_self->tid = pid_t(syscall(SYS_gettid));
++
++        PassToken();
++        WaitForToken(lock);
++    }
++
++    void OnThreadExited(const std::function<void()>& markExited)
++    {
++        std::lock_guard lock(g_mutex);
++
++        markExited();
++
++        if (g_self != nullptr)
++        {
++            ReleaseToken();
++            std::erase(g_trackedThreads, g_self);
++            delete g_self;
++            g_self = nullptr;
++        }
++
++        Update();
++    }
++
++    // Called without the lock, before every operation of a thread that may hold the token. After enough
++    // operations without blocking, hands the token to the next runnable thread, if there is one. This
++    // mustn't sleep: with nothing else to run, that would make the virtual clock jump ahead of the frames
++    // (the game's memory allocator alone takes its lock hundreds of thousands of times per frame).
++    static void CountOperation()
++    {
++        if (g_self == nullptr || g_serialDisabled || ++g_operationsSinceBlocked < OperationsBeforePreempting)
++            return;
++
++        g_operationsSinceBlocked = 0;
++
++        std::unique_lock lock(g_mutex);
++
++        if (g_tokenHolder == g_self && !g_runnable.empty())
++        {
++            g_runnable.push_back(g_self);
++            g_tokenHolder = nullptr;
++            PassToken();
++            WaitForToken(lock);
++        }
++    }
++
++    void Wait(const std::function<bool()>& tryAcquire)
++    {
++        CountOperation();
++
++        std::unique_lock lock(g_mutex);
++        WaitLocked(lock, tryAcquire);
++    }
++
++    bool Run(const std::function<bool()>& tryAcquire)
++    {
++        CountOperation();
++
++        std::lock_guard lock(g_mutex);
++        return tryAcquire();
++    }
++
++    void Modify(const std::function<void()>& change)
++    {
++        CountOperation();
++
++        std::lock_guard lock(g_mutex);
++        change();
++        Update();
++    }
++
++    void Sleep()
++    {
++        std::unique_lock lock(g_mutex);
++
++        g_statSleeps++;
++
++        // Until the next frame is presented, or until the virtual clock reaches the next frame boundary
++        // (which it can do without a frame being presented, when every thread is blocked).
++        uint64_t generation = g_sleepGeneration;
++        uint64_t deadline = g_frameStart + FrameLength;
++        while (deadline <= g_virtualTime)
++            deadline += FrameLength;
++
++        WaitLocked(lock, [generation, deadline]() { return g_sleepGeneration != generation || g_virtualTime >= deadline; }, deadline);
++    }
++
++    void SleepFor(uint32_t milliseconds)
++    {
++        std::unique_lock lock(g_mutex);
++
++        g_statSleeps++;
++
++        if (milliseconds == 0)
++        {
++            // A yield: let everything else run, and wake at the next scheduled event (a timed sleep ending,
++            // an audio callback, the next frame), without adding time of its own. A thread polling in a loop
++            // then takes as much virtual time as what it waits for, as on the real hardware, rather than
++            // pushing the clock (and audio) ahead of the frames.
++            uint64_t time = g_virtualTime;
++            uint64_t generation = g_sleepGeneration;
++            WaitLocked(lock, [time, generation]() { return g_virtualTime != time || g_sleepGeneration != generation; });
++            return;
++        }
++
++        uint64_t deadline = g_virtualTime + uint64_t(milliseconds) * 1000;
++        WaitLocked(lock, [deadline]() { return g_virtualTime >= deadline; }, deadline);
++    }
++
++    void YieldIfPolling()
++    {
++        if (g_self == nullptr)
++            return;
++
++        if (g_pollsSinceBlocked++ != 0)
++            SleepFor(0);
++    }
++
++    void WaitForAudioCallback()
++    {
++        std::unique_lock lock(g_mutex);
++
++        // Audio runs on the virtual clock like any timed sleep: one callback per 256 samples at 48 kHz,
++        // i.e. every 16000 / 3 microseconds. It runs two frames ahead of it, so libTAS, which takes 800
++        // samples each frame, always has enough queued: produced just in time, a frame that only got three
++        // callbacks (768 samples) would be short and play a gap.
++        constexpr uint64_t Headroom = 2 * FrameLength;
++        uint64_t deadline = g_audioStart + (g_audioCallbacksDone + 1) * 16000 / 3;
++        deadline = deadline > g_audioStart + Headroom ? deadline - Headroom : g_audioStart;
++        WaitLocked(lock, [deadline]() { return g_virtualTime >= deadline; }, deadline);
++
++        g_audioCallbacksDone++;
++    }
++
++    void WaitForHost(const std::function<bool()>& ready)
++    {
++        {
++            std::lock_guard lock(g_mutex);
++
++            g_hostWaiters++;
++
++            if (g_self != nullptr)
++                ReleaseToken();
++
++            Update();
++        }
++
++        while (!ready())
++            RealSleepMilliseconds(1);
++
++        std::unique_lock lock(g_mutex);
++
++        g_hostWaiters--;
++
++        if (g_self != nullptr && !g_serialDisabled && g_tokenHolder != g_self)
++        {
++            g_runnable.push_back(g_self);
++            PassToken();
++            WaitForToken(lock);
++        }
++
++        Update();
++    }
++
++    static void ReportStall()
++    {
++        if (g_stallFile < 0)
++            return;
++
++        std::string header = fmt::format("=== stall: token held by thread {}, {} runnable, {} presenting, reported by thread {} ===\n",
++            g_tokenHolder != nullptr ? long(g_tokenHolder->tid) : -1L, g_runnable.size(), g_presenting, long(syscall(SYS_gettid)));
++        syscall(SYS_write, g_stallFile, header.data(), header.size());
++
++        for (TrackedThread* thread : g_trackedThreads)
++        {
++            if (thread != g_self && !thread->blocked && thread->tid != 0)
++                pthread_kill(thread->thread, SIGURG);
++        }
++    }
++
++    // Lock held. Writes every tracked thread's stack to the stall report, one after the other.
++    static void DumpAllThreads(const char* reason)
++    {
++        if (g_stallFile < 0)
++            return;
++
++        std::string header = fmt::format("=== {} (virtual time {} us, frame started at {} us) ===\n", reason, g_virtualTime, g_frameStart);
++        syscall(SYS_write, g_stallFile, header.data(), header.size());
++
++        for (TrackedThread* thread : g_trackedThreads)
++        {
++            if (thread->tid != 0 && thread != g_self)
++            {
++                pthread_kill(thread->thread, SIGURG);
++                RealSleepMilliseconds(20);
++            }
++        }
++    }
++
++    // Lock held. Lets every thread run in parallel from now on, rather than deadlock.
++    static void FallBackToParallel(const char* reason)
++    {
++        fprintf(stderr, "TAS mode: %s. Threads now run in parallel; playback won't be deterministic. See ~/tas_stall.txt.\n", reason);
++
++        g_statGaveUp++;
++        ReportStall();
++
++        g_serialDisabled = true;
++        g_tokenHolder = nullptr;
++        g_runnable.clear();
++
++        for (TrackedThread* thread : g_trackedThreads)
++            thread->tokenCondition.notify_all();
++
++        g_presenterCondition.notify_all();
++    }
++
++    void WaitForOtherThreads()
++    {
++        std::unique_lock lock(g_mutex);
++
++        g_presenting++;
++        g_presenterWaiting = true;
++
++        // A new frame: the first poll in it doesn't need to yield.
++        g_pollsSinceBlocked = 0;
++
++        // Let every other runnable thread finish its work first.
++        if (g_self != nullptr)
++            ReleaseToken();
++
++        const uint64_t start = RealTimeMilliseconds();
++
++        auto waitUntilIdle = [&]()
++        {
++            while ((!IsIdle() || g_hostWaiters > 0) && !g_serialDisabled)
++            {
++                // A thread that spins without ever blocking would keep the token forever. Give up rather than
++                // deadlock, and let threads run in parallel from then on; frames aren't deterministic after that.
++                if (RealTimeMilliseconds() - start > 60000)
++                {
++                    FallBackToParallel("the other guest threads didn't all block within 60 seconds of a frame ending");
++                    break;
++                }
++
++                g_presenterCondition.wait(lock);
++            }
++        };
++
++        waitUntilIdle();
++
++        // Step the virtual clock through the rest of the frame, waking timed sleeps in order and letting
++        // everything run until blocked again after each one.
++        const uint64_t frameEnd = g_frameStart + FrameLength;
++
++        while (!g_serialDisabled)
++        {
++            uint64_t next = NextDeadline();
++            if (next > frameEnd)
++                break;
++
++            g_virtualTime = std::max(g_virtualTime, next);
++            WakeReadyWaiters();
++            PassToken();
++
++            waitUntilIdle();
++        }
++
++        g_virtualTime = std::max(g_virtualTime, frameEnd);
++        g_presenterWaiting = false;
++
++        if (g_self != nullptr && !g_serialDisabled)
++            g_tokenHolder = g_self;
++    }
++
++    void AdvanceFrame()
++    {
++        std::lock_guard lock(g_mutex);
++
++        if (g_presenting > 0)
++            g_presenting--;
++
++        g_sleepGeneration++;
++        g_frameStart = g_virtualTime;
++        g_framesAdvanced++;
++
++        Update();
++    }
++}
++
++#include <fcntl.h>
++#include <kernel/heap.h>
++#include <kernel/memory.h>
++
++namespace TasTrace
++{
++    static int g_file = -1;
++    static std::mutex g_writeMutex;
++    static uint64_t g_frame;
++    static std::atomic<uint64_t> g_audioDropped;
++    static std::atomic<uint32_t> g_audioQueued;
++
++    bool IsEnabled()
++    {
++        static const bool s_enabled = []()
++        {
++            const char* path = std::getenv("UNLEASHED_TAS_TRACE");
++            if (!IsTasMode() || path == nullptr || path[0] == '\0')
++                return false;
++
++            // libTAS restarts the game for every playback, so give each run its own file.
++            std::string fullPath = fmt::format("{}.{}", path, getpid());
++
++            // Raw system calls: libTAS intercepts file writes from the game (to prevent it from saving),
++            // and the trace must reach the disk.
++            g_file = int(syscall(SYS_openat, AT_FDCWD, fullPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
++            if (g_file < 0)
++                fprintf(stderr, "TAS mode: couldn't open the trace file %s.\n", fullPath.c_str());
++            else
++                fprintf(stderr, "TAS mode: writing the trace to %s.\n", fullPath.c_str());
++
++            return g_file >= 0;
++        }();
++
++        return s_enabled;
++    }
++
++    static void Write(const char* data, size_t size)
++    {
++        std::lock_guard lock(g_writeMutex);
++
++        while (size != 0)
++        {
++            ssize_t written = syscall(SYS_write, g_file, data, size);
++            if (written <= 0)
++                return;
++
++            data += written;
++            size -= size_t(written);
++        }
++    }
++
++    static size_t HeapAllocated(Mutex& mutex, O1HeapInstance* heap)
++    {
++        std::lock_guard lock(mutex);
++        return o1heapGetDiagnostics(heap).allocated;
++    }
++
++    void OnFrame()
++    {
++        if (!IsEnabled())
++            return;
++
++        uint64_t blocked, sleeps, gaveUp, audio, virtualTime, jumps, jumpedTime;
++        {
++            std::lock_guard lock(TasScheduler::g_mutex);
++            blocked = TasScheduler::g_statBlocked;
++            sleeps = TasScheduler::g_statSleeps;
++            gaveUp = TasScheduler::g_statGaveUp;
++            audio = TasScheduler::g_audioCallbacksDone;
++            virtualTime = TasScheduler::g_virtualTime;
++            jumps = TasScheduler::g_statJumps;
++            jumpedTime = TasScheduler::g_statJumpedTime;
++        }
++
++        uint64_t time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++
++        std::string line = fmt::format("F {} time={} virtual_time={} jumps={} jumped_time={} timebase_reads={} blocked={} sleeps={} audio={} audio_dropped={} audio_queued={} gave_up={} heap={} physical_heap={} image=",
++            g_frame++, time, virtualTime, jumps, jumpedTime, g_timebaseReads.load(), blocked, sleeps, audio, g_audioDropped.load(), g_audioQueued.load(), gaveUp,
++            HeapAllocated(g_userHeap.mutex, g_userHeap.heap), HeapAllocated(g_userHeap.physicalMutex, g_userHeap.physicalHeap));
++
++        // The game image holds the guest's global variables. Hash it in 1 MB chunks so a difference
++        // can be narrowed down to a region.
++        constexpr size_t ChunkSize = 0x100000;
++        for (size_t offset = 0; offset < PPC_IMAGE_SIZE; offset += ChunkSize)
++        {
++            size_t size = std::min<size_t>(ChunkSize, PPC_IMAGE_SIZE - offset);
++            uint32_t hash = uint32_t(XXH3_64bits(g_memory.base + PPC_IMAGE_BASE + offset, size));
++            line += fmt::format("{:08x}{}", hash, offset + ChunkSize < PPC_IMAGE_SIZE ? "," : "");
++        }
++
++        // UNLEASHED_TAS_TRACE_CHUNK=<index> also hashes that chunk in 4 KB pages, to narrow a difference down.
++        static const int s_detailChunk = []()
++        {
++            const char* value = std::getenv("UNLEASHED_TAS_TRACE_CHUNK");
++            return value != nullptr ? std::atoi(value) : -1;
++        }();
++
++        if (s_detailChunk >= 0 && size_t(s_detailChunk) * ChunkSize < PPC_IMAGE_SIZE)
++        {
++            constexpr size_t PageSize = 0x1000;
++            size_t chunkStart = size_t(s_detailChunk) * ChunkSize;
++            size_t chunkEnd = std::min<size_t>(chunkStart + ChunkSize, PPC_IMAGE_SIZE);
++
++            line += " pages=";
++            for (size_t offset = chunkStart; offset < chunkEnd; offset += PageSize)
++            {
++                uint32_t hash = uint32_t(XXH3_64bits(g_memory.base + PPC_IMAGE_BASE + offset, PageSize));
++                line += fmt::format("{:08x}{}", hash, offset + PageSize < chunkEnd ? "," : "");
++            }
++        }
++
++        line += '\n';
++
++        Write(line.data(), line.size());
++    }
++
++    void OnAudioSubmit(bool dropped, uint32_t queuedSamples)
++    {
++        if (dropped)
++            g_audioDropped++;
++
++        g_audioQueued = queuedSamples;
++    }
++
++    void OnFileRead(const char* fileName, uint64_t offset, uint32_t size)
++    {
++        if (!IsEnabled())
++            return;
++
++        std::string line = fmt::format("R {} {} offset={} size={}\n", g_frame, fileName, offset, size);
++        Write(line.data(), line.size());
++    }
++}
++
++#else
++
++void StartTasThreadSpawner()
++{
++}
++
++namespace TasScheduler
++{
++    void InitMainThread() {}
++    void* OnThreadCreated() { return nullptr; }
++    void OnThreadStarted(void* thread) {}
++    void OnThreadExited(const std::function<void()>& markExited) { markExited(); }
++    void Wait(const std::function<bool()>& tryAcquire) { while (!tryAcquire()) {} }
++    bool Run(const std::function<bool()>& tryAcquire) { return tryAcquire(); }
++    void Modify(const std::function<void()>& change) { change(); }
++    void Sleep() {}
++    void NoteWaitingOnLock(uint32_t lockAddress, uint32_t owner) {}
++    void SleepFor(uint32_t milliseconds) {}
++    void YieldIfPolling() {}
++    void WaitForAudioCallback() {}
++    void WaitForHost(const std::function<bool()>& ready) { while (!ready()) {} }
++    void WaitForOtherThreads() {}
++    void AdvanceFrame() {}
++}
++
++namespace TasTrace
++{
++    bool IsEnabled() { return false; }
++    void OnFrame() {}
++    void OnFileRead(const char* fileName, uint64_t offset, uint32_t size) {}
++    void OnAudioSubmit(bool dropped, uint32_t queuedSamples) {}
++}
++
++#endif
+diff --git a/UnleashedRecomp/tas_mode.h b/UnleashedRecomp/tas_mode.h
+new file mode 100644
+index 0000000..f478031
+--- /dev/null
++++ b/UnleashedRecomp/tas_mode.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++
++// TAS mode is enabled by setting UNLEASHED_TAS_MODE=1 in the environment.
++// It adjusts behaviour that breaks under libTAS (frozen fake time, savestates),
++// while leaving the normal game untouched.
++inline bool IsTasMode()
++{
++#ifdef __linux__
++    static const bool s_tasMode = []()
++    {
++        const char* value = std::getenv("UNLEASHED_TAS_MODE");
++        return value != nullptr && std::strcmp(value, "0") != 0 && value[0] != '\0';
++    }();
++
++    return s_tasMode;
++#else
++    return false;
++#endif
++}
++
++// Makes the guest timebase (mftb) follow std::chrono::steady_clock, which libTAS controls,
++// instead of the CPU's time stamp counter. Must be called before guest code runs.
++void InstallTasTimebase();
++
++// Starts the thread that creates the Vulkan driver's threads on its behalf (see tas_mode.cpp).
++// Must be called before the Vulkan device is created.
++void StartTasThreadSpawner();
++
++// Makes the game's threads deterministic (see tas_mode.cpp): only one guest thread runs at a time,
++// in a fixed order. Only used in TAS mode; callers check IsTasMode() first.
++namespace TasScheduler
++{
++    // Registers the calling thread, which runs the guest's main function, before guest code starts.
++    void InitMainThread();
++
++    // Called by the creator of a thread that will run guest code, before that thread can run. Queues the
++    // thread to run at this point, so the order doesn't depend on when the OS starts it. The result must
++    // be passed to OnThreadStarted() by the new thread.
++    void* OnThreadCreated();
++    // Called by that thread once it runs, before running any guest code. Waits for its turn.
++    void OnThreadStarted(void* thread);
++    // Called by a thread that ran guest code when it's done. Runs markExited under the scheduler lock.
++    void OnThreadExited(const std::function<void()>& markExited);
++
++    // Blocks until tryAcquire() succeeds. tryAcquire() is always called under the scheduler lock.
++    void Wait(const std::function<bool()>& tryAcquire);
++    // A single attempt, under the scheduler lock.
++    bool Run(const std::function<bool()>& tryAcquire);
++    // Changes state that waiting threads may be blocked on, and wakes the ones that can proceed.
++    void Modify(const std::function<void()>& change);
++
++    // Blocks until the next frame (vsync waits and the like), or until every other thread is blocked.
++    void Sleep();
++    // Guest sleeps and yields: blocks for that long on the scheduler's virtual clock (see tas_mode.cpp).
++    void SleepFor(uint32_t milliseconds);
++    // For functions the game polls in loops without blocking: sleeps if the calling thread already
++    // called one since it last blocked, so the threads it's waiting for get to run.
++    void YieldIfPolling();
++    // For the audio thread: blocks until another audio callback is due.
++    void WaitForAudioCallback();
++
++    // Diagnostics: records the critical section the calling thread is about to wait for (0 when done),
++    // so stall reports can say who holds it.
++    void NoteWaitingOnLock(uint32_t lockAddress, uint32_t owner);
++
++    // For host code waiting on host threads (e.g. pipeline compilation): gives up the run token until
++    // ready() is true, polling it. Frames don't end meanwhile, so how long the host takes doesn't matter.
++    void WaitForHost(const std::function<bool()>& ready);
++
++    // Before presenting: waits until every other guest thread is blocked.
++    void WaitForOtherThreads();
++    // After presenting (the libTAS frame boundary): starts the next frame.
++    void AdvanceFrame();
++}
++
++// A per-frame record of the game's state, for finding what differs between two playbacks of the
++// same movie. Written in TAS mode when UNLEASHED_TAS_TRACE is set to a file path.
++namespace TasTrace
++{
++    bool IsEnabled();
++
++    // At the start of Video::Present, while every other guest thread is blocked.
++    void OnFrame();
++    void OnFileRead(const char* fileName, uint64_t offset, uint32_t size);
++    // From the audio thread: whether a callback's audio was queued or dropped, and how much was queued.
++    void OnAudioSubmit(bool dropped, uint32_t queuedSamples);
++}
+diff --git a/UnleashedRecomp/ui/game_window.cpp b/UnleashedRecomp/ui/game_window.cpp
+index d15aac6..7112106 100644
+--- a/UnleashedRecomp/ui/game_window.cpp
++++ b/UnleashedRecomp/ui/game_window.cpp
+@@ -5,6 +5,7 @@
+ #include <os/version.h>
+ #include <app.h>
+ #include <sdl_listener.h>
++#include <tas_mode.h>
+ #include <SDL_syswm.h>
+ 
+ #if _WIN32
+@@ -161,7 +162,21 @@ void GameWindow::Init(const char* sdlVideoDriver)
+     SDL_SetHint("SDL_APP_ID", "io.github.hedge_dev.unleashedrecomp");
+ #endif
+ 
+-    if (SDL_VideoInit(sdlVideoDriver) != 0 && sdlVideoDriver)
++    if (IsTasMode())
++    {
++        // libTAS only treats the game as an SDL2 game, and sends it SDL events such as the SDL_QUIT from
++        // its Stop button, if video is initialised through SDL_InitSubSystem, which it intercepts.
++        if (sdlVideoDriver)
++            SDL_SetHint(SDL_HINT_VIDEODRIVER, sdlVideoDriver);
++
++        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0 && sdlVideoDriver)
++        {
++            LOGFN_ERROR("Failed to initialise the SDL video driver: \"{}\". Falling back to default.", sdlVideoDriver);
++            SDL_SetHint(SDL_HINT_VIDEODRIVER, nullptr);
++            SDL_InitSubSystem(SDL_INIT_VIDEO);
++        }
++    }
++    else if (SDL_VideoInit(sdlVideoDriver) != 0 && sdlVideoDriver)
+     {
+         LOGFN_ERROR("Failed to initialise the SDL video driver: \"{}\". Falling back to default.", sdlVideoDriver);
+         SDL_VideoInit(nullptr);
+diff --git a/UnleashedRecomp/ui/tas_hud.cpp b/UnleashedRecomp/ui/tas_hud.cpp
+new file mode 100644
+index 0000000..48564ac
+--- /dev/null
++++ b/UnleashedRecomp/ui/tas_hud.cpp
+@@ -0,0 +1,217 @@
++#include "tas_hud.h"
++#include <api/SWA.h>
++#include <gpu/imgui/imgui_snapshot.h>
++#include <kernel/function.h>
++#include <kernel/memory.h>
++#include <ui/imgui_utils.h>
++#include <tas_mode.h>
++
++#include <cmath>
++#include <numbers>
++
++// The day Sonic player context, recorded when its constructor runs. Its velocity is split like in Sonic
++// Generations' CPlayerSpeedContext: the full velocity, the part along the ground and the part along the
++// up vector (full = horizontal + vertical). Found by comparing per-frame dumps of the context with how
++// Sonic's position moves.
++static constexpr uint32_t SONIC_CONTEXT_VFTABLE = 0x820182C4;
++static constexpr uint32_t VELOCITY_OFFSET = 0x210;
++static constexpr uint32_t HORIZONTAL_VELOCITY_OFFSET = 0x220;
++static constexpr uint32_t VERTICAL_VELOCITY_OFFSET = 0x230;
++
++static uint32_t g_speedContext;
++static int16_t g_thumbLX;
++static int16_t g_thumbLY;
++
++// SWA::Player::CPlayerSpeedContext::CPlayerSpeedContext (the base of the day Sonic context)
++PPC_FUNC_IMPL(__imp__sub_82330188);
++PPC_FUNC(sub_82330188)
++{
++    uint32_t context = ctx.r3.u32;
++    __imp__sub_82330188(ctx, base);
++
++    if (TasHud::IsEnabled())
++        g_speedContext = context;
++}
++
++// The target zones of the M-/D-Speed Visualiser, on the stick as SDL reports it: -1..1, Y pointing
++// down, angles as atan2(y, x). Its per-axis deadzone applies before checking them.
++struct TargetZone
++{
++    float StartAngle;
++    float EndAngle;
++    float InnerRadius;
++    float OuterRadius;
++};
++
++static constexpr float PI = std::numbers::pi_v<float>;
++static constexpr float STICK_DEADZONE = 0.05f;
++
++static constexpr TargetZone TARGET_ZONES[] =
++{
++    { 5 * PI / 4, 7 * PI / 4, 0.45f, 0.70f }, // Up
++    { -PI / 4, PI / 4, 0.29f, 0.50f },        // Right
++    { 3 * PI / 4, 5 * PI / 4, 0.29f, 0.50f }, // Left
++};
++
++static bool IsInZone(const TargetZone& zone, float x, float y)
++{
++    float radius = std::hypot(x, y);
++    if (radius < zone.InnerRadius || radius > zone.OuterRadius)
++        return false;
++
++    // Angle from the start of the zone, in [0, 2π), so zones that cross angle 0 work too.
++    float angle = std::fmod(std::atan2(y, x) - zone.StartAngle + 4 * PI, 2 * PI);
++    return angle <= zone.EndAngle - zone.StartAngle;
++}
++
++static float ApplyDeadzone(float value)
++{
++    return std::abs(value) < STICK_DEADZONE ? 0.0f : value;
++}
++
++static float LoadFloat(uint32_t address)
++{
++    uint8_t* base = g_memory.base;
++    uint32_t value = PPC_LOAD_U32(address);
++    float result;
++    memcpy(&result, &value, sizeof(result));
++    return result;
++}
++
++static bool GetVelocity(uint32_t offset, float& x, float& y, float& z)
++{
++    uint8_t* base = g_memory.base;
++
++    // The context may have been destroyed since, and its memory reused.
++    if (g_speedContext == 0 || PPC_LOAD_U32(g_speedContext) != SONIC_CONTEXT_VFTABLE)
++        return false;
++
++    x = LoadFloat(g_speedContext + offset);
++    y = LoadFloat(g_speedContext + offset + 4);
++    z = LoadFloat(g_speedContext + offset + 8);
++    return true;
++}
++
++bool TasHud::IsEnabled()
++{
++    static const bool s_enabled = []()
++    {
++        const char* value = std::getenv("UNLEASHED_TAS_HUD");
++        return IsTasMode() && value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
++    }();
++
++    return s_enabled;
++}
++
++void TasHud::OnInputState(int16_t thumbLX, int16_t thumbLY)
++{
++    g_thumbLX = thumbLX;
++    g_thumbLY = thumbLY;
++}
++
++static void DrawText(ImDrawList* drawList, ImFont* font, float size, ImVec2 pos, ImU32 colour, const std::string& text)
++{
++    drawList->AddText(font, size, { pos.x + Scale(1), pos.y + Scale(1) }, IM_COL32(0, 0, 0, 200), text.c_str());
++    drawList->AddText(font, size, pos, colour, text.c_str());
++}
++
++static void DrawZone(ImDrawList* drawList, ImVec2 centre, float scale, const TargetZone& zone, bool active)
++{
++    constexpr int SEGMENTS = 20;
++
++    ImU32 fill = active ? IM_COL32(0, 255, 0, 200) : IM_COL32(0, 255, 0, 80);
++    ImU32 outline = active ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 160);
++
++    ImVec2 outer[SEGMENTS + 1];
++    ImVec2 inner[SEGMENTS + 1];
++
++    for (int i = 0; i <= SEGMENTS; i++)
++    {
++        float angle = zone.StartAngle + (zone.EndAngle - zone.StartAngle) * i / SEGMENTS;
++        outer[i] = { centre.x + std::cos(angle) * zone.OuterRadius * scale, centre.y + std::sin(angle) * zone.OuterRadius * scale };
++        inner[i] = { centre.x + std::cos(angle) * zone.InnerRadius * scale, centre.y + std::sin(angle) * zone.InnerRadius * scale };
++    }
++
++    // The band isn't convex, so fill it one quad at a time.
++    for (int i = 0; i < SEGMENTS; i++)
++        drawList->AddQuadFilled(outer[i], outer[i + 1], inner[i + 1], inner[i], fill);
++
++    drawList->AddPolyline(outer, SEGMENTS + 1, outline, 0, Scale(1));
++    drawList->AddPolyline(inner, SEGMENTS + 1, outline, 0, Scale(1));
++    drawList->AddLine(outer[0], inner[0], outline, Scale(1));
++    drawList->AddLine(outer[SEGMENTS], inner[SEGMENTS], outline, Scale(1));
++}
++
++void TasHud::Draw()
++{
++    if (!IsEnabled())
++        return;
++
++    auto drawList = ImGui::GetBackgroundDrawList();
++    auto& res = ImGui::GetIO().DisplaySize;
++    auto font = ImFontAtlasSnapshot::GetFont("FOT-SeuratPro-M.otf");
++
++    float radius = Scale(70);
++    ImVec2 centre = { res.x - Scale(40) - radius, res.y - Scale(70) - radius };
++    ImVec2 panelMin = { centre.x - radius - Scale(10), centre.y - radius - Scale(56) };
++    ImVec2 panelMax = { centre.x + radius + Scale(10), centre.y + radius + Scale(48) };
++
++    drawList->AddRectFilled(panelMin, panelMax, IM_COL32(0, 0, 0, 120), Scale(6));
++
++    // Speedometer.
++    float hx, hy, hz, vx, vy, vz, fx, fy, fz;
++    if (GetVelocity(HORIZONTAL_VELOCITY_OFFSET, hx, hy, hz) && GetVelocity(VERTICAL_VELOCITY_OFFSET, vx, vy, vz) &&
++        GetVelocity(VELOCITY_OFFSET, fx, fy, fz))
++    {
++        DrawText(drawList, font, Scale(18), { panelMin.x + Scale(8), panelMin.y + Scale(6) }, IM_COL32_WHITE,
++            fmt::format("Speed {:.2f}", std::sqrt(hx * hx + hy * hy + hz * hz)));
++
++        // The vertical part's sign: along the up vector or against it.
++        float vertical = std::sqrt(vx * vx + vy * vy + vz * vz) * (vy < 0 ? -1.0f : 1.0f);
++        DrawText(drawList, font, Scale(11), { panelMin.x + Scale(8), panelMin.y + Scale(28) }, IM_COL32(220, 220, 220, 255),
++            fmt::format("Total {:.2f}   Vertical {:.2f}", std::sqrt(fx * fx + fy * fy + fz * fz), vertical));
++    }
++    else
++    {
++        DrawText(drawList, font, Scale(18), { panelMin.x + Scale(8), panelMin.y + Scale(6) }, IM_COL32(160, 160, 160, 255), "Speed --");
++    }
++
++    // Stick, as SDL (and libTAS) reports it: XInput's Y is flipped with a bitwise NOT.
++    int16_t sdlX = g_thumbLX;
++    int16_t sdlY = int16_t(~g_thumbLY);
++    float x = ApplyDeadzone(sdlX / 32768.0f);
++    float y = ApplyDeadzone(sdlY / 32768.0f);
++
++    drawList->AddCircle(centre, radius, IM_COL32(255, 255, 255, 200), 64, Scale(1.5f));
++    drawList->AddLine({ centre.x - radius, centre.y }, { centre.x + radius, centre.y }, IM_COL32(255, 255, 255, 90), Scale(1));
++    drawList->AddLine({ centre.x, centre.y - radius }, { centre.x, centre.y + radius }, IM_COL32(255, 255, 255, 90), Scale(1));
++
++    int activeZone = -1;
++    for (int i = 0; i < int(std::size(TARGET_ZONES)); i++)
++    {
++        bool active = IsInZone(TARGET_ZONES[i], x, y);
++        if (active && activeZone < 0)
++            activeZone = i;
++
++        DrawZone(drawList, centre, radius, TARGET_ZONES[i], active);
++    }
++
++    ImVec2 stick = { centre.x + x * radius, centre.y + y * radius };
++    drawList->AddLine(centre, stick, IM_COL32(255, 60, 60, 255), Scale(2));
++    drawList->AddCircleFilled(stick, Scale(4.5f), IM_COL32(255, 60, 60, 255));
++
++    ImU32 zoneColour = activeZone >= 0 ? IM_COL32(80, 255, 80, 255) : IM_COL32(200, 200, 200, 255);
++    std::string zoneText = activeZone >= 0 ? fmt::format("Zone {}", activeZone + 1) : "No zone";
++    DrawText(drawList, font, Scale(11), { panelMin.x + Scale(8), centre.y + radius + Scale(6) }, zoneColour, zoneText);
++
++    // What to type into libTAS, and what the game made of it.
++    DrawText(drawList, font, Scale(11), { panelMin.x + Scale(8), centre.y + radius + Scale(20) }, IM_COL32_WHITE,
++        fmt::format("X {:.2f} Y {:.2f}  ({}, {})", x, y, sdlX, sdlY));
++
++    if (auto inputState = SWA::CInputState::GetInstance())
++    {
++        auto& padState = inputState->GetPadState();
++        DrawText(drawList, font, Scale(11), { panelMin.x + Scale(8), centre.y + radius + Scale(34) }, IM_COL32(200, 200, 200, 255),
++            fmt::format("Game {:.2f} {:.2f}", float(padState.LeftStickHorizontal), float(padState.LeftStickVertical)));
++    }
++}
+diff --git a/UnleashedRecomp/ui/tas_hud.h b/UnleashedRecomp/ui/tas_hud.h
+new file mode 100644
+index 0000000..7139934
+--- /dev/null
++++ b/UnleashedRecomp/ui/tas_hud.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <cstdint>
++
++// A TAS mode overlay, enabled with UNLEASHED_TAS_HUD=1: Sonic's speed, and the left stick with the
++// M-/D-Speed target zones. It's drawn into the game's frames, so it also shows up in encodes.
++namespace TasHud
++{
++    bool IsEnabled();
++
++    // From XamInputGetState: the left stick given to the game, in XInput's convention (Y up).
++    void OnInputState(int16_t thumbLX, int16_t thumbLY);
++
++    void Draw();
++}
+diff --git a/UnleashedRecompLib/config/SWA.toml b/UnleashedRecompLib/config/SWA.toml
+index 5063e71..c5382fc 100644
+--- a/UnleashedRecompLib/config/SWA.toml
++++ b/UnleashedRecompLib/config/SWA.toml
+@@ -1153,3 +1153,22 @@ registers = ["f1"]
+ name = "CEvilSonicContext_CStateWall_LeaveRotationMidAsmHook"
+ address = 0x82406774
+ registers = ["f1"]
++
++# TAS mode: the audio library spins here, polling a task's status until another thread has advanced it.
++# Only reached when the loop comes around again, so always yield.
++[[midasm_hook]]
++name = "TasSpinYieldMidAsmHook"
++address = 0x8316CFE0
++registers = ["r3"]
++
++# TAS mode: stopping a sound spins here, updating its streams until they have stopped, which needs the
++# audio thread to run. Let the thread yield so it can.
++[[midasm_hook]]
++name = "TasStreamStopWaitMidAsmHook"
++address = 0x83148E78
++
++# TAS mode: another loop stopping a sound (in sub_8314A410), polling its status and updating its streams
++# until it has stopped. Reached when loading a stage while a sound is still stopping (e.g. on a fresh save).
++[[midasm_hook]]
++name = "TasStreamStopWaitMidAsmHook"
++address = 0x8314A498
+Submodule thirdparty/plume 1192686..6cf6a31:
+diff --git a/thirdparty/plume/plume_vulkan.cpp b/thirdparty/plume/plume_vulkan.cpp
+index 9103ca8..fb1c80e 100644
+--- a/thirdparty/plume/plume_vulkan.cpp
++++ b/thirdparty/plume/plume_vulkan.cpp
+@@ -3192,6 +3192,24 @@ namespace plume {
+             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
+             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
+         }
++        else if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
++            assert(dstBuffer != nullptr);
++            assert(srcTexture != nullptr);
++
++            const uint32_t blockWidth = RenderFormatBlockWidth(srcTexture->desc.format);
++            VkBufferImageCopy imageCopy = {};
++            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
++            imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
++            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
++            imageCopy.imageSubresource.layerCount = 1;
++            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
++            imageCopy.imageExtent.width = dstLocation.placedFootprint.width;
++            imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
++            imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
++            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
++        }
+         else {
+             VkImageCopy imageCopy = {};
+             imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
+Submodule tools/XenonRecomp c5bfd90..0890ac5:
+diff --git a/tools/XenonRecomp/XenonRecomp/recompiler.cpp b/tools/XenonRecomp/XenonRecomp/recompiler.cpp
+index fa91527..50d558c 100644
+--- a/tools/XenonRecomp/XenonRecomp/recompiler.cpp
++++ b/tools/XenonRecomp/XenonRecomp/recompiler.cpp
+@@ -1260,7 +1260,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MFTB:
+-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
++        println("\t{}.u64 = PPCReadTimebase();", r(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_MR:
+diff --git a/tools/XenonRecomp/XenonUtils/ppc_context.h b/tools/XenonRecomp/XenonUtils/ppc_context.h
+index 31a86cd..17ea6e1 100644
+--- a/tools/XenonRecomp/XenonUtils/ppc_context.h
++++ b/tools/XenonRecomp/XenonUtils/ppc_context.h
+@@ -700,4 +700,13 @@ inline uint64_t __rdtsc()
+ #   error "Missing implementation for __rdtsc()"
+ #endif
+ 
++// The host can replace the guest timebase (mftb), which otherwise reads the CPU's time stamp counter,
++// e.g. so that a tool controlling time (such as libTAS) also controls the guest's timebase.
++inline uint64_t (*g_ppcTimebaseOverride)() = nullptr;
++
++inline uint64_t PPCReadTimebase()
++{
++    return g_ppcTimebaseOverride != nullptr ? g_ppcTimebaseOverride() : __rdtsc();
++}
++
+ #endif
