@@ -238,6 +238,59 @@ static float ApplyDeadzone(float value)
     return std::abs(value) < STICK_DEADZONE ? 0.0f : value;
 }
 
+// How the game reads the stick, fitted to the values it produces (within 0.001): each axis loses a
+// deadzone and is scaled back to 0..1, then the vector is shortened to length 1 if it's longer.
+static constexpr float GAME_STICK_DEADZONE = 0.2651f;
+
+// The break-jump glitch: holding the stick through a switch to 2D and a jump, where the game reads it as at
+// least 0.1 long (2D movement ignores shorter input) but shorter than 0.3 (NoPadStopWalkPadLengthLimit,
+// parameter 140), makes Sonic's velocity explode. Found by replaying a movie with the stick at different
+// positions, then matching the limits with the game's values.
+static constexpr float BREAK_JUMP_MIN_LENGTH = 0.1f;
+static constexpr float BREAK_JUMP_MAX_LENGTH = 0.3f;
+
+// The raw stick positions the game reads as a given length form a square with rounded corners: the
+// deadzone cross in the middle, then arcs of radius length * (1 - deadzone) around (±deadzone, ±deadzone).
+// The zone is the ring between the two lengths.
+static void DrawBreakJumpZone(ImDrawList* drawList, ImVec2 centre, float scale, bool active)
+{
+    constexpr int ARC_SEGMENTS = 8;
+    constexpr int POINTS = 4 * (ARC_SEGMENTS + 1);
+
+    ImVec2 inner[POINTS];
+    ImVec2 outer[POINTS];
+    int count = 0;
+
+    for (int quadrant = 0; quadrant < 4; quadrant++)
+    {
+        float cornerX = (quadrant == 0 || quadrant == 3) ? GAME_STICK_DEADZONE : -GAME_STICK_DEADZONE;
+        float cornerY = quadrant < 2 ? GAME_STICK_DEADZONE : -GAME_STICK_DEADZONE;
+
+        for (int i = 0; i <= ARC_SEGMENTS; i++, count++)
+        {
+            float angle = (quadrant + float(i) / ARC_SEGMENTS) * PI / 2;
+            float cosine = std::cos(angle) * (1.0f - GAME_STICK_DEADZONE);
+            float sine = std::sin(angle) * (1.0f - GAME_STICK_DEADZONE);
+
+            inner[count] = { centre.x + (cornerX + cosine * BREAK_JUMP_MIN_LENGTH) * scale, centre.y + (cornerY + sine * BREAK_JUMP_MIN_LENGTH) * scale };
+            outer[count] = { centre.x + (cornerX + cosine * BREAK_JUMP_MAX_LENGTH) * scale, centre.y + (cornerY + sine * BREAK_JUMP_MAX_LENGTH) * scale };
+        }
+    }
+
+    ImU32 fill = active ? IM_COL32(255, 150, 30, 200) : IM_COL32(255, 150, 30, 70);
+    ImU32 outline = active ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 120);
+
+    // The ring isn't convex, so fill it one quad at a time; the gaps between quadrants are the straight sides.
+    for (int i = 0; i < POINTS; i++)
+    {
+        int next = (i + 1) % POINTS;
+        drawList->AddQuadFilled(outer[i], outer[next], inner[next], inner[i], fill);
+    }
+
+    drawList->AddPolyline(outer, POINTS, outline, ImDrawFlags_Closed, Scale(1));
+    drawList->AddPolyline(inner, POINTS, outline, ImDrawFlags_Closed, Scale(1));
+}
+
 bool TasHud::IsEnabled()
 {
     static const bool s_enabled = []()
@@ -480,7 +533,8 @@ void TasHud::Draw()
         }
 
         DrawText(drawList, font, Scale(11), { left, stateRow }, IM_COL32(220, 220, 220, 255),
-            fmt::format("{}  {}f", stateName, int(std::lround(stateTime / deltaTime))));    }
+            fmt::format("{}  {}f", stateName, int(std::lround(stateTime / deltaTime))));
+    }
     else
     {
         DrawText(drawList, font, Scale(11), { left, row }, IM_COL32(160, 160, 160, 255), "No player");
@@ -492,9 +546,22 @@ void TasHud::Draw()
     float x = ApplyDeadzone(sdlX / 32768.0f);
     float y = ApplyDeadzone(sdlY / 32768.0f);
 
+    // And as the game read it this frame.
+    const SWA::SPadState* padState = nullptr;
+    if (auto inputState = SWA::CInputState::GetInstance())
+        padState = &inputState->GetPadState();
+
+    float gameX = padState != nullptr ? float(padState->LeftStickHorizontal) : 0.0f;
+    float gameY = padState != nullptr ? float(padState->LeftStickVertical) : 0.0f;
+    float gameLengthSquared = gameX * gameX + gameY * gameY;
+    bool breakJump = gameLengthSquared >= BREAK_JUMP_MIN_LENGTH * BREAK_JUMP_MIN_LENGTH &&
+        gameLengthSquared < BREAK_JUMP_MAX_LENGTH * BREAK_JUMP_MAX_LENGTH;
+
     drawList->AddCircle(centre, radius, IM_COL32(255, 255, 255, 200), 64, Scale(1.5f));
     drawList->AddLine({ centre.x - radius, centre.y }, { centre.x + radius, centre.y }, IM_COL32(255, 255, 255, 90), Scale(1));
     drawList->AddLine({ centre.x, centre.y - radius }, { centre.x, centre.y + radius }, IM_COL32(255, 255, 255, 90), Scale(1));
+
+    DrawBreakJumpZone(drawList, centre, radius, breakJump);
 
     int activeZone = -1;
     for (int i = 0; i < int(std::size(TARGET_ZONES)); i++)
@@ -510,20 +577,21 @@ void TasHud::Draw()
     drawList->AddLine(centre, stick, IM_COL32(255, 60, 60, 255), Scale(2));
     drawList->AddCircleFilled(stick, Scale(4.5f), IM_COL32(255, 60, 60, 255));
 
-    ImU32 zoneColour = activeZone >= 0 ? IM_COL32(80, 255, 80, 255) : IM_COL32(200, 200, 200, 255);
-    std::string zoneText = activeZone >= 0 ? fmt::format("Zone {}", activeZone + 1) : "No zone";
-    DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(6) }, zoneColour, zoneText);
+    std::string zoneText = activeZone >= 0 ? fmt::format("Zone {}", activeZone + 1) : "";
+    if (breakJump)
+        zoneText += zoneText.empty() ? "Break-jump" : " + Break-jump";
+
+    ImU32 zoneColour = activeZone >= 0 ? IM_COL32(80, 255, 80, 255) : breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
+    DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(6) }, zoneColour, zoneText.empty() ? "No zone" : zoneText);
 
     // What to type into libTAS, and what the game made of it.
     DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(20) }, IM_COL32_WHITE,
         fmt::format("X {:.2f} Y {:.2f}  ({}, {})", x, y, sdlX, sdlY));
 
-    const SWA::SPadState* padState = nullptr;
-    if (auto inputState = SWA::CInputState::GetInstance())
+    if (padState != nullptr)
     {
-        padState = &inputState->GetPadState();
         DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(34) }, IM_COL32(200, 200, 200, 255),
-            fmt::format("Game {:.2f} {:.2f}", float(padState->LeftStickHorizontal), float(padState->LeftStickVertical)));
+            fmt::format("Game {:.3f} {:.3f}  length {:.3f}", gameX, gameY, std::sqrt(gameLengthSquared)));
     }
 
     DrawController(drawList, font, { left, centre.y + radius + Scale(52) }, width - 2 * padding, padState);
