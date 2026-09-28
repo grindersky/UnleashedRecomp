@@ -138,9 +138,11 @@ void XAudioSubmitFrame(void* samples)
         // The TAS scheduler can run the audio thread faster than libTAS plays audio back (while the game
         // loads, for example), and the queue would then grow: audio falls behind the picture, and libTAS
         // eventually runs out of buffers. Keep only a few callbacks' worth queued and drop the rest; libTAS
-        // drains its queue by its own clock, so this is deterministic. The scheduler keeps about two frames
-        // (6 callbacks) queued, plus up to 4 produced per frame, so this is only reached when loading.
-        constexpr uint32_t MAX_QUEUED_FRAMES = 16;
+        // drains its queue by its own clock, so this is deterministic. The scheduler keeps two 60 Hz frames'
+        // worth (1600 samples) queued on top of what libTAS takes each frame (800 samples at 60 fps, 1600 at
+        // 30 fps), so this is only reached when loading.
+        const uint32_t samplesPerFrame = uint32_t(TasScheduler::GetFrameLength() * XAUDIO_SAMPLES_HZ / 1000000);
+        const uint32_t maxQueuedFrames = std::max<uint32_t>(16, (1600 + samplesPerFrame) / XAUDIO_NUM_SAMPLES + 4);
 
         // libTAS returns the queue length in samples, not in bytes like SDL does.
         static const bool s_underLibTAS = std::getenv("LIBTAS_LIBRARY_PATH") != nullptr;
@@ -148,7 +150,7 @@ void XAudioSubmitFrame(void* samples)
         const uint32_t frameSize = s_underLibTAS ? XAUDIO_NUM_SAMPLES : channels * XAUDIO_NUM_SAMPLES * uint32_t(sizeof(float));
 
         const uint32_t queued = SDL_GetQueuedAudioSize(g_audioDevice);
-        const bool drop = queued / frameSize >= MAX_QUEUED_FRAMES;
+        const bool drop = queued / frameSize >= maxQueuedFrames;
 
         if (TasTrace::IsEnabled())
             TasTrace::OnAudioSubmit(drop, s_underLibTAS ? queued : queued / (channels * uint32_t(sizeof(float))));

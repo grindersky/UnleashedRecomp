@@ -237,9 +237,18 @@ namespace TasScheduler
     // many iterations per frame as it would on the real hardware, however long frames take to render. It
     // only moves at deterministic points: stepping through a frame when it ends, or jumping to the next
     // wake-up when every thread is blocked.
-    static constexpr uint64_t FrameLength = 1000000 / 60;
     static uint64_t g_virtualTime = 1;
     static uint64_t g_frameStart = 1;
+
+    // How far the virtual clock steps each frame: as far as libTAS's clock does, which is also how much
+    // audio libTAS plays each frame. That's 1/60 s unless the movie uses another frame rate, which libTAS
+    // doesn't tell the game, so it's measured at each frame boundary. It's rounded down to whole
+    // microseconds without carrying the rest over, keeping 60 fps frames at 16666: movies depend on the
+    // exact schedule.
+    static constexpr uint64_t DefaultFrameLength = 1000000 / 60;
+    static uint64_t g_frameLength = DefaultFrameLength;
+    // libTAS's clock at the last frame boundary, in nanoseconds (0 before the first one).
+    static uint64_t g_lastFrameBoundaryTime;
 
     // Reported by TasTrace: jumps of the virtual clock made because every thread was blocked.
     static uint64_t g_statJumps;
@@ -396,7 +405,7 @@ namespace TasScheduler
                     return value != nullptr ? std::strtoull(value, nullptr, 10) : UINT64_MAX;
                 }();
 
-                if (g_framesAdvanced >= s_dumpAfter && g_virtualTime > g_frameStart + 3 * FrameLength && g_longFrameDumps < 3)
+                if (g_framesAdvanced >= s_dumpAfter && g_virtualTime > g_frameStart + 3 * g_frameLength && g_longFrameDumps < 3)
                 {
                     g_longFrameDumps++;
                     DumpAllThreads("frame took more than three frames of virtual time");
@@ -639,9 +648,9 @@ namespace TasScheduler
         // Until the next frame is presented, or until the virtual clock reaches the next frame boundary
         // (which it can do without a frame being presented, when every thread is blocked).
         uint64_t generation = g_sleepGeneration;
-        uint64_t deadline = g_frameStart + FrameLength;
+        uint64_t deadline = g_frameStart + g_frameLength;
         while (deadline <= g_virtualTime)
-            deadline += FrameLength;
+            deadline += g_frameLength;
 
         WaitLocked(lock, [generation, deadline]() { return g_sleepGeneration != generation || g_virtualTime >= deadline; }, deadline);
     }
@@ -682,10 +691,10 @@ namespace TasScheduler
         std::unique_lock lock(g_mutex);
 
         // Audio runs on the virtual clock like any timed sleep: one callback per 256 samples at 48 kHz,
-        // i.e. every 16000 / 3 microseconds. It runs two frames ahead of it, so libTAS, which takes 800
-        // samples each frame, always has enough queued: produced just in time, a frame that only got three
-        // callbacks (768 samples) would be short and play a gap.
-        constexpr uint64_t Headroom = 2 * FrameLength;
+        // i.e. every 16000 / 3 microseconds. It runs two 60 Hz frames ahead of it, so libTAS, which takes a
+        // frame's worth each frame (800 samples at 60 fps), always has enough queued: produced just in time,
+        // a frame that only got three callbacks (768 samples) would be short and play a gap.
+        constexpr uint64_t Headroom = 2 * DefaultFrameLength;
         uint64_t deadline = g_audioStart + (g_audioCallbacksDone + 1) * 16000 / 3;
         deadline = deadline > g_audioStart + Headroom ? deadline - Headroom : g_audioStart;
         WaitLocked(lock, [deadline]() { return g_virtualTime >= deadline; }, deadline);
@@ -812,7 +821,7 @@ namespace TasScheduler
 
         // Step the virtual clock through the rest of the frame, waking timed sleeps in order and letting
         // everything run until blocked again after each one.
-        const uint64_t frameEnd = g_frameStart + FrameLength;
+        const uint64_t frameEnd = g_frameStart + g_frameLength;
 
         while (!g_serialDisabled)
         {
@@ -841,11 +850,29 @@ namespace TasScheduler
         if (g_presenting > 0)
             g_presenting--;
 
+        // libTAS moved its clock forward by a frame at the frame boundary that just passed. Read it through
+        // CLOCK_REALTIME, which moves with it like CLOCK_MONOTONIC: movies can have libTAS count the main
+        // thread's CLOCK_MONOTONIC reads to advance time on its own (time tracking), and an extra read here
+        // would change when that happens.
+        timespec ts{};
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t now = uint64_t(ts.tv_sec) * 1000000000 + uint64_t(ts.tv_nsec);
+        if (g_lastFrameBoundaryTime != 0 && now > g_lastFrameBoundaryTime)
+            g_frameLength = (now - g_lastFrameBoundaryTime) / 1000;
+
+        g_lastFrameBoundaryTime = now;
+
         g_sleepGeneration++;
         g_frameStart = g_virtualTime;
         g_framesAdvanced++;
 
         Update();
+    }
+
+    uint64_t GetFrameLength()
+    {
+        std::lock_guard lock(g_mutex);
+        return g_frameLength;
     }
 }
 
@@ -1007,6 +1034,7 @@ namespace TasScheduler
     void WaitForHost(const std::function<bool()>& ready) { while (!ready()) {} }
     void WaitForOtherThreads() {}
     void AdvanceFrame() {}
+    uint64_t GetFrameLength() { return 1000000 / 60; }
 }
 
 namespace TasTrace
