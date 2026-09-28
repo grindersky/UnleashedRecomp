@@ -1,5 +1,6 @@
 #include "tas_hud.h"
 #include <api/SWA.h>
+#include <app.h>
 #include <gpu/imgui/imgui_snapshot.h>
 #include <kernel/function.h>
 #include <kernel/memory.h>
@@ -8,19 +9,48 @@
 
 #include <cmath>
 #include <numbers>
+#include <unordered_map>
 
-// The day Sonic player context, recorded when its constructor runs. Its velocity is split like in Sonic
-// Generations' CPlayerSpeedContext: the full velocity, the part along the ground and the part along the
-// up vector (full = horizontal + vertical). Found by comparing per-frame dumps of the context with how
-// Sonic's position moves.
+// The day Sonic player context (SWA::Player::CSonicContext), recorded when its constructor runs. Its
+// velocity is split like in Sonic Generations' CPlayerSpeedContext: the full velocity, the part along the
+// ground and the part along the up vector (full = horizontal + vertical). Found by comparing per-frame
+// dumps of the context with how Sonic's position moves.
 static constexpr uint32_t SONIC_CONTEXT_VFTABLE = 0x820182C4;
 static constexpr uint32_t VELOCITY_OFFSET = 0x210;
 static constexpr uint32_t HORIZONTAL_VELOCITY_OFFSET = 0x220;
 static constexpr uint32_t VERTICAL_VELOCITY_OFFSET = 0x230;
 
+// More of the context, found in the game's code:
+// - the player object, whose state machine is at +0xCC (the context's ChangeState, sub_82307E18);
+static constexpr uint32_t PLAYER_OFFSET = 0x100;
+static constexpr uint32_t PLAYER_STATE_MACHINE_OFFSET = 0xCC;
+// - whether Sonic stands on the ground (sub_82316530 switches to "Fall" when it's false);
+static constexpr uint32_t GROUNDED_OFFSET = 0x3C0;
+// - two sets of state flags: counters, one byte per flag, in an array at +4 (sub_823171C8 and the next ones).
+static constexpr uint32_t STATE_FLAGS_OFFSET = 0x4AC;
+static constexpr uint32_t STATE_FLAGS_2_OFFSET = 0x4B0;
+// Set by a short hop (CStateJumpShort) until it has lasted StompingDisableTime (parameter 292, 0.15 s by
+// default): until then, stomping is refused.
+static constexpr uint32_t STOMP_DISABLED_FLAG = 20;
+static constexpr uint32_t STOMPING_DISABLE_TIME_PARAMETER = 292;
+// Stomping is also refused while this is set, unless flag 7 of the second set is (sub_8231B7D8).
+static constexpr uint32_t STOMP_BLOCKER_OFFSET = 0xCC8;
+static constexpr uint32_t STOMP_BLOCKER_OVERRIDE_FLAG = 7;
+// Hedgehog engine states: the context at +8, the time spent in the state, in seconds, at +0x10.
+static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
+static constexpr uint32_t STATE_TIME_OFFSET = 0x10;
+
 static uint32_t g_speedContext;
 static int16_t g_thumbLX;
 static int16_t g_thumbLY;
+
+// Counts drawn frames, to tell whether the checks below ran during the update of the frame being drawn.
+static uint32_t g_frame = 1;
+static uint32_t g_jumpCheckFrame;
+static uint32_t g_stompCheckFrame;
+static bool g_stompDisabledByHop;
+static bool g_stompBlocked;
+static float g_stompingDisableTime = 0.15f;
 
 // SWA::Player::CPlayerSpeedContext::CPlayerSpeedContext (the base of the day Sonic context)
 PPC_FUNC_IMPL(__imp__sub_82330188);
@@ -31,6 +61,145 @@ PPC_FUNC(sub_82330188)
 
     if (TasHud::IsEnabled())
         g_speedContext = context;
+}
+
+static bool IsReadable(uint32_t address)
+{
+    // Everything but the first page of guest memory can be read.
+    return address >= 0x1000 && address < 0xFFFF0000;
+}
+
+static uint32_t LoadU32(uint32_t address)
+{
+    uint8_t* base = g_memory.base;
+    return IsReadable(address) ? PPC_LOAD_U32(address) : 0;
+}
+
+static uint8_t LoadU8(uint32_t address)
+{
+    uint8_t* base = g_memory.base;
+    return IsReadable(address) ? PPC_LOAD_U8(address) : 0;
+}
+
+static float LoadFloat(uint32_t address)
+{
+    uint32_t value = LoadU32(address);
+    float result;
+    memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+static bool IsSonicContext(uint32_t context)
+{
+    // The context may have been destroyed since, and its memory reused.
+    return context != 0 && LoadU32(context) == SONIC_CONTEXT_VFTABLE;
+}
+
+static bool GetFlag(uint32_t context, uint32_t flagsOffset, uint32_t flag)
+{
+    uint32_t flags = LoadU32(context + flagsOffset);
+    return flags != 0 && LoadU8(LoadU32(flags + 4) + flag) != 0;
+}
+
+// The context's TryJump: jumps if the jump button is pressed. The states that allow jumping call it every
+// frame; others, like a quick step until it ends, don't.
+PPC_FUNC_IMPL(__imp__sub_82330CB0);
+PPC_FUNC(sub_82330CB0)
+{
+    if (TasHud::IsEnabled() && ctx.r3.u32 == g_speedContext)
+        g_jumpCheckFrame = g_frame;
+
+    __imp__sub_82330CB0(ctx, base);
+}
+
+// The context's TryStomp, called by the air states when no action tried before it (like a homing attack) was taken.
+PPC_FUNC_IMPL(__imp__sub_823765C0);
+PPC_FUNC(sub_823765C0)
+{
+    uint32_t context = ctx.r3.u32;
+
+    if (TasHud::IsEnabled() && context == g_speedContext)
+    {
+        g_stompCheckFrame = g_frame;
+        g_stompDisabledByHop = GetFlag(context, STATE_FLAGS_OFFSET, STOMP_DISABLED_FLAG);
+        g_stompBlocked = LoadU32(context + STOMP_BLOCKER_OFFSET) != 0 && !GetFlag(context, STATE_FLAGS_2_OFFSET, STOMP_BLOCKER_OVERRIDE_FLAG);
+    }
+
+    __imp__sub_823765C0(ctx, base);
+}
+
+// Reads a float parameter of the player by ID. Records StompingDisableTime when the short hop reads it.
+PPC_FUNC_IMPL(__imp__sub_8245DB60);
+PPC_FUNC(sub_8245DB60)
+{
+    uint32_t parameter = ctx.r4.u32;
+    __imp__sub_8245DB60(ctx, base);
+
+    if (parameter == STOMPING_DISABLE_TIME_PARAMETER && TasHud::IsEnabled())
+        g_stompingDisableTime = float(ctx.f1.f64);}
+
+// The current state of the player's state machine, or 0. The machine points to the current state's record
+// at +0x58 (compared with the new state in sub_82E669D8), which points to the state at +0x1C.
+static uint32_t GetCurrentState(uint32_t context)
+{
+    uint32_t player = LoadU32(context + PLAYER_OFFSET);
+    if (player == 0)
+        return 0;
+
+    uint32_t stateMachine = player + PLAYER_STATE_MACHINE_OFFSET;
+    uint32_t record = LoadU32(stateMachine + 0x58);
+    uint32_t state = LoadU32(record + 0x1C);
+    return state != 0 && LoadU32(state + STATE_CONTEXT_OFFSET) == context ? state : 0;
+}
+
+// The name of the state's class, from the game's RTTI: "CStateJumpShort@CSonicContext@..." becomes "JumpShort".
+static const std::string& GetStateName(uint32_t state)
+{
+    static std::unordered_map<uint32_t, std::string> s_names;
+
+    uint32_t vtable = LoadU32(state);
+    auto it = s_names.find(vtable);
+    if (it != s_names.end())
+        return it->second;
+
+    std::string name = "?";
+
+    // The vtable is preceded by its complete object locator, which points to the type descriptor at +12,
+    // whose mangled name is at +8.
+    uint32_t typeDescriptor = LoadU32(LoadU32(vtable - 4) + 12);
+    if (vtable >= PPC_IMAGE_BASE && vtable < PPC_IMAGE_BASE + PPC_IMAGE_SIZE &&
+        typeDescriptor >= PPC_IMAGE_BASE && typeDescriptor < PPC_IMAGE_BASE + PPC_IMAGE_SIZE)
+    {
+        auto text = reinterpret_cast<const char*>(g_memory.Translate(typeDescriptor + 8));
+        std::string mangled(text, strnlen(text, 96));
+
+        if (mangled.starts_with(".?AV"))
+        {
+            name = mangled.substr(4, mangled.find('@') - 4);
+
+            for (std::string_view prefix : { "CPlayerSpeedState", "CSonicState", "CState" })
+            {
+                if (name.starts_with(prefix) && name.size() > prefix.size())
+                {
+                    name = name.substr(prefix.size());
+                    break;
+                }
+            }
+        }
+    }
+
+    return s_names.emplace(vtable, name).first->second;
+}
+
+static bool GetVelocity(uint32_t offset, float& x, float& y, float& z)
+{
+    if (!IsSonicContext(g_speedContext))
+        return false;
+
+    x = LoadFloat(g_speedContext + offset);
+    y = LoadFloat(g_speedContext + offset + 4);
+    z = LoadFloat(g_speedContext + offset + 8);
+    return true;
 }
 
 // The target zones of the M-/D-Speed Visualiser, on the stick as SDL reports it: -1..1, Y pointing
@@ -69,29 +238,6 @@ static float ApplyDeadzone(float value)
     return std::abs(value) < STICK_DEADZONE ? 0.0f : value;
 }
 
-static float LoadFloat(uint32_t address)
-{
-    uint8_t* base = g_memory.base;
-    uint32_t value = PPC_LOAD_U32(address);
-    float result;
-    memcpy(&result, &value, sizeof(result));
-    return result;
-}
-
-static bool GetVelocity(uint32_t offset, float& x, float& y, float& z)
-{
-    uint8_t* base = g_memory.base;
-
-    // The context may have been destroyed since, and its memory reused.
-    if (g_speedContext == 0 || PPC_LOAD_U32(g_speedContext) != SONIC_CONTEXT_VFTABLE)
-        return false;
-
-    x = LoadFloat(g_speedContext + offset);
-    y = LoadFloat(g_speedContext + offset + 4);
-    z = LoadFloat(g_speedContext + offset + 8);
-    return true;
-}
-
 bool TasHud::IsEnabled()
 {
     static const bool s_enabled = []()
@@ -113,6 +259,38 @@ static void DrawText(ImDrawList* drawList, ImFont* font, float size, ImVec2 pos,
 {
     drawList->AddText(font, size, { pos.x + Scale(1), pos.y + Scale(1) }, IM_COL32(0, 0, 0, 200), text.c_str());
     drawList->AddText(font, size, pos, colour, text.c_str());
+}
+
+static float TextWidth(ImFont* font, float size, const std::string& text)
+{
+    return font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str()).x;
+}
+
+// A labelled box, lit when active: filled for what Sonic is doing, outlined for what a press would do.
+static void DrawIndicator(ImDrawList* drawList, ImFont* font, ImVec2 pos, float width, const char* label, ImU32 colour, bool lit, bool outlined = false)
+{
+    float size = Scale(11);
+    float textWidth = TextWidth(font, size, label);
+    ImVec2 max = { pos.x + width, pos.y + Scale(16) };
+    ImU32 textColour = IM_COL32(170, 170, 170, 255);
+
+    if (outlined)
+    {
+        drawList->AddRectFilled(pos, max, IM_COL32(20, 20, 20, 200), Scale(3));
+        drawList->AddRect(pos, max, lit ? colour : IM_COL32(80, 80, 80, 255), Scale(3), 0, Scale(1.5f));
+
+        if (lit)
+            textColour = colour;
+    }
+    else
+    {
+        drawList->AddRectFilled(pos, max, lit ? colour : IM_COL32(20, 20, 20, 200), Scale(3));
+
+        if (lit)
+            textColour = IM_COL32(0, 0, 0, 255);
+    }
+
+    drawList->AddText(font, size, { pos.x + (width - textWidth) / 2, pos.y + Scale(2) }, textColour, label);
 }
 
 static void DrawZone(ImDrawList* drawList, ImVec2 centre, float scale, const TargetZone& zone, bool active)
@@ -151,29 +329,91 @@ void TasHud::Draw()
     auto& res = ImGui::GetIO().DisplaySize;
     auto font = ImFontAtlasSnapshot::GetFont("FOT-SeuratPro-M.otf");
 
+    // Wide enough for the longest stick line and three indicators a row as wide as the widest, away from
+    // the edge of the screen.
     float radius = Scale(70);
-    ImVec2 centre = { res.x - Scale(40) - radius, res.y - Scale(70) - radius };
-    ImVec2 panelMin = { centre.x - radius - Scale(10), centre.y - radius - Scale(56) };
-    ImVec2 panelMax = { centre.x + radius + Scale(10), centre.y + radius + Scale(48) };
+    float padding = Scale(8);
+    float gap = Scale(4);
+    float width = std::max({ 2 * radius + 2 * padding,
+        TextWidth(font, Scale(11), "X -1.00 Y -1.00  (-32768, -32768)") + 2 * padding,
+        3 * (TextWidth(font, Scale(11), "CAN STOMP") + Scale(10)) + 2 * gap + 2 * padding });
+    ImVec2 panelMax = { res.x - Scale(40), res.y - Scale(22) };
+    ImVec2 centre = { panelMax.x - width / 2, panelMax.y - Scale(48) - radius };
+    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(102) };
+    float left = panelMin.x + padding;
 
-    drawList->AddRectFilled(panelMin, panelMax, IM_COL32(0, 0, 0, 120), Scale(6));
+    drawList->AddRectFilled(panelMin, panelMax, IM_COL32(0, 0, 0, 140), Scale(6));
 
     // Speedometer.
     float hx, hy, hz, vx, vy, vz, fx, fy, fz;
     if (GetVelocity(HORIZONTAL_VELOCITY_OFFSET, hx, hy, hz) && GetVelocity(VERTICAL_VELOCITY_OFFSET, vx, vy, vz) &&
         GetVelocity(VELOCITY_OFFSET, fx, fy, fz))
     {
-        DrawText(drawList, font, Scale(18), { panelMin.x + Scale(8), panelMin.y + Scale(6) }, IM_COL32_WHITE,
+        DrawText(drawList, font, Scale(18), { left, panelMin.y + Scale(6) }, IM_COL32_WHITE,
             fmt::format("Speed {:.2f}", std::sqrt(hx * hx + hy * hy + hz * hz)));
 
         // The vertical part's sign: along the up vector or against it.
         float vertical = std::sqrt(vx * vx + vy * vy + vz * vz) * (vy < 0 ? -1.0f : 1.0f);
-        DrawText(drawList, font, Scale(11), { panelMin.x + Scale(8), panelMin.y + Scale(28) }, IM_COL32(220, 220, 220, 255),
+        DrawText(drawList, font, Scale(11), { left, panelMin.y + Scale(28) }, IM_COL32(220, 220, 220, 255),
             fmt::format("Total {:.2f}   Vertical {:.2f}", std::sqrt(fx * fx + fy * fy + fz * fz), vertical));
     }
     else
     {
-        DrawText(drawList, font, Scale(18), { panelMin.x + Scale(8), panelMin.y + Scale(6) }, IM_COL32(160, 160, 160, 255), "Speed --");
+        DrawText(drawList, font, Scale(18), { left, panelMin.y + Scale(6) }, IM_COL32(160, 160, 160, 255), "Speed --");
+    }
+
+    // What Sonic is doing, then what a press on this frame would have done: the game checked for the jump
+    // or stomp button during this frame's update. Both need a new press, holding the button doesn't count.
+    float row = panelMin.y + Scale(46);
+    float pressRow = row + Scale(20);
+    float stateRow = pressRow + Scale(20);
+
+    if (IsSonicContext(g_speedContext))
+    {
+        uint32_t context = g_speedContext;
+        uint32_t state = GetCurrentState(context);
+        std::string stateName = state != 0 ? GetStateName(state) : "?";
+        float stateTime = state != 0 ? LoadFloat(state + STATE_TIME_OFFSET) : 0.0f;
+        float deltaTime = std::max(float(App::s_deltaTime), 0.001f);
+
+        bool grounded = LoadU8(context + GROUNDED_OFFSET) != 0;
+        bool sliding = stateName.starts_with("Sliding");
+        bool stomping = stateName.starts_with("Stomping");
+        bool canJump = g_jumpCheckFrame == g_frame;
+        bool stompChecked = g_stompCheckFrame == g_frame;
+        bool canStomp = stompChecked && !g_stompDisabledByHop && !g_stompBlocked;
+
+        float indicatorWidth = (width - 2 * padding - 2 * gap) / 3;
+        float column2 = left + indicatorWidth + gap;
+        float column3 = column2 + indicatorWidth + gap;
+
+        DrawIndicator(drawList, font, { left, row }, indicatorWidth, grounded ? "GROUND" : "AIR", grounded ? IM_COL32(80, 220, 80, 230) : IM_COL32(90, 170, 255, 230), true);
+        DrawIndicator(drawList, font, { column2, row }, indicatorWidth, "SLIDING", IM_COL32(255, 200, 60, 230), sliding);
+        DrawIndicator(drawList, font, { column3, row }, indicatorWidth, "STOMPING", IM_COL32(255, 110, 80, 230), stomping);
+
+        DrawIndicator(drawList, font, { left, pressRow }, indicatorWidth, "CAN JUMP", IM_COL32(80, 230, 80, 255), canJump, true);
+        DrawIndicator(drawList, font, { column2, pressRow }, indicatorWidth, "CAN STOMP", IM_COL32(80, 230, 80, 255), canStomp, true);
+
+        // After a short hop: in how many frames the stomp will be accepted. The hop adds the frame's time
+        // (in single precision) to its own, and only then compares it and tries the stomp.
+        if (stompChecked && g_stompDisabledByHop && state != 0)
+        {
+            int frames = 0;
+            float time = stateTime;
+            do
+            {
+                time += deltaTime;
+                frames++;
+            } while (time <= g_stompingDisableTime && frames < 99);
+
+            DrawText(drawList, font, Scale(11), { column3, pressRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", frames));
+        }
+
+        DrawText(drawList, font, Scale(11), { left, stateRow }, IM_COL32(220, 220, 220, 255),
+            fmt::format("{}  {}f", stateName, int(std::lround(stateTime / deltaTime))));    }
+    else
+    {
+        DrawText(drawList, font, Scale(11), { left, row }, IM_COL32(160, 160, 160, 255), "No player");
     }
 
     // Stick, as SDL (and libTAS) reports it: XInput's Y is flipped with a bitwise NOT.
@@ -202,16 +442,18 @@ void TasHud::Draw()
 
     ImU32 zoneColour = activeZone >= 0 ? IM_COL32(80, 255, 80, 255) : IM_COL32(200, 200, 200, 255);
     std::string zoneText = activeZone >= 0 ? fmt::format("Zone {}", activeZone + 1) : "No zone";
-    DrawText(drawList, font, Scale(11), { panelMin.x + Scale(8), centre.y + radius + Scale(6) }, zoneColour, zoneText);
+    DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(6) }, zoneColour, zoneText);
 
     // What to type into libTAS, and what the game made of it.
-    DrawText(drawList, font, Scale(11), { panelMin.x + Scale(8), centre.y + radius + Scale(20) }, IM_COL32_WHITE,
+    DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(20) }, IM_COL32_WHITE,
         fmt::format("X {:.2f} Y {:.2f}  ({}, {})", x, y, sdlX, sdlY));
 
     if (auto inputState = SWA::CInputState::GetInstance())
     {
         auto& padState = inputState->GetPadState();
-        DrawText(drawList, font, Scale(11), { panelMin.x + Scale(8), centre.y + radius + Scale(34) }, IM_COL32(200, 200, 200, 255),
+        DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(34) }, IM_COL32(200, 200, 200, 255),
             fmt::format("Game {:.2f} {:.2f}", float(padState.LeftStickHorizontal), float(padState.LeftStickVertical)));
     }
+
+    g_frame++;
 }
