@@ -2477,10 +2477,10 @@ index d15aac6..7112106 100644
          SDL_VideoInit(nullptr);
 diff --git a/UnleashedRecomp/ui/tas_hud.cpp b/UnleashedRecomp/ui/tas_hud.cpp
 new file mode 100644
-index 0000000..fba5477
+index 0000000..350a575
 --- /dev/null
 +++ b/UnleashedRecomp/ui/tas_hud.cpp
-@@ -0,0 +1,459 @@
+@@ -0,0 +1,532 @@
 +#include "tas_hud.h"
 +#include <api/SWA.h>
 +#include <app.h>
@@ -2803,6 +2803,74 @@ index 0000000..fba5477
 +    drawList->AddLine(outer[SEGMENTS], inner[SEGMENTS], outline, Scale(1));
 +}
 +
++static constexpr float CONTROLLER_HEIGHT = 46;
++
++// The buttons used in play, as the game read them this frame: the triggers (filled as far as they're
++// pulled), bumpers and Start on the left, the face buttons on the right. Held buttons are lit; ones pressed
++// on this frame, which is what jumps and stomps need, also get a white ring.
++static void DrawController(ImDrawList* drawList, ImFont* font, ImVec2 pos, float width, const SWA::SPadState* pad)
++{
++    uint32_t down = pad != nullptr ? uint32_t(pad->DownState) : 0;
++    uint32_t tapped = pad != nullptr ? uint32_t(pad->TappedState) : 0;
++    float size = Scale(12);
++    ImU32 ring = IM_COL32(255, 255, 255, 255);
++    ImU32 unlitFill = IM_COL32(20, 20, 20, 200);
++
++    auto drawLabel = [&](ImVec2 centre, const char* label, ImU32 colour)
++    {
++        ImVec2 textSize = font->CalcTextSizeA(size, FLT_MAX, 0.0f, label);
++        drawList->AddText(font, size, { centre.x - textSize.x / 2, centre.y - textSize.y / 2 }, colour, label);
++    };
++
++    auto drawBox = [&](ImVec2 min, ImVec2 max, const char* label, uint32_t key, float fill = -1.0f)
++    {
++        bool lit = (down & key) != 0;
++        drawList->AddRectFilled(min, max, unlitFill, Scale(3));
++
++        // Triggers are analog: fill them as far as they're pulled.
++        float amount = fill >= 0.0f ? std::clamp(fill, 0.0f, 1.0f) : (lit ? 1.0f : 0.0f);
++        if (amount > 0.0f)
++            drawList->AddRectFilled(min, { min.x + (max.x - min.x) * amount, max.y }, IM_COL32(220, 220, 220, 230), Scale(3));
++
++        drawList->AddRect(min, max, (tapped & key) ? ring : IM_COL32(110, 110, 110, 255), Scale(3), 0, (tapped & key) ? Scale(2) : Scale(1));
++        drawLabel({ (min.x + max.x) / 2, (min.y + max.y) / 2 }, label, amount > 0.5f ? IM_COL32(0, 0, 0, 255) : IM_COL32(200, 200, 200, 255));
++    };
++
++    auto drawButton = [&](ImVec2 centre, float radius, const char* label, uint32_t key, ImU32 colour)
++    {
++        bool lit = (down & key) != 0;
++        drawList->AddCircleFilled(centre, radius, lit ? colour : unlitFill, 16);
++        drawList->AddCircle(centre, radius, (tapped & key) ? ring : colour, 16, (tapped & key) ? Scale(2) : Scale(1.2f));
++        drawLabel(centre, label, lit ? IM_COL32(0, 0, 0, 255) : colour);
++    };
++
++    // Triggers and bumpers in their order on the controller, Start under them.
++    float middle = pos.y + CONTROLLER_HEIGHT * Scale(1) / 2;
++    float rowHeight = Scale(18);
++    float rowGap = Scale(4);
++    float top = middle - rowHeight - rowGap / 2;
++    float gap = Scale(4);
++    float slot = (width * 0.6f - 3 * gap) / 4;
++    auto slotX = [&](int i) { return pos.x + i * (slot + gap); };
++
++    drawBox({ slotX(0), top }, { slotX(0) + slot, top + rowHeight }, "LT", SWA::eKeyState_LeftTrigger, pad != nullptr ? float(pad->LeftTrigger) : 0.0f);
++    drawBox({ slotX(1), top }, { slotX(1) + slot, top + rowHeight }, "LB", SWA::eKeyState_LeftBumper);
++    drawBox({ slotX(2), top }, { slotX(2) + slot, top + rowHeight }, "RB", SWA::eKeyState_RightBumper);
++    drawBox({ slotX(3), top }, { slotX(3) + slot, top + rowHeight }, "RT", SWA::eKeyState_RightTrigger, pad != nullptr ? float(pad->RightTrigger) : 0.0f);
++
++    float startTop = middle + rowGap / 2;
++    drawBox({ slotX(1), startTop }, { slotX(2) + slot, startTop + rowHeight }, "START", SWA::eKeyState_Start);
++
++    // Face buttons.
++    ImVec2 face = { pos.x + width * 0.8f, middle };
++    float spread = Scale(12);
++    float buttonRadius = Scale(10);
++    drawButton({ face.x, face.y - spread }, buttonRadius, "Y", SWA::eKeyState_Y, IM_COL32(255, 200, 40, 255));
++    drawButton({ face.x - spread * 1.6f, face.y }, buttonRadius, "X", SWA::eKeyState_X, IM_COL32(60, 140, 255, 255));
++    drawButton({ face.x + spread * 1.6f, face.y }, buttonRadius, "B", SWA::eKeyState_B, IM_COL32(255, 70, 60, 255));
++    drawButton({ face.x, face.y + spread }, buttonRadius, "A", SWA::eKeyState_A, IM_COL32(80, 220, 80, 255));
++}
++
 +void TasHud::Draw()
 +{
 +    if (!IsEnabled())
@@ -2821,7 +2889,7 @@ index 0000000..fba5477
 +        TextWidth(font, Scale(11), "X -1.00 Y -1.00  (-32768, -32768)") + 2 * padding,
 +        3 * (TextWidth(font, Scale(11), "CAN STOMP") + Scale(10)) + 2 * gap + 2 * padding });
 +    ImVec2 panelMax = { res.x - Scale(40), res.y - Scale(22) };
-+    ImVec2 centre = { panelMax.x - width / 2, panelMax.y - Scale(48) - radius };
++    ImVec2 centre = { panelMax.x - width / 2, panelMax.y - Scale(58 + CONTROLLER_HEIGHT) - radius };
 +    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(102) };
 +    float left = panelMin.x + padding;
 +
@@ -2877,9 +2945,11 @@ index 0000000..fba5477
 +        DrawIndicator(drawList, font, { left, pressRow }, indicatorWidth, "CAN JUMP", IM_COL32(80, 230, 80, 255), canJump, true);
 +        DrawIndicator(drawList, font, { column2, pressRow }, indicatorWidth, "CAN STOMP", IM_COL32(80, 230, 80, 255), canStomp, true);
 +
-+        // After a short hop: in how many frames the stomp will be accepted. The hop adds the frame's time
-+        // (in single precision) to its own, and only then compares it and tries the stomp.
-+        if (stompChecked && g_stompDisabledByHop && state != 0)
++        // During a short hop: in how many frames the stomp will be accepted. The hop adds the frame's time
++        // (in single precision) to its own, and only then compares it and tries the stomp. Leaving the hop
++        // (for an air boost, say) clears the flag right away instead.
++        bool hopping = stateName == "JumpShort" || stateName == "JumpHurdle";
++        if (stompChecked && g_stompDisabledByHop && hopping)
 +        {
 +            int frames = 0;
 +            float time = stateTime;
@@ -2931,28 +3001,32 @@ index 0000000..fba5477
 +    DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(20) }, IM_COL32_WHITE,
 +        fmt::format("X {:.2f} Y {:.2f}  ({}, {})", x, y, sdlX, sdlY));
 +
++    const SWA::SPadState* padState = nullptr;
 +    if (auto inputState = SWA::CInputState::GetInstance())
 +    {
-+        auto& padState = inputState->GetPadState();
++        padState = &inputState->GetPadState();
 +        DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(34) }, IM_COL32(200, 200, 200, 255),
-+            fmt::format("Game {:.2f} {:.2f}", float(padState.LeftStickHorizontal), float(padState.LeftStickVertical)));
++            fmt::format("Game {:.2f} {:.2f}", float(padState->LeftStickHorizontal), float(padState->LeftStickVertical)));
 +    }
++
++    DrawController(drawList, font, { left, centre.y + radius + Scale(52) }, width - 2 * padding, padState);
 +
 +    g_frame++;
 +}
 diff --git a/UnleashedRecomp/ui/tas_hud.h b/UnleashedRecomp/ui/tas_hud.h
 new file mode 100644
-index 0000000..8e80e5c
+index 0000000..d1ce604
 --- /dev/null
 +++ b/UnleashedRecomp/ui/tas_hud.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +#pragma once
 +
 +#include <cstdint>
 +
 +// A TAS mode overlay, enabled with UNLEASHED_TAS_HUD=1: Sonic's speed, his state (on the ground,
-+// sliding, whether a jump or stomp would be accepted), and the left stick with the M-/D-Speed target
-+// zones. It's drawn into the game's frames, so it also shows up in encodes. It only reads the game's memory.
++// sliding, whether a jump or stomp would be accepted), the left stick with the M-/D-Speed target zones,
++// and the buttons. It's drawn into the game's frames, so it also shows up in encodes. It only reads the
++// game's memory.
 +namespace TasHud
 +{
 +    bool IsEnabled();
