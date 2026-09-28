@@ -77,6 +77,8 @@ namespace TasScheduler
     void WaitForOtherThreads();
     // After presenting (the libTAS frame boundary): starts the next frame.
     void AdvanceFrame();
+    // How long a frame lasts on the virtual clock, in microseconds: libTAS's frame length (1/60 s by default).
+    uint64_t GetFrameLength();
 }
 
 // A per-frame record of the game's state, for finding what differs between two playbacks of the
