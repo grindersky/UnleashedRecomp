@@ -2795,6 +2795,7 @@ void Video::WaitOnSwapChain()
 
 static bool g_shouldPrecompilePipelines;
 static std::atomic<bool> g_executedCommandList;
+static std::atomic<bool> g_begunCommandList; // Only waited for in TAS mode.
 
 void Video::Present()
 {
@@ -2875,6 +2876,15 @@ void Video::Present()
 
     cmd.type = RenderCommandType::BeginCommandList;
     g_renderQueue.enqueue(cmd);
+
+    // The render thread frees the guest memory of released resources when it begins the next command list.
+    // In TAS mode, wait for it before running more guest code: otherwise how fast the host renders decides
+    // whether guest allocations in the next frame see that memory freed, changing the heap's layout.
+    if (IsTasMode())
+    {
+        g_begunCommandList.wait(false);
+        g_begunCommandList = false;
+    }
 
     // libTAS controls the frame rate, and this limiter would spin on its frozen clock.
     if (Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX && !IsTasMode())
@@ -3029,6 +3039,9 @@ static void ProcBeginCommandList(const RenderCommand& cmd)
 {
     DestructTempResources();
     BeginCommandList();
+
+    g_begunCommandList = true;
+    g_begunCommandList.notify_one();
 }
 
 static GuestSurface* GetBackBuffer() 
