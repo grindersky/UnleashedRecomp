@@ -2,8 +2,9 @@
 
 #include <cstdint>
 
-// A TAS mode overlay, enabled with UNLEASHED_TAS_HUD=1: Sonic's speed, and the left stick with the
-// M-/D-Speed target zones. It's drawn into the game's frames, so it also shows up in encodes.
+// A TAS mode overlay, enabled with UNLEASHED_TAS_HUD=1: Sonic's speed, his state (on the ground,
+// sliding, whether a jump or stomp would be accepted), and the left stick with the M-/D-Speed target
+// zones. It's drawn into the game's frames, so it also shows up in encodes. It only reads the game's memory.
 namespace TasHud
 {
     bool IsEnabled();
