@@ -116,3 +116,25 @@ PPC_FUNC(sub_823B4590)
 
     SDL_User_EvilSonic(false);
 }
+
+// SWA::Player::CPlayerSpeedContext::CStateBrake::LeaveState (also used by CSonicContext's). Entering the brake
+// starts its "sonic_brake" effect; leaving it stops the effect through its particle instance (+240), which
+// is only attached to the effect some time after it's created. Leaving the brake before that, as in a very
+// short brake during a drift, dereferenced the null instance and crashed. Leave the effect running then.
+PPC_FUNC_IMPL(__imp__sub_82334A50);
+PPC_FUNC(sub_82334A50)
+{
+    uint32_t state = ctx.r3.u32;
+    uint32_t effect = PPC_LOAD_U32(state + 0x6C);
+
+    if (effect != 0 && PPC_LOAD_U32(effect + 240) == 0)
+    {
+        // Hide the effect from the original, which then skips stopping it, and give it back afterwards.
+        PPC_STORE_U32(state + 0x6C, 0);
+        __imp__sub_82334A50(ctx, base);
+        PPC_STORE_U32(state + 0x6C, effect);
+        return;
+    }
+
+    __imp__sub_82334A50(ctx, base);
+}
