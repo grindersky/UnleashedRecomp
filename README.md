@@ -27,6 +27,8 @@ and whether a jump or stomp pressed on the current frame would work, with a coun
 again after a jump), the stick with the M-/D-Speed zones and the break-jump zone (orange), and the buttons (lit while
 held, with a ring on the frame they're pressed). It's drawn into the frames, so it also shows up in encodes.
 
+To play back and encode movies on your graphics card instead of the CPU under WSL, see [DOZEN.md](DOZEN.md).
+
 ## Keeping movies in sync
 
 libTAS doesn't save everything that matters in the movie: play it back with the game's FPS option set to libTAS's
