@@ -104,17 +104,13 @@ Turn it back on when you go back to recording with plain `libTAS`.
 ### 8. Play back or encode a movie
 
 ```bash
-UNLEASHED_TAS_MODE=1 libTASdozen > ~/libtas.log 2>&1
+UNLEASHED_TAS_MODE=1 libTASdozen
 ```
 
-Keep the output redirected to a file: if a Windows terminal is in its text-selection mode, it stops libTAS while it
-writes. Add `UNLEASHED_TAS_HUD=1` in front for the HUD. Load your movie and encode as usual.
+Add `UNLEASHED_TAS_HUD=1` in front for the HUD. Load your movie and encode as usual.
 
-To confirm dozen is in use, the log should mention it:
-
-```bash
-grep "dzn is not a conformant" ~/libtas.log
-```
+To confirm dozen is in use: when the game starts, the terminal you started libTAS from shows
+`WARNING: dzn is not a conformant Vulkan implementation, testing use only.`
 
 > Dozen changes only how frames are drawn. The TAS mode makes the game behave the same on both drivers, so movies
 > made on lavapipe play back in sync on dozen. Keep the same game FPS option and codes as when the movie was recorded.
@@ -125,7 +121,7 @@ grep "dzn is not a conformant" ~/libtas.log
 The `VK_DRIVER_FILES` path is wrong. Check that `~/dozen/install/share/vulkan/icd.d/dzn_icd.x86_64.json` exists and
 that step 4 finished without errors.
 
-**The game still runs slowly and the log doesn't mention dzn**
+**The game still runs slowly and the terminal doesn't show the dzn warning**
 "Force software rendering" is still checked in libTAS (step 7), or libTAS was started with `libTAS` instead of
 `libTASdozen`.
 
