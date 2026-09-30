@@ -4,6 +4,114 @@
 
 ---
 
+# Unleashed Recompiled: TAS mode
+
+This branch adds a TAS mode to Unleashed Recompiled for [libTAS](https://github.com/clementgallet/libTAS) on Linux, and on Windows through WSL: deterministic movie playback, savestates, correct audio at any libTAS frame rate, libTAS's on-screen display and Stop button, and an optional HUD for TASing. Without the TAS mode turned on, the game runs like the normal port.
+
+The original README follows [below](#unleashed-recompiled).
+
+## Setting Up the TAS Version
+
+### 1. Set up WSL and libTAS
+
+On Windows, follow libTAS's [WSL guide](https://clementgallet.github.io/libTAS/guides/wsl/): it installs WSL 2 with Ubuntu, then libTAS. Everything below runs in that Ubuntu terminal. On Linux, just install libTAS.
+
+The TAS mode was tested with libTAS 1.4.8 on Ubuntu 26.04 in WSL 2.
+
+### 2. Install the build dependencies
+
+```bash
+sudo apt install git autoconf automake libtool pkg-config curl cmake ninja-build clang clang-tools libgtk-3-dev
+```
+
+### 3. Get the source
+
+Either clone this branch:
+
+```bash
+git clone --recurse-submodules -b tas-mode https://github.com/grindersky/UnleashedRecomp.git
+cd UnleashedRecomp
+```
+
+Or clone the original project and apply the TAS patch from the [`patches` branch](https://github.com/grindersky/UnleashedRecomp/tree/patches):
+
+```bash
+git clone --recurse-submodules https://github.com/hedge-dev/UnleashedRecomp.git
+cd UnleashedRecomp
+curl -LO https://raw.githubusercontent.com/grindersky/UnleashedRecomp/patches/UnleashedTAS.patch
+git apply UnleashedTAS.patch
+```
+
+> [!NOTE]
+> The patch is made against the original project's commit `cf829a9`. If `git apply` fails because the project has changed since, check out that commit first with `git checkout cf829a9 && git submodule update --init --recursive`, then apply the patch.
+
+### 4. Add the game files needed to build
+
+Copy `default.xex`, `default.xexp` and `shader.ar` from your copy of the game into `UnleashedRecompLib/private/`.
+
+If you already have Unleashed Recompiled installed, for example on Windows, take them from its folder: `game/default.xex`, `game/shader.ar` and `update/default.xexp`. From WSL, Windows drives are under `/mnt`, for example `/mnt/c/Games/UnleashedRecomp/game/default.xex`. Otherwise, see [Add the Required Game Files](docs/BUILDING.md#2-add-the-required-game-files).
+
+### 5. Build
+
+```bash
+cmake . --preset linux-release
+cmake --build ./out/build/linux-release --target UnleashedRecomp
+```
+
+The first build takes a while, as it recompiles the whole game. The game ends up in `out/build/linux-release/UnleashedRecomp/`.
+
+### 6. Install the game data
+
+Run the game once on its own, without libTAS:
+
+```bash
+cd out/build/linux-release/UnleashedRecomp
+./UnleashedRecomp
+```
+
+The installer asks for your game, its title update and, optionally, the DLC (see [How to Install](#how-to-install)). Once you reach the title screen, quit the game.
+
+### 7. Set up libTAS
+
+Start libTAS with the TAS mode turned on:
+
+```bash
+UNLEASHED_TAS_MODE=1 libTAS
+```
+
+Choose `out/build/linux-release/UnleashedRecomp/UnleashedRecomp` as the game executable. Then, with the game closed, set these in libTAS's **Settings**:
+
+- **Runtime → Prevent writing to disk**: on. Playing a movie then can't change your save, so every movie starts from the same save.
+- **Video → Force software rendering**: on. The game then draws with lavapipe, Mesa's renderer that runs on the CPU, which the TAS mode was made and tested with, savestates included.
+- **Input → Mouse support**: off, as the game doesn't use the mouse. **Joystick support**: 1 controller, for analog stick inputs.
+
+Start the game from libTAS and TAS as usual.
+
+### Options
+
+Set these in front of `libTAS`, like `UNLEASHED_TAS_MODE=1`:
+
+- `UNLEASHED_TAS_MODE=1`: turns the TAS mode on. Without it, the game runs like the normal port.
+- `UNLEASHED_TAS_HUD=1`: a HUD with Sonic's speed, his state (on the ground or in the air, sliding, stomping, and whether a jump or stomp pressed on the current frame would work, with a countdown until a stomp is allowed again after a jump), the stick with the M-/D-Speed zones and the break-jump zone, and the buttons. It's drawn into the frames, so it also shows up in encodes.
+
+### Keeping movies in sync
+
+libTAS doesn't save everything that matters in a movie. Play movies back with:
+
+- the game's FPS option set to libTAS's frame rate,
+- the same codes enabled as when the movie was recorded (in `~/.config/UnleashedRecomp/ModsDB.ini`),
+- the same save.
+
+Movies recorded at frame rates other than 60 fps with a version from before 2026-09-28 will probably desync.
+
+### Faster playback and encoding
+
+To play back and encode movies on your graphics card instead of the CPU under WSL, see the [dozen guide](https://github.com/grindersky/UnleashedRecomp/blob/patches/DOZEN.md). It makes playback and encoding several times faster.
+
+---
+
+# Unleashed Recompiled
+
 Unleashed Recompiled is an unofficial PC port of the Xbox 360 version of Sonic Unleashed created through the process of static recompilation. The port offers Windows and Linux support with numerous built-in enhancements such as high resolutions, ultrawide support, high frame rates, improved performance and modding.
 
 **This project does not include any game assets. You must provide the files from your own legally acquired copy of the game to install or build Unleashed Recompiled.**
