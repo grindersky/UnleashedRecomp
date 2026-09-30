@@ -51,8 +51,6 @@ Copy `default.xex`, `default.xexp` and `shader.ar` from your copy of the game in
 
 If you already have Unleashed Recompiled installed, for example on Windows, take them from its folder: `game/default.xex`, `game/shader.ar` and `update/default.xexp`. From WSL, Windows drives are under `/mnt`, for example `/mnt/c/Games/UnleashedRecomp/game/default.xex`. Otherwise, see [Add the Required Game Files](docs/BUILDING.md#2-add-the-required-game-files).
 
-It is also recommended to try to just select the XBOX360 `.iso` instead of these 3 files when installing the game (after building it first of course, which is the step after this one). Don't forget about the "Patch Update" file as well. 
-
 ### 5. Build
 
 ```bash
@@ -73,6 +71,8 @@ cd out/build/linux-release/UnleashedRecomp
 
 The installer asks for your game, its title update and, optionally, the DLC (see [How to Install](#how-to-install)). Once you reach the title screen, quit the game.
 
+For the game, it's recommended to just select your Xbox 360 `.iso` with **Add Files**. Don't forget the title update ("Patch Update") file as well, for example `TU_19KA20I_0000004000000.00000000000G1`: the game can't be installed without it.
+
 ### 7. Set up libTAS
 
 Start libTAS with the TAS mode turned on:
@@ -89,6 +89,39 @@ Choose `out/build/linux-release/UnleashedRecomp/UnleashedRecomp` as the game exe
 
 Start the game from libTAS and TAS as usual.
 
+### Updating the TAS version
+
+When the TAS version gets an update, update the source, then build the game again.
+
+If you cloned this branch:
+
+```bash
+cd UnleashedRecomp
+git pull
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
+If you applied the patch to the original project, take the old patch back out with the `UnleashedTAS.patch` you applied, then download and apply the new one:
+
+```bash
+cd UnleashedRecomp
+git apply -R UnleashedTAS.patch
+curl -LO https://raw.githubusercontent.com/grindersky/UnleashedRecomp/patches/UnleashedTAS.patch
+git apply UnleashedTAS.patch
+```
+
+`git apply -R` only works if you haven't changed the source yourself since applying the patch. If it fails, start again from a fresh clone, as in step 3.
+
+Then build the game again, as in step 5:
+
+```bash
+cmake . --preset linux-release
+cmake --build ./out/build/linux-release --target UnleashedRecomp
+```
+
+There's no need to install the game data again: it stays next to the game in `out/build/linux-release/UnleashedRecomp/`, and your saves, mods, codes and libTAS settings stay too. Only a fresh clone needs step 6 again, or those folders (`game`, `update`, `dlc`, `patched`) copied over from the old one.
+
 ### Options
 
 Set these in front of `libTAS`, like `UNLEASHED_TAS_MODE=1`:
@@ -96,12 +129,48 @@ Set these in front of `libTAS`, like `UNLEASHED_TAS_MODE=1`:
 - `UNLEASHED_TAS_MODE=1`: turns the TAS mode on. Without it, the game runs like the normal port.
 - `UNLEASHED_TAS_HUD=1`: a HUD with Sonic's speed, his state (on the ground or in the air, sliding, stomping, and whether a jump or stomp pressed on the current frame would work, with a countdown until a stomp is allowed again after a jump), the stick with the M-/D-Speed zones and the break-jump zone, and the buttons. It's drawn into the frames, so it also shows up in encodes.
 
+### Mods and codes
+
+The game loads mods and Hedge Mod Manager codes through two files, which Hedge Mod Manager usually writes. In WSL, you don't need Hedge Mod Manager: write them yourself. Edit them while the game is closed, as it only reads them when it starts.
+
+**`~/.config/UnleashedRecomp/cpkredir.ini`** turns mods and codes on, and says where to find the list of them. Write the full path, as `~` doesn't work there:
+
+```ini
+[CPKREDIR]
+Enabled=1
+ModsDbIni="/home/YOUR_NAME/.config/UnleashedRecomp/ModsDB.ini"
+```
+
+**`ModsDB.ini`**, the file `ModsDbIni` points to, lists the active mods and codes:
+
+```ini
+[Main]
+ActiveModCount=2
+ActiveMod0=CustomStage
+ActiveMod1=OtherMod
+
+[Mods]
+CustomStage="/home/YOUR_NAME/UnleashedMods/CustomStage/mod.ini"
+OtherMod="/mnt/c/UnleashedMods/OtherMod/mod.ini"
+
+[Codes]
+Code0="HomingAttackOnJump"
+Code1="SkipIntroLogos"
+CodeCount=2
+```
+
+- **Mods**: extract each mod into its own folder, with its `mod.ini` directly inside. Give it any name, point that name to its `mod.ini` under `[Mods]`, and list it under `[Main]` as `ActiveMod0`, `ActiveMod1` and so on, with `ActiveModCount` set to how many there are. Mods made for Hedge Mod Manager and for Unleashed Mod Manager both work. If two mods replace the same file, the one listed first wins.
+- **Custom levels** are mods that replace one of the game's stages. Turn the mod on, then play the stage it replaces; its description says which one. To switch to another custom level, change which mods are listed under `[Main]`: mods only listed under `[Mods]` aren't loaded.
+- **Codes**: list them under `[Codes]` as `Code0`, `Code1` and so on, with `CodeCount` set to one more than the highest number. To turn a code off without renumbering the others, put a `;` in front of its line. The names must be written exactly as below:
+
+  `AllowCancellingUnleash`, `DisableAutoSaveWarning`, `DisableBoostFilter`, `DisableDLCIcon`, `DisableDPadMovement`, `DisableDWMRoundedCorners`, `DisableLowResolutionFontOnCustomUI`, `EnableEventCollisionDebugView`, `EnableGIMipLevelDebugView`, `EnableObjectCollisionDebugView`, `EnableStageCollisionDebugView`, `FixEggmanlandUsingEventGalleryTransition`, `FixUnleashOutOfControlDrain`, `HomingAttackOnJump`, `HUDToggleKey`, `SaveScoreAtCheckpoints`, `SkipIntroLogos`, `UseAlternateTitle`, `UseArrowsForTimeOfDayTransition`, `UseOfficialTitleOnTitleBar`
+
 ### Keeping movies in sync
 
 libTAS doesn't save everything that matters in a movie. Play movies back with:
 
 - the game's FPS option set to libTAS's frame rate,
-- the same codes enabled as when the movie was recorded (in `~/.config/UnleashedRecomp/ModsDB.ini`),
+- the same mods and codes enabled as when the movie was recorded (see [Mods and codes](#mods-and-codes)),
 - the same save.
 
 Movies recorded at frame rates other than 60 fps with a version from before 2026-09-28 will probably desync.
