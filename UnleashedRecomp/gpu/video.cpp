@@ -292,6 +292,9 @@ static bool g_vulkan = false;
 static constexpr bool g_vulkan = true;
 #endif
 
+// Running on dozen, Mesa's Vulkan driver on top of D3D12 (see CreateHostDevice).
+static bool g_vulkanOnD3D12;
+
 static bool g_triangleStripWorkaround = false;
 
 static bool g_hardwareResolve = true;
@@ -1808,6 +1811,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 #endif
 
     g_capabilities = g_device->getCapabilities();
+
+    // Mesa's Vulkan driver on top of D3D12 (dozen) names its devices "Microsoft Direct3D12 (<GPU>)".
+    g_vulkanOnD3D12 = g_vulkan && g_device->getDescription().name.starts_with("Microsoft Direct3D12");
 
     LoadEmbeddedResources();
 
@@ -4550,6 +4556,12 @@ static void FlushRenderStateForRenderThread()
         // D3D12 resets the depth bias values. Check if they need to be set again.
         if (g_capabilities.dynamicDepthBias && !g_vulkan)
             g_dirtyStates.depthBias = (g_depthBias != g_pipelineState.depthBias) || (g_slopeScaledDepthBias != g_pipelineState.slopeScaledDepthBias);
+
+        // Dozen lets D3D12 reset them too (as of Mesa 26.0), to the pipeline's values of 0, although Vulkan
+        // keeps dynamic state across pipeline changes. Shadow maps then lost their depth bias, and models
+        // shadowed themselves in stripes. Set them again after every pipeline change.
+        else if (g_capabilities.dynamicDepthBias && g_vulkanOnD3D12)
+            g_dirtyStates.depthBias = true;
     }
 
     if (g_dirtyStates.depthBias && g_capabilities.dynamicDepthBias)
