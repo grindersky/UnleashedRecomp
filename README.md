@@ -51,6 +51,8 @@ Copy `default.xex`, `default.xexp` and `shader.ar` from your copy of the game in
 
 If you already have Unleashed Recompiled installed, for example on Windows, take them from its folder: `game/default.xex`, `game/shader.ar` and `update/default.xexp`. From WSL, Windows drives are under `/mnt`, for example `/mnt/c/Games/UnleashedRecomp/game/default.xex`. Otherwise, see [Add the Required Game Files](docs/BUILDING.md#2-add-the-required-game-files).
 
+It is also recommended to try to just select the XBOX360 `.iso` instead of these 3 files. Don't forget about the "Patch Update" file as well. 
+
 ### 5. Build
 
 ```bash
