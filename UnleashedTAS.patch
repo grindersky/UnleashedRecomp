@@ -491,7 +491,7 @@ index 0000000..956be45
 +    void GetWindowPixelSize(uint32_t& width, uint32_t& height) const;
 +};
 diff --git a/UnleashedRecomp/gpu/video.cpp b/UnleashedRecomp/gpu/video.cpp
-index a9edd0b..30fdb3c 100644
+index a9edd0b..8b066ef 100644
 --- a/UnleashedRecomp/gpu/video.cpp
 +++ b/UnleashedRecomp/gpu/video.cpp
 @@ -3,6 +3,7 @@
@@ -516,7 +516,27 @@ index a9edd0b..30fdb3c 100644
  
  #if defined(ASYNC_PSO_DEBUG) || defined(PSO_CACHING)
  #include <magic_enum/magic_enum.hpp>
-@@ -1875,7 +1878,11 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
+@@ -289,6 +292,9 @@ static bool g_vulkan = false;
+ static constexpr bool g_vulkan = true;
+ #endif
+ 
++// Running on dozen, Mesa's Vulkan driver on top of D3D12 (see CreateHostDevice).
++static bool g_vulkanOnD3D12;
++
+ static bool g_triangleStripWorkaround = false;
+ 
+ static bool g_hardwareResolve = true;
+@@ -1806,6 +1812,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
+ 
+     g_capabilities = g_device->getCapabilities();
+ 
++    // Mesa's Vulkan driver on top of D3D12 (dozen) names its devices "Microsoft Direct3D12 (<GPU>)".
++    g_vulkanOnD3D12 = g_vulkan && g_device->getDescription().name.starts_with("Microsoft Direct3D12");
++
+     LoadEmbeddedResources();
+ 
+     constexpr uint64_t LowEndMemoryLimit = 2048ULL * 1024ULL * 1024ULL;
+@@ -1875,7 +1884,11 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
          break;
      }
  
@@ -529,7 +549,7 @@ index a9edd0b..30fdb3c 100644
      g_swapChain->setVsyncEnabled(Config::VSync);
      g_swapChainValid = !g_swapChain->needsResize();
  
-@@ -2603,6 +2610,7 @@ static void DrawImGui()
+@@ -2603,6 +2616,7 @@ static void DrawImGui()
      assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
  
      DrawFPS();
@@ -537,7 +557,7 @@ index a9edd0b..30fdb3c 100644
      DrawProfiler();
      ImGui::Render();
  
-@@ -2787,9 +2795,17 @@ void Video::WaitOnSwapChain()
+@@ -2787,9 +2801,17 @@ void Video::WaitOnSwapChain()
  
  static bool g_shouldPrecompilePipelines;
  static std::atomic<bool> g_executedCommandList;
@@ -556,7 +576,7 @@ index a9edd0b..30fdb3c 100644
      g_readyForCommands = false;
  
      RenderCommand cmd;
-@@ -2802,9 +2818,13 @@ void Video::Present()
+@@ -2802,9 +2824,13 @@ void Video::Present()
      g_renderQueue.enqueue(cmd);
  
      // All the shaders are available at this point. We can precompile embedded PSOs then.
@@ -571,7 +591,7 @@ index a9edd0b..30fdb3c 100644
          g_shouldPrecompilePipelines = false;
      }
  
-@@ -2824,6 +2844,10 @@ void Video::Present()
+@@ -2824,6 +2850,10 @@ void Video::Present()
          g_swapChainValid = g_swapChain->present(g_backBufferIndex, signalSemaphores, std::size(signalSemaphores));
      }
  
@@ -582,7 +602,7 @@ index a9edd0b..30fdb3c 100644
      g_pendingWaitOnSwapChain = true;
  
      g_frame = g_nextFrame;
-@@ -2853,7 +2877,17 @@ void Video::Present()
+@@ -2853,7 +2883,17 @@ void Video::Present()
      cmd.type = RenderCommandType::BeginCommandList;
      g_renderQueue.enqueue(cmd);
  
@@ -601,7 +621,7 @@ index a9edd0b..30fdb3c 100644
      {
          using namespace std::chrono_literals;
  
-@@ -2977,7 +3011,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
+@@ -2977,7 +3017,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
      commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
      commandList->end();
  
@@ -611,7 +631,7 @@ index a9edd0b..30fdb3c 100644
      {
          const RenderCommandList *commandLists[] = { commandList.get() };
          RenderCommandSemaphore *waitSemaphores[] = { g_acquireSemaphores[g_frame].get() };
-@@ -3004,6 +3039,9 @@ static void ProcBeginCommandList(const RenderCommand& cmd)
+@@ -3004,6 +3045,9 @@ static void ProcBeginCommandList(const RenderCommand& cmd)
  {
      DestructTempResources();
      BeginCommandList();
@@ -621,7 +641,20 @@ index a9edd0b..30fdb3c 100644
  }
  
  static GuestSurface* GetBackBuffer() 
-@@ -6947,6 +6985,23 @@ PPC_FUNC(sub_825369A0)
+@@ -4512,6 +4556,12 @@ static void FlushRenderStateForRenderThread()
+         // D3D12 resets the depth bias values. Check if they need to be set again.
+         if (g_capabilities.dynamicDepthBias && !g_vulkan)
+             g_dirtyStates.depthBias = (g_depthBias != g_pipelineState.depthBias) || (g_slopeScaledDepthBias != g_pipelineState.slopeScaledDepthBias);
++
++        // Dozen lets D3D12 reset them too (as of Mesa 26.0), to the pipeline's values of 0, although Vulkan
++        // keeps dynamic state across pipeline changes. Shadow maps then lost their depth bias, and models
++        // shadowed themselves in stripes. Set them again after every pipeline change.
++        else if (g_capabilities.dynamicDepthBias && g_vulkanOnD3D12)
++            g_dirtyStates.depthBias = true;
+     }
+ 
+     if (g_dirtyStates.depthBias && g_capabilities.dynamicDepthBias)
+@@ -6947,6 +6997,23 @@ PPC_FUNC(sub_825369A0)
      assert(std::this_thread::get_id() == g_mainThreadId);
  
      // Wait for pipeline compilations to finish.
@@ -645,7 +678,7 @@ index a9edd0b..30fdb3c 100644
      uint32_t value;
      while ((value = g_compilingPipelineTaskCount.load()) != 0)
      {
-@@ -6961,10 +7016,28 @@ PPC_FUNC(sub_825369A0)
+@@ -6961,10 +7028,28 @@ PPC_FUNC(sub_825369A0)
      __imp__sub_825369A0(ctx, base);
  }
  
@@ -675,7 +708,7 @@ index a9edd0b..30fdb3c 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -6978,7 +7051,9 @@ PPC_FUNC(sub_82E2EFB0)
+@@ -6978,7 +7063,9 @@ PPC_FUNC(sub_82E2EFB0)
  // CTerrainModelData::CheckMadeAll
  PPC_FUNC_IMPL(__imp__sub_82E243D8);
  PPC_FUNC(sub_82E243D8)
@@ -686,7 +719,7 @@ index a9edd0b..30fdb3c 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -6992,7 +7067,9 @@ PPC_FUNC(sub_82E243D8)
+@@ -6992,7 +7079,9 @@ PPC_FUNC(sub_82E243D8)
  // CParticleMaterial::CheckMadeAll
  PPC_FUNC_IMPL(__imp__sub_82E87598);
  PPC_FUNC(sub_82E87598)
@@ -697,7 +730,7 @@ index a9edd0b..30fdb3c 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -7005,6 +7082,12 @@ PPC_FUNC(sub_82E87598)
+@@ -7005,6 +7094,12 @@ PPC_FUNC(sub_82E87598)
  
  void GetDatabaseDataMidAsmHook(PPCRegister& r1, PPCRegister& r4)
  {

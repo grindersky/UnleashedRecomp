@@ -4,6 +4,9 @@
 running under [libTAS](https://github.com/clementgallet/libTAS) on Linux: deterministic movie playback, savestates,
 libTAS's Stop button and OSD, correct audio at any libTAS frame rate, and an optional HUD.
 
+For the full setup, from WSL and libTAS to the libTAS settings to use, see the guide in the
+[`tas-mode` branch's README](https://github.com/grindersky/UnleashedRecomp/tree/tas-mode#setting-up-the-tas-version).
+
 ## Applying it
 
 ```bash
