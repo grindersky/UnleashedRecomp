@@ -6,9 +6,8 @@ back and encoding movies several times faster:
 
 | | |
 |---|---|
-| Fast-forward playback on dozen | 41.6 fps |
+| Fast-forward playback on dozen | 82.4 fps |
 | The same playback on lavapipe | 12.1 fps |
-| Encoding 720p with a 4K upscale on dozen | 11–15 fps |
 
 Use dozen to **play back and encode** movies. Keep making TASes (recording, savestates) on lavapipe, by turning on
 libTAS's "Force software rendering": savestates haven't been tested on dozen. A movie plays back the same on both
@@ -144,4 +143,4 @@ dozen doesn't have.
 ---
 
 Tested on Ubuntu 26.04.1 in WSL 2 with Mesa 26.0.8 (meson 1.10.1, GCC 15.2) and an NVIDIA GeForce RTX 5070. Speeds
-are from playing back and encoding the same movie on the same machine.
+are from fast-forward playback on the same machine.
