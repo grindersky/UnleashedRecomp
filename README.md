@@ -25,10 +25,15 @@ Put your own game files in `UnleashedRecompLib/private/` before building, as for
 UNLEASHED_TAS_MODE=1 libTAS
 ```
 
-Add `UNLEASHED_TAS_HUD=1` for a HUD with Sonic's speed, his state (on the ground or in the air, sliding, stomping,
-and whether a jump or stomp pressed on the current frame would work, with a countdown until a stomp is allowed
-again after a jump), the stick with the M-/D-Speed zones and the break-jump zone (orange), and the buttons (lit while
-held, with a ring on the frame they're pressed). It's drawn into the frames, so it also shows up in encodes.
+Add `UNLEASHED_TAS_HUD=1` for a HUD, shown in levels. It's drawn into the frames, so it also shows up in encodes.
+
+- As Sonic: his speed, his state (on the ground or in the air, sliding, stomping, and whether a jump or stomp pressed
+  on the current frame would work, with a countdown until a stomp is allowed again after a jump), the stick with the
+  M-/D-Speed zones and the break-jump zone (orange), and the buttons (lit while held, with a ring on the frame they're
+  pressed).
+- As the Werehog: his speed, his state (on the ground or in the air, dashing, attacking, which attack and in how many
+  frames it ends on its own, with and without the stick), whether a guard (LB) pressed on the current frame would
+  work, his Unleash gauge, the stage time, the stick and the buttons.
 
 To play back and encode movies on your graphics card instead of the CPU under WSL, see [DOZEN.md](DOZEN.md).
 
