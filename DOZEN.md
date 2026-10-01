@@ -10,9 +10,9 @@ back and encoding movies several times faster:
 | The same playback on lavapipe | 12.1 fps |
 | Encoding 720p with a 4K upscale on dozen | 11–15 fps |
 
-Use dozen to **play back and encode** movies. Keep making TASes (recording, savestates) with plain libTAS on
-lavapipe: savestates haven't been tested on dozen. A movie plays back the same on both drivers; playbacks on each
-were compared frame by frame and matched over 2800 frames.
+Use dozen to **play back and encode** movies. Keep making TASes (recording, savestates) on lavapipe, by turning on
+libTAS's "Force software rendering": savestates haven't been tested on dozen. A movie plays back the same on both
+drivers; playbacks on each were compared frame by frame and matched over 2800 frames.
 
 ## What you need
 
@@ -85,29 +85,33 @@ VK_DRIVER_FILES=$HOME/dozen/install/share/vulkan/icd.d/dzn_icd.x86_64.json vulka
 You should see `deviceName = Microsoft Direct3D12 (your graphics card)` and `driverName = Dozen`. A warning that dzn
 is not a conformant Vulkan implementation is normal.
 
-### 6. Add a command that starts libTAS with dozen
+### 6. Add commands that start libTAS with dozen
 
 ```bash
-echo "alias libTASdozen='VK_DRIVER_FILES=$HOME/dozen/install/share/vulkan/icd.d/dzn_icd.x86_64.json libTAS'" >> ~/.bashrc
+echo "alias libTASdozen='UNLEASHED_TAS_MODE=1 VK_DRIVER_FILES=$HOME/dozen/install/share/vulkan/icd.d/dzn_icd.x86_64.json libTAS'" >> ~/.bashrc
+echo "alias libTASdozenHUD='UNLEASHED_TAS_MODE=1 UNLEASHED_TAS_HUD=1 VK_DRIVER_FILES=$HOME/dozen/install/share/vulkan/icd.d/dzn_icd.x86_64.json libTAS'" >> ~/.bashrc
 source ~/.bashrc
 ```
 
-From now on, `libTASdozen` starts libTAS with dozen, and `libTAS` still starts it the usual way.
+From now on, `libTASdozen` starts libTAS with the TAS mode on and dozen, and `libTASdozenHUD` does the same with the
+TAS HUD. If you added `libTASdozen` from an older version of this guide, the new line replaces it.
 
-### 7. Turn off libTAS's software rendering
+### 7. Choose the driver with libTAS's software rendering
 
-With the game closed, open libTAS's **Settings**, go to **Video**, and uncheck **Force software rendering**. While
-that option is on, libTAS switches the game back to lavapipe without saying so, and playback is as slow as before.
+With the game closed, open libTAS's **Settings** and go to **Video**. **Force software rendering** picks the driver:
 
-Turn it back on when you go back to recording with plain `libTAS`.
+- **Off**: the game draws on dozen. Use this to play back and encode.
+- **On**: libTAS switches the game back to lavapipe without saying so. Use this to make TASes.
+
+libTAS remembers the setting, so switch it when you go from making a TAS to encoding and back.
 
 ### 8. Play back or encode a movie
 
 ```bash
-UNLEASHED_TAS_MODE=1 libTASdozen
+libTASdozen
 ```
 
-Add `UNLEASHED_TAS_HUD=1` in front for the HUD. Load your movie and encode as usual.
+Or `libTASdozenHUD` for the HUD. Load your movie and encode as usual.
 
 To confirm dozen is in use: when the game starts, the terminal you started libTAS from shows
 `WARNING: dzn is not a conformant Vulkan implementation, testing use only.`
@@ -123,7 +127,7 @@ that step 4 finished without errors.
 
 **The game still runs slowly and the terminal doesn't show the dzn warning**
 "Force software rendering" is still checked in libTAS (step 7), or libTAS was started with `libTAS` instead of
-`libTASdozen`.
+`libTASdozen` or `libTASdozenHUD`.
 
 **`libd3d12.so` is missing**
 WSL has no access to your graphics card. Update Windows, run `wsl --update`, install the latest graphics driver,
