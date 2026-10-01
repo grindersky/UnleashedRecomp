@@ -40,7 +40,52 @@ static constexpr uint32_t STOMP_BLOCKER_OVERRIDE_FLAG = 7;
 static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
 static constexpr uint32_t STATE_TIME_OFFSET = 0x10;
 
+// The Werehog's player context (SWA::Player::CEvilSonicContext). Both contexts are built on the same base
+// (sub_8230D620), so the player and its states are found the same way, but the Werehog keeps his velocity
+// elsewhere: a single vector, in world space. Found by comparing per-frame dumps of the context with how he
+// moves: it's how fast the point under him (+0x580) and his height (+0x560) change.
+static constexpr uint32_t EVIL_SONIC_CONTEXT_VFTABLE = 0x8201DD6C;
+static constexpr uint32_t EVIL_VELOCITY_OFFSET = 0x900;
+// Whether he's on the ground: what his IsOnGround (sub_823A4080) returns. It stays set until a jump takes him
+// about 0.1 up, and is cleared while an attack lifts him off the ground.
+static constexpr uint32_t EVIL_GROUNDED_OFFSET = 0xAE1;
+// His helpers: an std::map<uint16_t, boost::shared_ptr<...>> (sub_82BB93D0 looks them up). Helper 2 handles
+// attacks (SWA::Player::CEvilAttackAction); its current action (sub_82DE0870) is a node of the attack list read
+// from EvilAttackAction*.xml (sub_824241D0), where +16 is its ActionName, +20 its MotionName and +148 its Guard
+// flag: whether a guard can cancel it.
+static constexpr uint32_t EVIL_HELPERS_OFFSET = 0x3BC;
+static constexpr uint16_t EVIL_ATTACK_HELPER = 2;
+static constexpr uint32_t ATTACK_HELPER_LEVEL_OFFSET = 8;
+static constexpr uint32_t ATTACK_HELPER_ACTION_OFFSET = 20;
+static constexpr uint32_t ATTACK_MOTION_MAPS = 0x833655D8;
+static constexpr uint32_t ACTION_NAME_OFFSET = 16;
+static constexpr uint32_t ACTION_MOTION_NAME_OFFSET = 20;
+static constexpr uint32_t ACTION_KEY_END_OFFSET = 76;
+static constexpr uint32_t ACTION_GUARD_OFFSET = 148;
+// The motion's EndSkipTimeWhenPad (sub_82424A18).
+static constexpr uint32_t MOTION_END_SKIP_TIME_OFFSET = 268;
+// The player's animation state machine: CEvilSonic's interface at +0xC0 returns it from its +380 (sub_82303030).
+static constexpr uint32_t PLAYER_ANIMATION_STATE_MACHINE_OFFSET = 0xC0 + 380;
+// An animation state (SWA::CAnimationControlSingle): its Havok control (hkaDefaultAnimationControl) at +4, with the
+// local time at +8, the playback speed at +0x40 and the animation binding at +0x28, whose animation (+0) has its
+// duration at +12 (the state's vfunc 2, sub_82BC0870). The state's start time is at +20 (sub_82BBD030).
+static constexpr uint32_t ANIMATION_CONTROL_OFFSET = 4;
+static constexpr uint32_t ANIMATION_START_TIME_OFFSET = 20;
+static constexpr uint32_t ANIMATION_CONTROL_TIME_OFFSET = 8;
+static constexpr uint32_t ANIMATION_CONTROL_SPEED_OFFSET = 0x40;
+static constexpr uint32_t ANIMATION_CONTROL_BINDING_OFFSET = 0x28;
+static constexpr uint32_t ANIMATION_DURATION_OFFSET = 12;
+
+// The game document (SWA::CGameDocument::GetInstance), whose member keeps the stage time at +0x5C: it stops at the
+// goal, and counts up from below 0 during a stage's intro. (+0x60 keeps going after the goal.)
+static constexpr uint32_t GAME_DOCUMENT = 0x83367900;
+static constexpr uint32_t GAME_DOCUMENT_MEMBER_OFFSET = 8;
+static constexpr uint32_t STAGE_TIME_OFFSET = 0x5C;
+
 static uint32_t g_speedContext;
+static uint32_t g_evilContext;
+// Which of the two was made last, for when both are around.
+static bool g_evilContextIsNewer;
 static int16_t g_thumbLX;
 static int16_t g_thumbLY;
 
@@ -52,6 +97,15 @@ static bool g_stompDisabledByHop;
 static bool g_stompBlocked;
 static float g_stompingDisableTime = 0.15f;
 
+// The Werehog's state and attack action on the last drawn frame, and the frame they started on.
+static uint32_t g_evilState;
+static uint32_t g_evilAction;
+static float g_evilStateTime;
+static uint32_t g_evilStateStartFrame;
+// The attack animation and its local time on the last drawn frame.
+static uint32_t g_evilAnimation;
+static float g_evilAnimationTime;
+
 // SWA::Player::CPlayerSpeedContext::CPlayerSpeedContext (the base of the day Sonic context)
 PPC_FUNC_IMPL(__imp__sub_82330188);
 PPC_FUNC(sub_82330188)
@@ -60,7 +114,19 @@ PPC_FUNC(sub_82330188)
     __imp__sub_82330188(ctx, base);
 
     if (TasHud::IsEnabled())
+    {
         g_speedContext = context;
+        g_evilContextIsNewer = false;
+    }
+}
+
+void TasHud::OnEvilSonicContext(uint32_t context)
+{
+    if (IsEnabled())
+    {
+        g_evilContext = context;
+        g_evilContextIsNewer = true;
+    }
 }
 
 static bool IsReadable(uint32_t address)
@@ -81,6 +147,12 @@ static uint8_t LoadU8(uint32_t address)
     return IsReadable(address) ? PPC_LOAD_U8(address) : 0;
 }
 
+static uint16_t LoadU16(uint32_t address)
+{
+    uint8_t* base = g_memory.base;
+    return IsReadable(address) ? PPC_LOAD_U16(address) : 0;
+}
+
 static float LoadFloat(uint32_t address)
 {
     uint32_t value = LoadU32(address);
@@ -93,6 +165,101 @@ static bool IsSonicContext(uint32_t context)
 {
     // The context may have been destroyed since, and its memory reused.
     return context != 0 && LoadU32(context) == SONIC_CONTEXT_VFTABLE;
+}
+
+static bool IsEvilSonicContext(uint32_t context)
+{
+    return context != 0 && LoadU32(context) == EVIL_SONIC_CONTEXT_VFTABLE;
+}
+
+// The player to show: day Sonic or the Werehog, the one made last if both are alive, or 0 outside of levels.
+static uint32_t GetPlayerContext(bool& werehog)
+{
+    bool sonic = IsSonicContext(g_speedContext);
+    werehog = IsEvilSonicContext(g_evilContext) && (!sonic || g_evilContextIsNewer);
+    return werehog ? g_evilContext : sonic ? g_speedContext : 0;
+}
+
+// A CSharedString's text.
+static std::string GetSharedString(uint32_t address)
+{
+    uint32_t text = LoadU32(address);
+    if (!IsReadable(text))
+        return {};
+
+    auto chars = reinterpret_cast<const char*>(g_memory.Translate(text));
+    return std::string(chars, strnlen(chars, 64));
+}
+
+// Looks up an std::map node like std::map::find, without inserting (the game's lookups insert missing keys).
+// MSVC's tree: the head node at +4 of the map, whose parent (+4) is the root; nodes have their left child at +0,
+// right child at +8, key at +12 and value at +16, then the colour and a byte set in the head: at +25 after an
+// 8-byte value (like a shared_ptr), at +21 after a 2-byte one. Returns the node, or 0.
+template<typename Less, typename Equal>
+static uint32_t FindMapNode(uint32_t map, uint32_t headFlagOffset, Less less, Equal equal)
+{
+    uint32_t head = LoadU32(map + 4);
+    if (head == 0)
+        return 0;
+
+    uint32_t found = head;
+    uint32_t node = LoadU32(head + 4);
+    for (int depth = 0; depth < 64 && node != 0 && LoadU8(node + headFlagOffset) == 0; depth++)
+    {
+        if (less(node + 12))
+        {
+            node = LoadU32(node + 8);
+        }
+        else
+        {
+            found = node;
+            node = LoadU32(node);
+        }
+    }
+
+    return found != head && equal(found + 12) ? found : 0;
+}
+
+static uint32_t FindMapNode(uint32_t map, uint16_t key, uint32_t headFlagOffset = 25)
+{
+    return FindMapNode(map, headFlagOffset, [&](uint32_t k) { return LoadU16(k) < key; }, [&](uint32_t k) { return LoadU16(k) == key; });
+}
+
+static uint32_t FindMapNode(uint32_t map, const std::string& key, uint32_t headFlagOffset = 25)
+{
+    return FindMapNode(map, headFlagOffset, [&](uint32_t k) { return GetSharedString(k) < key; },
+        [&](uint32_t k) { return GetSharedString(k) == key; });
+}
+
+// The Werehog's attack helper, or 0.
+static uint32_t GetEvilAttackHelper(uint32_t context)
+{
+    uint32_t node = FindMapNode(context + EVIL_HELPERS_OFFSET, EVIL_ATTACK_HELPER);
+    return node != 0 ? LoadU32(node + 16) : 0;
+}
+
+// The motion an attack action plays, or 0: the motions read from EvilAttackMotionFile.xml are in an
+// std::map<CSharedString, boost::shared_ptr<...>> per level of the attack list (0x833655D8 + 12 * the helper's level
+// at +8), by the action's MotionName at +20 (sub_82423B90). The motion's animation file name is at +0.
+static uint32_t GetAttackMotion(uint32_t helper, uint32_t action)
+{
+    uint32_t node = FindMapNode(ATTACK_MOTION_MAPS + 12 * LoadU32(helper + ATTACK_HELPER_LEVEL_OFFSET),
+        GetSharedString(action + ACTION_MOTION_NAME_OFFSET));
+    return node != 0 ? LoadU32(node + 16) : 0;
+}
+
+// The player's animation state for an animation, or 0 (sub_82BB97E8): the player's animation state machine
+// (sub_82307C70) maps names to IDs at +20 and IDs to states at +8.
+static uint32_t GetAnimationState(uint32_t context, const std::string& name)
+{
+    uint32_t player = LoadU32(context + PLAYER_OFFSET);
+    uint32_t stateMachine = player != 0 ? LoadU32(player + PLAYER_ANIMATION_STATE_MACHINE_OFFSET) : 0;
+    if (stateMachine == 0)
+        return 0;
+
+    uint32_t idNode = FindMapNode(stateMachine + 20, name, 21);
+    uint32_t stateNode = idNode != 0 ? FindMapNode(stateMachine + 8, LoadU16(idNode + 16)) : 0;
+    return stateNode != 0 ? LoadU32(stateNode + 16) : 0;
 }
 
 static bool GetFlag(uint32_t context, uint32_t flagsOffset, uint32_t flag)
@@ -191,15 +358,12 @@ static const std::string& GetStateName(uint32_t state)
     return s_names.emplace(vtable, name).first->second;
 }
 
-static bool GetVelocity(uint32_t offset, float& x, float& y, float& z)
+static float VectorLength(uint32_t address, float& y)
 {
-    if (!IsSonicContext(g_speedContext))
-        return false;
-
-    x = LoadFloat(g_speedContext + offset);
-    y = LoadFloat(g_speedContext + offset + 4);
-    z = LoadFloat(g_speedContext + offset + 8);
-    return true;
+    float x = LoadFloat(address);
+    float z = LoadFloat(address + 8);
+    y = LoadFloat(address + 4);
+    return std::sqrt(x * x + y * y + z * z);
 }
 
 // The target zones of the M-/D-Speed Visualiser, on the stick as SDL reports it: -1..1, Y pointing
@@ -447,6 +611,15 @@ void TasHud::Draw()
     if (!IsEnabled())
         return;
 
+    // Only in levels, where Sonic or the Werehog is around.
+    bool werehog;
+    uint32_t context = GetPlayerContext(werehog);
+    if (context == 0)
+    {
+        g_frame++;
+        return;
+    }
+
     auto drawList = ImGui::GetBackgroundDrawList();
     auto& res = ImGui::GetIO().DisplaySize;
     auto font = ImFontAtlasSnapshot::GetFont("FOT-SeuratPro-M.otf");
@@ -456,60 +629,179 @@ void TasHud::Draw()
     float radius = Scale(70);
     float padding = Scale(8);
     float gap = Scale(4);
+    float indicatorText = std::max({ TextWidth(font, Scale(11), "CAN STOMP"), TextWidth(font, Scale(11), "ATTACKING"),
+        TextWidth(font, Scale(11), "CAN GUARD") });
     float width = std::max({ 2 * radius + 2 * padding,
         TextWidth(font, Scale(11), "X -1.00 Y -1.00  (-32768, -32768)") + 2 * padding,
-        3 * (TextWidth(font, Scale(11), "CAN STOMP") + Scale(10)) + 2 * gap + 2 * padding });
+        3 * (indicatorText + Scale(10)) + 2 * gap + 2 * padding });
     ImVec2 panelMax = { res.x - Scale(40), res.y - Scale(22) };
     ImVec2 centre = { panelMax.x - width / 2, panelMax.y - Scale(58 + CONTROLLER_HEIGHT) - radius };
-    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(102) };
+    // The Werehog's panel has a row more, for when his attack ends.
+    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(werehog ? 122 : 102) };
     float left = panelMin.x + padding;
 
     drawList->AddRectFilled(panelMin, panelMax, IM_COL32(0, 0, 0, 140), Scale(6));
 
-    // Speedometer.
-    float hx, hy, hz, vx, vy, vz, fx, fy, fz;
-    if (GetVelocity(HORIZONTAL_VELOCITY_OFFSET, hx, hy, hz) && GetVelocity(VERTICAL_VELOCITY_OFFSET, vx, vy, vz) &&
-        GetVelocity(VELOCITY_OFFSET, fx, fy, fz))
+    // Speedometer: the speed along the ground, the full speed, and the vertical part, along the up vector
+    // or against it.
+    float speed, total, vertical;
+    if (werehog)
     {
-        DrawText(drawList, font, Scale(18), { left, panelMin.y + Scale(6) }, IM_COL32_WHITE,
-            fmt::format("Speed {:.2f}", std::sqrt(hx * hx + hy * hy + hz * hz)));
-
-        // The vertical part's sign: along the up vector or against it.
-        float vertical = std::sqrt(vx * vx + vy * vy + vz * vz) * (vy < 0 ? -1.0f : 1.0f);
-        DrawText(drawList, font, Scale(11), { left, panelMin.y + Scale(28) }, IM_COL32(220, 220, 220, 255),
-            fmt::format("Total {:.2f}   Vertical {:.2f}", std::sqrt(fx * fx + fy * fy + fz * fz), vertical));
+        // Split along the world's up, which is the Werehog's (his up vector stayed (0, 1, 0) everywhere).
+        total = VectorLength(context + EVIL_VELOCITY_OFFSET, vertical);
+        speed = std::sqrt(std::max(total * total - vertical * vertical, 0.0f));
     }
     else
     {
-        DrawText(drawList, font, Scale(18), { left, panelMin.y + Scale(6) }, IM_COL32(160, 160, 160, 255), "Speed --");
+        float y;
+        speed = VectorLength(context + HORIZONTAL_VELOCITY_OFFSET, y);
+        total = VectorLength(context + VELOCITY_OFFSET, y);
+        vertical = VectorLength(context + VERTICAL_VELOCITY_OFFSET, y);
+        if (y < 0)
+            vertical = -vertical;
     }
 
-    // What Sonic is doing, then what a press on this frame would have done: the game checked for the jump
-    // or stomp button during this frame's update. Both need a new press, holding the button doesn't count.
+    DrawText(drawList, font, Scale(18), { left, panelMin.y + Scale(6) }, IM_COL32_WHITE, fmt::format("Speed {:.2f}", speed));
+    DrawText(drawList, font, Scale(11), { left, panelMin.y + Scale(28) }, IM_COL32(220, 220, 220, 255),
+        fmt::format("Total {:.2f}   Vertical {:.2f}", total, vertical));
+
+    // What the player is doing. For Sonic, then what a press on this frame would have done: the game checked
+    // for the jump or stomp button during this frame's update. Both need a new press, holding the button
+    // doesn't count.
     float row = panelMin.y + Scale(46);
     float pressRow = row + Scale(20);
     float stateRow = pressRow + Scale(20);
+    float attackRow = stateRow + Scale(20);
 
-    if (IsSonicContext(g_speedContext))
+    uint32_t state = GetCurrentState(context);
+    std::string stateName = state != 0 ? GetStateName(state) : "?";
+    float stateTime = state != 0 ? LoadFloat(state + STATE_TIME_OFFSET) : 0.0f;
+    float deltaTime = std::max(float(App::s_deltaTime), 0.001f);
+
+    float indicatorWidth = (width - 2 * padding - 2 * gap) / 3;
+    float column2 = left + indicatorWidth + gap;
+    float column3 = column2 + indicatorWidth + gap;
+
+    bool grounded = LoadU8(context + (werehog ? EVIL_GROUNDED_OFFSET : GROUNDED_OFFSET)) != 0;
+    DrawIndicator(drawList, font, { left, row }, indicatorWidth, grounded ? "GROUND" : "AIR", grounded ? IM_COL32(80, 220, 80, 230) : IM_COL32(90, 170, 255, 230), true);
+
+    std::string stateLabel = stateName;
+    int stateFrames = int(std::lround(stateTime / deltaTime));
+
+    if (werehog)
     {
-        uint32_t context = g_speedContext;
-        uint32_t state = GetCurrentState(context);
-        std::string stateName = state != 0 ? GetStateName(state) : "?";
-        float stateTime = state != 0 ? LoadFloat(state + STATE_TIME_OFFSET) : 0.0f;
-        float deltaTime = std::max(float(App::s_deltaTime), 0.001f);
+        bool dashing = stateName == "Dash";
+        bool attacking = stateName.starts_with("AttackAction") || stateName == "SuperAttack";
+        uint32_t helper = stateName == "AttackAction_byList" ? GetEvilAttackHelper(context) : 0;
+        uint32_t action = helper != 0 ? LoadU32(helper + ATTACK_HELPER_ACTION_OFFSET) : 0;
 
-        bool grounded = LoadU8(context + GROUNDED_OFFSET) != 0;
+        // When the attack's action ends on its own. Its animation advances by its playback speed times the game's
+        // speed, which some attacks lower for a while: the counts go by the last frame's rate, so they drop when such
+        // a slowdown ends. Matched against every attack that ended without a button press in two movies:
+        // - the action ends on the frame its animation's time gets within half a frame of the animation's end;
+        // - on the ground with the stick held, already on the frame after the time passes the end minus the
+        //   motion's EndSkipTimeWhenPad.
+        // The action then either leads to the one named by its KEY__End (like the parts of a jumping slash), or
+        // lets go of the Werehog.
+        int framesLeft = -1;
+        int framesLeftWithStick = -1;
+        std::string nextAction;
+        uint32_t motion = action != 0 ? GetAttackMotion(helper, action) : 0;
+        uint32_t animation = motion != 0 ? GetAnimationState(context, GetSharedString(motion)) : 0;
+        if (animation != 0)
+        {
+            uint32_t control = LoadU32(animation + ANIMATION_CONTROL_OFFSET);
+            float duration = LoadFloat(LoadU32(LoadU32(control + ANIMATION_CONTROL_BINDING_OFFSET)) + ANIMATION_DURATION_OFFSET);
+            float time = LoadFloat(control + ANIMATION_CONTROL_TIME_OFFSET) - LoadFloat(animation + ANIMATION_START_TIME_OFFSET);
+            float step = animation == g_evilAnimation && time > g_evilAnimationTime ? time - g_evilAnimationTime :
+                deltaTime * LoadFloat(control + ANIMATION_CONTROL_SPEED_OFFSET);
+
+            if (duration > 0.0f && step > 0.0f)
+            {
+                float end = duration - 1.0f / 120.0f;
+                framesLeft = std::max(1, int(std::ceil((end - time) / step)));
+
+                float endWithStick = duration - LoadFloat(motion + MOTION_END_SKIP_TIME_OFFSET);
+                int withStick = 1 + std::max(0, int(std::ceil((endWithStick - time) / step)));
+                if (grounded && withStick < framesLeft)
+                    framesLeftWithStick = withStick;
+            }
+
+            nextAction = GetSharedString(action + ACTION_KEY_END_OFFSET);
+            g_evilAnimationTime = time;
+        }
+
+        g_evilAnimation = animation;
+
+        DrawIndicator(drawList, font, { column2, row }, indicatorWidth, "DASHING", IM_COL32(255, 200, 60, 230), dashing);
+        DrawIndicator(drawList, font, { column3, row }, indicatorWidth, "ATTACKING", IM_COL32(255, 110, 80, 230), attacking);
+
+        // Whether LB on this frame would guard. The states whose update checks for it, and changes to "Guard":
+        // standing, walking, running and landing guard right away; an attack only on the ground, and if its action
+        // allows it (sub_823CE5F8). All of them also need sub_823A4420 (an out-of-control check on the player),
+        // which isn't replicated, and neither are the rarer cases in Damage and Fall.
+        bool canGuard = stateName == "Idle" || stateName == "WalkSlowE" || stateName == "WalkE" || stateName == "RunE" ||
+            stateName == "Land" || (action != 0 && grounded && LoadU8(action + ACTION_GUARD_OFFSET) != 0);
+        DrawIndicator(drawList, font, { left, pressRow }, indicatorWidth, "CAN GUARD", IM_COL32(80, 230, 80, 255), canGuard, true);
+
+        if (framesLeft >= 0)
+        {
+            std::string text;
+            if (!nextAction.empty())
+                text = fmt::format("{} in {}f", nextAction, framesLeft);
+            else if (framesLeftWithStick >= 0)
+                text = fmt::format("free in {}f, {}f with the stick", framesLeft, framesLeftWithStick);
+            else
+                text = fmt::format("free in {}f", framesLeft);
+
+            DrawText(drawList, font, Scale(11), { left, attackRow }, IM_COL32(255, 200, 60, 255), text);
+        }
+
+        // The Unleash gauge, filled by defeating enemies.
+        auto evilSonicContext = reinterpret_cast<SWA::Player::CEvilSonicContext*>(g_memory.Translate(context));
+        std::string gauge = fmt::format("Unleash {:.1f}", float(evilSonicContext->m_DarkGaiaEnergy));
+        DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), gauge), pressRow + Scale(2) },
+            IM_COL32(220, 220, 220, 255), gauge);
+
+        // The stage time, which the Werehog's stages don't show: as the day stages show it (truncated to
+        // hundredths), and in frames.
+        uint32_t document = LoadU32(GAME_DOCUMENT);
+        uint32_t member = document != 0 ? LoadU32(document + GAME_DOCUMENT_MEMBER_OFFSET) : 0;
+        if (member != 0)
+        {
+            float stageTime = LoadFloat(member + STAGE_TIME_OFFSET);
+            int hundredths = int(std::abs(stageTime) * 100.0f);
+            std::string text = fmt::format("TIME {}{:02}:{:02}:{:02}  {}f", stageTime < 0.0f ? "-" : "", hundredths / 6000,
+                hundredths / 100 % 60, hundredths % 100, int(std::lround(stageTime * 60.0f)));
+            DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), text), panelMin.y + Scale(10) },
+                IM_COL32(220, 220, 220, 255), text);
+        }
+
+        // All attacks run in one state: show the attack list's name for the action instead.
+        if (action != 0)
+        {
+            if (std::string actionName = GetSharedString(action + ACTION_NAME_OFFSET); !actionName.empty())
+                stateLabel = "Attack " + actionName;
+        }
+
+        // Count drawn frames since the state or action changed: some attacks slow the game down, and their state
+        // time then advances by less than a frame.
+        if (state != g_evilState || action != g_evilAction || stateTime < g_evilStateTime)
+            g_evilStateStartFrame = g_frame;
+
+        g_evilState = state;
+        g_evilAction = action;
+        g_evilStateTime = stateTime;
+        stateFrames = int(g_frame - g_evilStateStartFrame);
+    }
+    else
+    {
         bool sliding = stateName.starts_with("Sliding");
         bool stomping = stateName.starts_with("Stomping");
         bool canJump = g_jumpCheckFrame == g_frame;
         bool stompChecked = g_stompCheckFrame == g_frame;
         bool canStomp = stompChecked && !g_stompDisabledByHop && !g_stompBlocked;
 
-        float indicatorWidth = (width - 2 * padding - 2 * gap) / 3;
-        float column2 = left + indicatorWidth + gap;
-        float column3 = column2 + indicatorWidth + gap;
-
-        DrawIndicator(drawList, font, { left, row }, indicatorWidth, grounded ? "GROUND" : "AIR", grounded ? IM_COL32(80, 220, 80, 230) : IM_COL32(90, 170, 255, 230), true);
         DrawIndicator(drawList, font, { column2, row }, indicatorWidth, "SLIDING", IM_COL32(255, 200, 60, 230), sliding);
         DrawIndicator(drawList, font, { column3, row }, indicatorWidth, "STOMPING", IM_COL32(255, 110, 80, 230), stomping);
 
@@ -532,14 +824,10 @@ void TasHud::Draw()
 
             DrawText(drawList, font, Scale(11), { column3, pressRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", frames));
         }
+    }
 
-        DrawText(drawList, font, Scale(11), { left, stateRow }, IM_COL32(220, 220, 220, 255),
-            fmt::format("{}  {}f", stateName, int(std::lround(stateTime / deltaTime))));
-    }
-    else
-    {
-        DrawText(drawList, font, Scale(11), { left, row }, IM_COL32(160, 160, 160, 255), "No player");
-    }
+    DrawText(drawList, font, Scale(11), { left, stateRow }, IM_COL32(220, 220, 220, 255),
+        fmt::format("{}  {}f", stateLabel, stateFrames));
 
     // Stick, as SDL (and libTAS) reports it: XInput's Y is flipped with a bitwise NOT.
     int16_t sdlX = g_thumbLX;
@@ -562,28 +850,35 @@ void TasHud::Draw()
     drawList->AddLine({ centre.x - radius, centre.y }, { centre.x + radius, centre.y }, IM_COL32(255, 255, 255, 90), Scale(1));
     drawList->AddLine({ centre.x, centre.y - radius }, { centre.x, centre.y + radius }, IM_COL32(255, 255, 255, 90), Scale(1));
 
-    DrawBreakJumpZone(drawList, centre, radius, breakJump);
-
+    // M-Speed, D-Speed and the break-jump are Sonic's: the Werehog can't do them.
     int activeZone = -1;
-    for (int i = 0; i < int(std::size(TARGET_ZONES)); i++)
+    if (!werehog)
     {
-        bool active = IsInZone(TARGET_ZONES[i], x, y);
-        if (active && activeZone < 0)
-            activeZone = i;
+        DrawBreakJumpZone(drawList, centre, radius, breakJump);
 
-        DrawZone(drawList, centre, radius, TARGET_ZONES[i], active);
+        for (int i = 0; i < int(std::size(TARGET_ZONES)); i++)
+        {
+            bool active = IsInZone(TARGET_ZONES[i], x, y);
+            if (active && activeZone < 0)
+                activeZone = i;
+
+            DrawZone(drawList, centre, radius, TARGET_ZONES[i], active);
+        }
     }
 
     ImVec2 stick = { centre.x + x * radius, centre.y + y * radius };
     drawList->AddLine(centre, stick, IM_COL32(255, 60, 60, 255), Scale(2));
     drawList->AddCircleFilled(stick, Scale(4.5f), IM_COL32(255, 60, 60, 255));
 
-    std::string zoneText = activeZone >= 0 ? TARGET_ZONES[activeZone].Name : "";
-    if (breakJump)
-        zoneText += zoneText.empty() ? "Break-jump" : " + Break-jump";
+    if (!werehog)
+    {
+        std::string zoneText = activeZone >= 0 ? TARGET_ZONES[activeZone].Name : "";
+        if (breakJump)
+            zoneText += zoneText.empty() ? "Break-jump" : " + Break-jump";
 
-    ImU32 zoneColour = activeZone >= 0 ? IM_COL32(80, 255, 80, 255) : breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
-    DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(6) }, zoneColour, zoneText.empty() ? "No zone" : zoneText);
+        ImU32 zoneColour = activeZone >= 0 ? IM_COL32(80, 255, 80, 255) : breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
+        DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(6) }, zoneColour, zoneText.empty() ? "No zone" : zoneText);
+    }
 
     // What to type into libTAS, and what the game made of it.
     DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(20) }, IM_COL32_WHITE,
