@@ -2540,10 +2540,10 @@ index d15aac6..7112106 100644
          SDL_VideoInit(nullptr);
 diff --git a/UnleashedRecomp/ui/tas_hud.cpp b/UnleashedRecomp/ui/tas_hud.cpp
 new file mode 100644
-index 0000000..e16e1f5
+index 0000000..55e9174
 --- /dev/null
 +++ b/UnleashedRecomp/ui/tas_hud.cpp
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,601 @@
 +#include "tas_hud.h"
 +#include <api/SWA.h>
 +#include <app.h>
@@ -2752,6 +2752,7 @@ index 0000000..e16e1f5
 +// down, angles as atan2(y, x). Its per-axis deadzone applies before checking them.
 +struct TargetZone
 +{
++    const char* Name;
 +    float StartAngle;
 +    float EndAngle;
 +    float InnerRadius;
@@ -2763,9 +2764,9 @@ index 0000000..e16e1f5
 +
 +static constexpr TargetZone TARGET_ZONES[] =
 +{
-+    { 5 * PI / 4, 7 * PI / 4, 0.45f, 0.70f }, // Up
-+    { -PI / 4, PI / 4, 0.29f, 0.50f },        // Right
-+    { 3 * PI / 4, 5 * PI / 4, 0.29f, 0.50f }, // Left
++    { "M-Speed", 5 * PI / 4, 7 * PI / 4, 0.45f, 0.70f }, // Up
++    { "D-Speed", -PI / 4, PI / 4, 0.29f, 0.50f },        // Right
++    { "D-Speed", 3 * PI / 4, 5 * PI / 4, 0.29f, 0.50f }, // Left
 +};
 +
 +static bool IsInZone(const TargetZone& zone, float x, float y)
@@ -3123,7 +3124,7 @@ index 0000000..e16e1f5
 +    drawList->AddLine(centre, stick, IM_COL32(255, 60, 60, 255), Scale(2));
 +    drawList->AddCircleFilled(stick, Scale(4.5f), IM_COL32(255, 60, 60, 255));
 +
-+    std::string zoneText = activeZone >= 0 ? fmt::format("Zone {}", activeZone + 1) : "";
++    std::string zoneText = activeZone >= 0 ? TARGET_ZONES[activeZone].Name : "";
 +    if (breakJump)
 +        zoneText += zoneText.empty() ? "Break-jump" : " + Break-jump";
 +
