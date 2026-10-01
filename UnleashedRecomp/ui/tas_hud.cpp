@@ -206,6 +206,7 @@ static bool GetVelocity(uint32_t offset, float& x, float& y, float& z)
 // down, angles as atan2(y, x). Its per-axis deadzone applies before checking them.
 struct TargetZone
 {
+    const char* Name;
     float StartAngle;
     float EndAngle;
     float InnerRadius;
@@ -217,9 +218,9 @@ static constexpr float STICK_DEADZONE = 0.05f;
 
 static constexpr TargetZone TARGET_ZONES[] =
 {
-    { 5 * PI / 4, 7 * PI / 4, 0.45f, 0.70f }, // Up
-    { -PI / 4, PI / 4, 0.29f, 0.50f },        // Right
-    { 3 * PI / 4, 5 * PI / 4, 0.29f, 0.50f }, // Left
+    { "M-Speed", 5 * PI / 4, 7 * PI / 4, 0.45f, 0.70f }, // Up
+    { "D-Speed", -PI / 4, PI / 4, 0.29f, 0.50f },        // Right
+    { "D-Speed", 3 * PI / 4, 5 * PI / 4, 0.29f, 0.50f }, // Left
 };
 
 static bool IsInZone(const TargetZone& zone, float x, float y)
@@ -577,7 +578,7 @@ void TasHud::Draw()
     drawList->AddLine(centre, stick, IM_COL32(255, 60, 60, 255), Scale(2));
     drawList->AddCircleFilled(stick, Scale(4.5f), IM_COL32(255, 60, 60, 255));
 
-    std::string zoneText = activeZone >= 0 ? fmt::format("Zone {}", activeZone + 1) : "";
+    std::string zoneText = activeZone >= 0 ? TARGET_ZONES[activeZone].Name : "";
     if (breakJump)
         zoneText += zoneText.empty() ? "Break-jump" : " + Break-jump";
 
