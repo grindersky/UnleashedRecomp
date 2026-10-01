@@ -4,6 +4,7 @@
 #include <os/logger.h>
 #include <app.h>
 #include <sdl_events.h>
+#include <ui/tas_hud.h>
 
 static uint32_t g_lastEnemyScore;
 static uint32_t g_lastTrickScore;
@@ -99,7 +100,10 @@ void PostUnleashMidAsmHook(PPCRegister& r30)
 PPC_FUNC_IMPL(__imp__sub_823B49D8);
 PPC_FUNC(sub_823B49D8)
 {
+    uint32_t context = ctx.r3.u32;
     __imp__sub_823B49D8(ctx, base);
+
+    TasHud::OnEvilSonicContext(context);
 
     App::s_isWerehog = true;
 
