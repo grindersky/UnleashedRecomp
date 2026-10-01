@@ -193,3 +193,21 @@ PPC_FUNC(sub_824EE620)
 
     ctx.r3.u32 = PersistentStorageManager::ShouldDisplayDLCMessage(true);
 }
+
+// The stage collision debug view (EnableStageCollisionDebugView) sets the game's ms_IsCollisionRender, and with
+// it, the stage loader (sub_82564100) skips every Terrain block of Stage.set.xml that has a TerrainInfoFile, so
+// that the blocks with only a RigidBodyContainer get loaded and drawn as collision instead. A few stages, like
+// Rooftop Run's day acts, have both in one block, which then got skipped: they lost their terrain and their
+// collision, and the player fell through the stage. Load such blocks like the collision-only ones, which only
+// read the block's collision fields: these stages then show their collision like the others. Without the debug
+// view, the loader runs unchanged.
+bool StageCollisionDebugViewTerrainMidAsmHook(PPCRegister& r1)
+{
+    if (!*SWA::SGlobals::ms_IsCollisionRender)
+        return false;
+
+    // The block's RigidBodyContainer, read into a CSharedString on the stack.
+    uint8_t* base = g_memory.base;
+    uint32_t rigidBodyContainer = PPC_LOAD_U32(r1.u32 + 108);
+    return rigidBodyContainer != 0 && PPC_LOAD_U8(rigidBodyContainer) != '\0';
+}
