@@ -39,6 +39,26 @@ static constexpr uint32_t STOMP_BLOCKER_OVERRIDE_FLAG = 7;
 // Hedgehog engine states: the context at +8, the time spent in the state, in seconds, at +0x10.
 static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
 static constexpr uint32_t STATE_TIME_OFFSET = 0x10;
+// The parameter table in use (boost::shared_ptr, set by sub_8230B630). Each movement mode switches to its own table,
+// kept in a global shared_ptr: matched against a movie, free 3D starts with 0x83362FA4, a 2D section switched to
+// 0x83362FAC (sub_82320B70) and back, and the forward sections, with quick steps, to 0x83364750 (sub_82377D00).
+// sub_82378500 goes on from there to 0x83364758; CPlayerSpeedPosturePluginOnWater uses 0x83362FB4.
+static constexpr uint32_t PARAMETERS_OFFSET = 0x1F4;
+
+struct MovementMode
+{
+    uint32_t Parameters;
+    const char* Name;
+};
+
+static constexpr MovementMode MOVEMENT_MODES[] =
+{
+    { 0x83362FA4, "3D" },
+    { 0x83362FAC, "2D" },
+    { 0x83364750, "FORWARD" },
+    { 0x83364758, "FORWARD" },
+    { 0x83362FB4, "ON WATER" },
+};
 
 // The Werehog's player context (SWA::Player::CEvilSonicContext). Both contexts are built on the same base
 // (sub_8230D620), so the player and its states are found the same way, but the Werehog keeps his velocity
@@ -260,6 +280,19 @@ static uint32_t GetAnimationState(uint32_t context, const std::string& name)
     uint32_t idNode = FindMapNode(stateMachine + 20, name, 21);
     uint32_t stateNode = idNode != 0 ? FindMapNode(stateMachine + 8, LoadU16(idNode + 16)) : 0;
     return stateNode != 0 ? LoadU32(stateNode + 16) : 0;
+}
+
+// Sonic's movement mode, from the parameter table he uses, or "?" for one of the others.
+static const char* GetMovementMode(uint32_t context)
+{
+    uint32_t parameters = LoadU32(context + PARAMETERS_OFFSET);
+    for (auto& mode : MOVEMENT_MODES)
+    {
+        if (parameters != 0 && parameters == LoadU32(mode.Parameters))
+            return mode.Name;
+    }
+
+    return "?";
 }
 
 static bool GetFlag(uint32_t context, uint32_t flagsOffset, uint32_t flag)
@@ -804,6 +837,11 @@ void TasHud::Draw()
 
         DrawIndicator(drawList, font, { column2, row }, indicatorWidth, "SLIDING", IM_COL32(255, 200, 60, 230), sliding);
         DrawIndicator(drawList, font, { column3, row }, indicatorWidth, "STOMPING", IM_COL32(255, 110, 80, 230), stomping);
+
+        // The movement mode, where the Werehog has the stage time.
+        std::string mode = fmt::format("MODE {}", GetMovementMode(context));
+        DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), mode), panelMin.y + Scale(10) },
+            IM_COL32(220, 220, 220, 255), mode);
 
         DrawIndicator(drawList, font, { left, pressRow }, indicatorWidth, "CAN JUMP", IM_COL32(80, 230, 80, 255), canJump, true);
         DrawIndicator(drawList, font, { column2, pressRow }, indicatorWidth, "CAN STOMP", IM_COL32(80, 230, 80, 255), canStomp, true);
