@@ -1172,3 +1172,10 @@ address = 0x83148E78
 [[midasm_hook]]
 name = "TasStreamStopWaitMidAsmHook"
 address = 0x8314A498
+
+# Stage collision debug view: load the Terrain blocks that also hold the stage's collision like collision-only ones.
+[[midasm_hook]]
+name = "StageCollisionDebugViewTerrainMidAsmHook"
+address = 0x82564274
+registers = ["r1"]
+jump_address_on_true = 0x82564764
