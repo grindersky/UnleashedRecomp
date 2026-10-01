@@ -1287,6 +1287,32 @@ index 322073c..37f695e 100644
      auto now = std::chrono::steady_clock::now();
      constexpr auto INTERVAL = 1000000000ns / 60;
      auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);
+diff --git a/UnleashedRecomp/patches/misc_patches.cpp b/UnleashedRecomp/patches/misc_patches.cpp
+index ec4e1a8..25d5b2d 100644
+--- a/UnleashedRecomp/patches/misc_patches.cpp
++++ b/UnleashedRecomp/patches/misc_patches.cpp
+@@ -193,3 +193,21 @@ PPC_FUNC(sub_824EE620)
+ 
+     ctx.r3.u32 = PersistentStorageManager::ShouldDisplayDLCMessage(true);
+ }
++
++// The stage collision debug view (EnableStageCollisionDebugView) sets the game's ms_IsCollisionRender, and with
++// it, the stage loader (sub_82564100) skips every Terrain block of Stage.set.xml that has a TerrainInfoFile, so
++// that the blocks with only a RigidBodyContainer get loaded and drawn as collision instead. A few stages, like
++// Rooftop Run's day acts, have both in one block, which then got skipped: they lost their terrain and their
++// collision, and the player fell through the stage. Load such blocks like the collision-only ones, which only
++// read the block's collision fields: these stages then show their collision like the others. Without the debug
++// view, the loader runs unchanged.
++bool StageCollisionDebugViewTerrainMidAsmHook(PPCRegister& r1)
++{
++    if (!*SWA::SGlobals::ms_IsCollisionRender)
++        return false;
++
++    // The block's RigidBodyContainer, read into a CSharedString on the stack.
++    uint8_t* base = g_memory.base;
++    uint32_t rigidBodyContainer = PPC_LOAD_U32(r1.u32 + 108);
++    return rigidBodyContainer != 0 && PPC_LOAD_U8(rigidBodyContainer) != '\0';
++}
 diff --git a/UnleashedRecomp/patches/player_patches.cpp b/UnleashedRecomp/patches/player_patches.cpp
 index cce0a58..4c184cb 100644
 --- a/UnleashedRecomp/patches/player_patches.cpp
@@ -2560,10 +2586,10 @@ index d15aac6..7112106 100644
          SDL_VideoInit(nullptr);
 diff --git a/UnleashedRecomp/ui/tas_hud.cpp b/UnleashedRecomp/ui/tas_hud.cpp
 new file mode 100644
-index 0000000..a2e1ad3
+index 0000000..fd307ea
 --- /dev/null
 +++ b/UnleashedRecomp/ui/tas_hud.cpp
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,934 @@
 +#include "tas_hud.h"
 +#include <api/SWA.h>
 +#include <app.h>
@@ -2605,6 +2631,26 @@ index 0000000..a2e1ad3
 +// Hedgehog engine states: the context at +8, the time spent in the state, in seconds, at +0x10.
 +static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
 +static constexpr uint32_t STATE_TIME_OFFSET = 0x10;
++// The parameter table in use (boost::shared_ptr, set by sub_8230B630). Each movement mode switches to its own table,
++// kept in a global shared_ptr: matched against a movie, free 3D starts with 0x83362FA4, a 2D section switched to
++// 0x83362FAC (sub_82320B70) and back, and the forward sections, with quick steps, to 0x83364750 (sub_82377D00).
++// sub_82378500 goes on from there to 0x83364758; CPlayerSpeedPosturePluginOnWater uses 0x83362FB4.
++static constexpr uint32_t PARAMETERS_OFFSET = 0x1F4;
++
++struct MovementMode
++{
++    uint32_t Parameters;
++    const char* Name;
++};
++
++static constexpr MovementMode MOVEMENT_MODES[] =
++{
++    { 0x83362FA4, "3D" },
++    { 0x83362FAC, "2D" },
++    { 0x83364750, "FORWARD" },
++    { 0x83364758, "FORWARD" },
++    { 0x83362FB4, "ON WATER" },
++};
 +
 +// The Werehog's player context (SWA::Player::CEvilSonicContext). Both contexts are built on the same base
 +// (sub_8230D620), so the player and its states are found the same way, but the Werehog keeps his velocity
@@ -2826,6 +2872,19 @@ index 0000000..a2e1ad3
 +    uint32_t idNode = FindMapNode(stateMachine + 20, name, 21);
 +    uint32_t stateNode = idNode != 0 ? FindMapNode(stateMachine + 8, LoadU16(idNode + 16)) : 0;
 +    return stateNode != 0 ? LoadU32(stateNode + 16) : 0;
++}
++
++// Sonic's movement mode, from the parameter table he uses, or "?" for one of the others.
++static const char* GetMovementMode(uint32_t context)
++{
++    uint32_t parameters = LoadU32(context + PARAMETERS_OFFSET);
++    for (auto& mode : MOVEMENT_MODES)
++    {
++        if (parameters != 0 && parameters == LoadU32(mode.Parameters))
++            return mode.Name;
++    }
++
++    return "?";
 +}
 +
 +static bool GetFlag(uint32_t context, uint32_t flagsOffset, uint32_t flag)
@@ -3371,6 +3430,11 @@ index 0000000..a2e1ad3
 +        DrawIndicator(drawList, font, { column2, row }, indicatorWidth, "SLIDING", IM_COL32(255, 200, 60, 230), sliding);
 +        DrawIndicator(drawList, font, { column3, row }, indicatorWidth, "STOMPING", IM_COL32(255, 110, 80, 230), stomping);
 +
++        // The movement mode, where the Werehog has the stage time.
++        std::string mode = fmt::format("MODE {}", GetMovementMode(context));
++        DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), mode), panelMin.y + Scale(10) },
++            IM_COL32(220, 220, 220, 255), mode);
++
 +        DrawIndicator(drawList, font, { left, pressRow }, indicatorWidth, "CAN JUMP", IM_COL32(80, 230, 80, 255), canJump, true);
 +        DrawIndicator(drawList, font, { column2, pressRow }, indicatorWidth, "CAN STOMP", IM_COL32(80, 230, 80, 255), canStomp, true);
 +
@@ -3462,19 +3526,20 @@ index 0000000..a2e1ad3
 +}
 diff --git a/UnleashedRecomp/ui/tas_hud.h b/UnleashedRecomp/ui/tas_hud.h
 new file mode 100644
-index 0000000..2f9489b
+index 0000000..368f7bd
 --- /dev/null
 +++ b/UnleashedRecomp/ui/tas_hud.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,22 @@
 +#pragma once
 +
 +#include <cstdint>
 +
 +// A TAS mode overlay, enabled with UNLEASHED_TAS_HUD=1, shown in levels: the player's speed and state (day
-+// Sonic: on the ground, sliding, whether a jump or stomp would be accepted; the Werehog: on the ground,
-+// dashing, attacking, which attack and when it ends, whether a guard would be accepted, his Unleash gauge and
-+// the stage time), the left stick (for Sonic with the M-/D-Speed target zones and the break-jump zone), and the
-+// buttons. It's drawn into the game's frames, so it also shows up in encodes. It only reads the game's memory.
++// Sonic: his movement mode, on the ground, sliding, whether a jump or stomp would be accepted; the Werehog: on
++// the ground, dashing, attacking, which attack and when it ends, whether a guard would be accepted, his Unleash
++// gauge and the stage time), the left stick (for Sonic with the M-/D-Speed target zones and the break-jump zone),
++// and the buttons. It's drawn into the game's frames, so it also shows up in encodes. It only reads the game's
++// memory.
 +namespace TasHud
 +{
 +    bool IsEnabled();
@@ -3488,10 +3553,10 @@ index 0000000..2f9489b
 +    void Draw();
 +}
 diff --git a/UnleashedRecompLib/config/SWA.toml b/UnleashedRecompLib/config/SWA.toml
-index 5063e71..c5382fc 100644
+index 5063e71..1808271 100644
 --- a/UnleashedRecompLib/config/SWA.toml
 +++ b/UnleashedRecompLib/config/SWA.toml
-@@ -1153,3 +1153,22 @@ registers = ["f1"]
+@@ -1153,3 +1153,29 @@ registers = ["f1"]
  name = "CEvilSonicContext_CStateWall_LeaveRotationMidAsmHook"
  address = 0x82406774
  registers = ["f1"]
@@ -3514,6 +3579,13 @@ index 5063e71..c5382fc 100644
 +[[midasm_hook]]
 +name = "TasStreamStopWaitMidAsmHook"
 +address = 0x8314A498
++
++# Stage collision debug view: load the Terrain blocks that also hold the stage's collision like collision-only ones.
++[[midasm_hook]]
++name = "StageCollisionDebugViewTerrainMidAsmHook"
++address = 0x82564274
++registers = ["r1"]
++jump_address_on_true = 0x82564764
 Submodule thirdparty/plume 1192686..ab5289b:
 diff --git a/thirdparty/plume/plume_vulkan.cpp b/thirdparty/plume/plume_vulkan.cpp
 index 9103ca8..7243e60 100644
