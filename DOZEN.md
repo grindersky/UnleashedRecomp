@@ -7,7 +7,7 @@ back and encoding movies several times faster:
 | | |
 |---|---|
 | Fast-forward playback on dozen | 82.4 fps |
-| The same playback on lavapipe | 12.1 fps |
+| The same playback (fast-forward) on lavapipe | 12.1 fps |
 
 Use dozen to **play back and encode** movies. Keep making TASes (recording, savestates) on lavapipe, by turning on
 libTAS's "Force software rendering": savestates haven't been tested on dozen. A movie plays back the same on both
