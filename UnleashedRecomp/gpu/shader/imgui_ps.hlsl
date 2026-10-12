@@ -125,6 +125,21 @@ float4 SampleSdfFont(float4 color, Texture2D<float4> texture, float2 uv, float2 
 
 float4 main(in Interpolators interpolators) : SV_Target
 {
+    if (g_PushConstants.ShaderModifier == IMGUI_SHADER_MODIFIER_DEPTH_TEST)
+    {
+        // The depth buffer may be at another resolution than the display.
+        Texture2D<float4> depthBuffer = g_Texture2DDescriptorHeap[g_PushConstants.Texture2DDescriptorIndex & 0x7FFFFFFF];
+        uint width, height;
+        depthBuffer.GetDimensions(width, height);
+
+        int2 texel = int2(interpolators.Position.xy * g_PushConstants.InverseDisplaySize * float2(width, height));
+        // The game's depth is reversed: 1 at the near plane, 0 at the far one.
+        if (interpolators.UV.x < depthBuffer.Load(int3(texel, 0)).x)
+            discard;
+
+        return interpolators.Color;
+    }
+
     float4 color = interpolators.Color;
     color *= PixelAntialiasing(interpolators.Position.xy - g_PushConstants.ProceduralOrigin);
     

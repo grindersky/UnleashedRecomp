@@ -13,6 +13,8 @@
 
 using namespace plume;
 
+struct GuestSurface;
+
 struct Video
 {
     static inline uint32_t s_viewportWidth;
@@ -24,6 +26,10 @@ struct Video
     static void StartPipelinePrecompilation();
     static void WaitForGPU();
     static void ComputeViewportDimensions();
+
+    // The depth buffer the game drew its scene with: the last depth stencil it set at its render resolution, without
+    // multisampling, or null.
+    static GuestSurface* GetSceneDepthStencil();
 };
 
 struct GuestSamplerState

@@ -12,6 +12,9 @@
 #define IMGUI_SHADER_MODIFIER_CATEGORY_BEVEL           9
 #define IMGUI_SHADER_MODIFIER_RECTANGLE_BEVEL          10
 #define IMGUI_SHADER_MODIFIER_LOW_QUALITY_TEXT         11
+// The vertices' depth (as the game's depth buffer has it: reversed, 1 at the near plane) in the texture coordinates' x,
+// and the texture is the game's depth buffer: pixels behind what the game drew are left out.
+#define IMGUI_SHADER_MODIFIER_DEPTH_TEST               12
 
 #ifdef __cplusplus
 

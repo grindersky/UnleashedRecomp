@@ -2160,8 +2160,14 @@ static uint32_t CreateDevice(uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
     return 0;
 }
 
+// The depth buffer the game drew its scene with, for the collision overlay (SetDepthStencilSurface).
+static GuestSurface* g_sceneDepthStencil;
+
 static void DestructResource(GuestResource* resource) 
 {
+    if (resource == reinterpret_cast<GuestResource*>(g_sceneDepthStencil))
+        g_sceneDepthStencil = nullptr;
+
     RenderCommand cmd;
     cmd.type = RenderCommandType::DestructResource;
     cmd.destructResource.resource = resource;
@@ -3389,8 +3395,21 @@ static void ProcSetRenderTarget(const RenderCommand& cmd)
     SetAlphaTestMode((g_pipelineState.specConstants & (SPEC_CONSTANT_ALPHA_TEST | SPEC_CONSTANT_ALPHA_TO_COVERAGE)) != 0);
 }
 
+GuestSurface* Video::GetSceneDepthStencil()
+{
+    return g_sceneDepthStencil;
+}
+
 static void SetDepthStencilSurface(GuestDevice* device, GuestSurface* depthStencil) 
 {
+    // The scene's depth buffer is at the game's render resolution (SetResolution); shadow maps and such aren't.
+    if (depthStencil != nullptr && depthStencil->sampleCount == RenderSampleCount::COUNT_1 &&
+        depthStencil->width == uint32_t(round(Video::s_viewportWidth * Config::ResolutionScale)) &&
+        depthStencil->height == uint32_t(round(Video::s_viewportHeight * Config::ResolutionScale)))
+    {
+        g_sceneDepthStencil = depthStencil;
+    }
+
     RenderCommand cmd;
     cmd.type = RenderCommandType::SetDepthStencilSurface;
     cmd.setDepthStencilSurface.depthStencil = depthStencil;

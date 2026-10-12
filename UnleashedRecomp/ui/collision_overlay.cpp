@@ -200,9 +200,10 @@ bool CollisionOverlay::IsEnabled()
     return Config::EnableStageCollisionDebugView || Config::EnableEventCollisionDebugView || Config::EnableObjectCollisionDebugView;
 }
 
-// F12 hides and shows the overlay. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is
-// passed on as a key, so it goes into the movie like the game's keys.
-static std::atomic<bool> g_hidden;
+// F12 switches between drawing the overlay over everything and hiding it behind what the game drew, with the game's
+// depth buffer. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is passed on as a key,
+// so it goes into the movie like the game's keys.
+static std::atomic<bool> g_depthTested;
 
 static class CollisionOverlayListener : public SDLEventListener
 {
@@ -210,7 +211,7 @@ public:
     bool OnSDLEvent(SDL_Event* event) override
     {
         if (CollisionOverlay::IsEnabled() && event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_F12 && !event->key.repeat)
-            g_hidden = !g_hidden;
+            g_depthTested = !g_depthTested;
 
         return false;
     }
@@ -278,22 +279,40 @@ namespace
             return viewPoint.z < -NEAR_PLANE;
         }
 
-        ImVec2 ToScreen(const Vector3& v) const
+        // A point on the screen, with its depth as the game's depth buffer has it. The game's viewport reverses the
+        // projection's depth (its minimum depth is 1, its maximum 0, SPEC_CONSTANT_REVERSE_Z): 1 at the near plane.
+        ImVec2 ToScreen(const Vector3& v, float& depth) const
         {
             float x = v.x * Projection[0] + v.y * Projection[4] + v.z * Projection[8] + Projection[12];
             float y = v.x * Projection[1] + v.y * Projection[5] + v.z * Projection[9] + Projection[13];
+            float z = v.x * Projection[2] + v.y * Projection[6] + v.z * Projection[10] + Projection[14];
             float w = v.x * Projection[3] + v.y * Projection[7] + v.z * Projection[11] + Projection[15];
+            depth = 1.0f - z / w;
             return { Origin.x + (x / w * 0.5f + 0.5f) * Size.x, Origin.y + (0.5f - y / w * 0.5f) * Size.y };
         }
+
+        // Whether the pixels behind the scene are left out (IMGUI_SHADER_MODIFIER_DEPTH_TEST): the triangles then carry
+        // their depth in their texture coordinates.
+        bool DepthTested = false;
 
         // A triangle, left out if it reaches behind the near plane.
         void Triangle(ImDrawList* drawList, const Vector3& a, const Vector3& b, const Vector3& c, ImU32 colour) const
         {
-            Vector3 va = ToView(a);
-            Vector3 vb = ToView(b);
-            Vector3 vc = ToView(c);
-            if (IsVisible(va) && IsVisible(vb) && IsVisible(vc))
-                drawList->AddTriangleFilled(ToScreen(va), ToScreen(vb), ToScreen(vc), colour);
+            Vector3 view[3] = { ToView(a), ToView(b), ToView(c) };
+            if (!IsVisible(view[0]) || !IsVisible(view[1]) || !IsVisible(view[2]))
+                return;
+
+            drawList->PrimReserve(3, 3);
+            ImDrawIdx index = ImDrawIdx(drawList->_VtxCurrentIdx);
+            for (int i = 0; i < 3; i++)
+                drawList->PrimWriteIdx(ImDrawIdx(index + i));
+
+            for (auto& point : view)
+            {
+                float depth;
+                ImVec2 position = ToScreen(point, depth);
+                drawList->PrimWriteVtx(position, DepthTested ? ImVec2(depth, 0.0f) : drawList->_Data->TexUvWhitePixel, colour);
+            }
         }
     };
 }
@@ -630,7 +649,7 @@ static void DrawRail(ImDrawList* drawList, const Projector& projector, uint32_t 
 
 void CollisionOverlay::Draw()
 {
-    if (!IsEnabled() || g_hidden)
+    if (!IsEnabled())
         return;
 
     // Only in levels, with the camera that was updated last.
@@ -663,6 +682,15 @@ void CollisionOverlay::Draw()
     ImDrawListFlags flags = drawList->Flags;
     drawList->Flags &= ~ImDrawListFlags_AntiAliasedFill;
 
+    // Behind walls: the game's depth buffer as the texture. Without it (with multisampling, say), over everything.
+    GuestSurface* depthStencil = g_depthTested ? Video::GetSceneDepthStencil() : nullptr;
+    projector.DepthTested = depthStencil != nullptr;
+    if (projector.DepthTested)
+    {
+        drawList->PushTextureID(ImTextureID(depthStencil));
+        SetShaderModifier(IMGUI_SHADER_MODIFIER_DEPTH_TEST);
+    }
+
     if (*SWA::SGlobals::ms_IsCollisionRender)
     {
         std::vector<uint32_t> paths;
@@ -682,6 +710,12 @@ void CollisionOverlay::Draw()
     }
 
     DrawPlayerCollision(drawList, projector, context);
+
+    if (projector.DepthTested)
+    {
+        SetShaderModifier(IMGUI_SHADER_MODIFIER_NONE);
+        drawList->PopTextureID();
+    }
 
     drawList->Flags = flags;
 }
