@@ -5,9 +5,11 @@
 #include <ui/imgui_utils.h>
 #include <ui/tas_hud.h>
 #include <user/config.h>
+#include <sdl_listener.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -197,6 +199,23 @@ bool CollisionOverlay::IsEnabled()
 {
     return Config::EnableStageCollisionDebugView || Config::EnableEventCollisionDebugView || Config::EnableObjectCollisionDebugView;
 }
+
+// F12 hides and shows the overlay. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is
+// passed on as a key, so it goes into the movie like the game's keys.
+static std::atomic<bool> g_hidden;
+
+static class CollisionOverlayListener : public SDLEventListener
+{
+public:
+    bool OnSDLEvent(SDL_Event* event) override
+    {
+        if (CollisionOverlay::IsEnabled() && event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_F12 && !event->key.repeat)
+            g_hidden = !g_hidden;
+
+        return false;
+    }
+}
+g_collisionOverlayListener;
 
 void CollisionOverlay::OnCameraUpdate(uint32_t camera)
 {
@@ -611,7 +630,7 @@ static void DrawRail(ImDrawList* drawList, const Projector& projector, uint32_t 
 
 void CollisionOverlay::Draw()
 {
-    if (!IsEnabled())
+    if (!IsEnabled() || g_hidden)
         return;
 
     // Only in levels, with the camera that was updated last.

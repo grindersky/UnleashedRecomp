@@ -5,7 +5,7 @@
 // Draws what the game's collision debug views (the EnableStageCollisionDebugView, EnableEventCollisionDebugView and
 // EnableObjectCollisionDebugView codes) leave out: with the stage collision view, the grind rails' collision, and with
 // any of them, the player's collision (day Sonic's or the Werehog's), as see-through solids. Drawn over the frame,
-// projected with the game's camera, without depth. It only reads the game's memory.
+// projected with the game's camera, without depth; F12 hides and shows it. It only reads the game's memory.
 namespace CollisionOverlay
 {
     bool IsEnabled();
