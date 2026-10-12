@@ -167,27 +167,22 @@ static uint32_t g_evilStateStartFrame;
 static uint32_t g_evilAnimation;
 static float g_evilAnimationTime;
 
-// SWA::Player::CPlayerSpeedContext::CPlayerSpeedContext (the base of the day Sonic context)
+// SWA::Player::CPlayerSpeedContext::CPlayerSpeedContext (the base of the day Sonic context). Recorded even without the
+// HUD, for the collision overlay.
 PPC_FUNC_IMPL(__imp__sub_82330188);
 PPC_FUNC(sub_82330188)
 {
     uint32_t context = ctx.r3.u32;
     __imp__sub_82330188(ctx, base);
 
-    if (TasHud::IsEnabled())
-    {
-        g_speedContext = context;
-        g_evilContextIsNewer = false;
-    }
+    g_speedContext = context;
+    g_evilContextIsNewer = false;
 }
 
 void TasHud::OnEvilSonicContext(uint32_t context)
 {
-    if (IsEnabled())
-    {
-        g_evilContext = context;
-        g_evilContextIsNewer = true;
-    }
+    g_evilContext = context;
+    g_evilContextIsNewer = true;
 }
 
 static bool IsReadable(uint32_t address)
@@ -234,7 +229,7 @@ static bool IsEvilSonicContext(uint32_t context)
 }
 
 // The player to show: day Sonic or the Werehog, the one made last if both are alive, or 0 outside of levels.
-static uint32_t GetPlayerContext(bool& werehog)
+uint32_t TasHud::GetPlayerContext(bool& werehog)
 {
     bool sonic = IsSonicContext(g_speedContext);
     werehog = IsEvilSonicContext(g_evilContext) && (!sonic || g_evilContextIsNewer);

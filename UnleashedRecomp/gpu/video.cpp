@@ -28,6 +28,7 @@
 #include <ui/options_menu.h>
 #include <ui/game_window.h>
 #include <ui/black_bar.h>
+#include <ui/collision_overlay.h>
 #include <ui/tas_hud.h>
 #include <patches/aspect_ratio_patches.h>
 #include <user/config.h>
@@ -2616,6 +2617,7 @@ static void DrawImGui()
     assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
 
     DrawFPS();
+    CollisionOverlay::Draw();
     TasHud::Draw();
     DrawProfiler();
     ImGui::Render();
