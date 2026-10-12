@@ -1079,15 +1079,6 @@ void TasHud::Draw()
                 time += deltaTime;
                 stompFrames++;
             } while (time <= g_stompingDisableTime && stompFrames < 99);
-
-            // The air actions try the air boost (sub_82375748) after the refused stomp, so an air boost on this frame
-            // is the quicker way, if Sonic can air-boost.
-            if (stompFrames > AIR_BOOST_STOMP_FRAMES)
-            {
-                std::string text = fmt::format("air boost: in {}f", AIR_BOOST_STOMP_FRAMES);
-                DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), text), stateRow },
-                    IM_COL32(255, 200, 60, 255), text);
-            }
         }
         else if (!canStomp && !grounded && stateName == "AirBoost")
         {
