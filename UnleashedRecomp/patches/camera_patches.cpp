@@ -2,6 +2,7 @@
 #include <ui/game_window.h>
 #include <user/config.h>
 #include <gpu/video.h>
+#include <ui/collision_overlay.h>
 #include "camera_patches.h"
 #include "aspect_ratio_patches.h"
 
@@ -63,5 +64,7 @@ PPC_FUNC(sub_82467890)
         ctx.r4 = r4;
     }
 
+    uint32_t camera = ctx.r3.u32;
     __imp__sub_82467890(ctx, base);
+    CollisionOverlay::OnCameraUpdate(camera);
 }

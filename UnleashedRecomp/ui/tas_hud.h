@@ -18,5 +18,8 @@ namespace TasHud
     // From the constructor of the Werehog's player context (SWA::Player::CEvilSonicContext).
     void OnEvilSonicContext(uint32_t context);
 
+    // The player's context: day Sonic's or the Werehog's, the one made last if both are alive, or 0 outside of levels.
+    uint32_t GetPlayerContext(bool& werehog);
+
     void Draw();
 }

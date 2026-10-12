@@ -155,6 +155,7 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
     "ui/achievement_overlay.cpp"
     "ui/black_bar.cpp"
     "ui/button_guide.cpp"
+    "ui/collision_overlay.cpp"
     "ui/fader.cpp"
     "ui/game_window.cpp"
     "ui/imgui_utils.cpp"
