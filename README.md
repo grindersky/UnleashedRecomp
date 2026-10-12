@@ -128,7 +128,7 @@ Set these in front of `libTAS`, like `UNLEASHED_TAS_MODE=1`:
 
 - `UNLEASHED_TAS_MODE=1`: turns the TAS mode on. Without it, the game runs like the normal port.
 - `UNLEASHED_TAS_HUD=1`: a HUD, shown in levels. It's drawn into the frames, so it also shows up in encodes.
-  - As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump, stomp or quick step pressed on the current frame would work, with countdowns until a stomp is allowed again after a jump, also with an air boost, which shortens the wait, and until the next quick step), the stick with the M-Speed zone (in 3D, in any direction), the D-Speed zones (in 2D) and the break-jump zone, and the buttons.
+  - As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump, stomp or quick step pressed on the current frame would work, with countdowns until a stomp is allowed again after a jump or an air boost, and until the next quick step), the stick with the M-Speed zone (in 3D, in any direction), the D-Speed zones (in 2D) and the break-jump zone, and the buttons.
   - As the Werehog: his speed, his state (on the ground or in the air, dashing, attacking, which attack and in how many frames it ends on its own, with and without the stick), whether a guard (LB) pressed on the current frame would work, his Unleash gauge, the stage time, the stick and the buttons.
 
 ### Mods and codes
@@ -166,6 +166,7 @@ CodeCount=2
 - **Codes**: list them under `[Codes]` as `Code0`, `Code1` and so on, with `CodeCount` set to one more than the highest number. To turn a code off without renumbering the others, put a `;` in front of its line. The names must be written exactly as below:
 
   `AllowCancellingUnleash`, `DisableAutoSaveWarning`, `DisableBoostFilter`, `DisableDLCIcon`, `DisableDPadMovement`, `DisableDWMRoundedCorners`, `DisableLowResolutionFontOnCustomUI`, `EnableEventCollisionDebugView`, `EnableGIMipLevelDebugView`, `EnableObjectCollisionDebugView`, `EnableStageCollisionDebugView`, `FixEggmanlandUsingEventGalleryTransition`, `FixUnleashOutOfControlDrain`, `HomingAttackOnJump`, `HUDToggleKey`, `SaveScoreAtCheckpoints`, `SkipIntroLogos`, `UseAlternateTitle`, `UseArrowsForTimeOfDayTransition`, `UseOfficialTitleOnTitleBar`
+- **Collision views**: `EnableStageCollisionDebugView` shows the stage's collision instead of its models, `EnableEventCollisionDebugView` the event triggers, and `EnableObjectCollisionDebugView` the objects' collision. With the stage collision view, the grind rails' collision is drawn too (orange), and with any of the three, the player's collision that's on: his body (cyan) and what touches rings, objects and triggers (magenta). These are drawn over the picture, so they show through walls.
 
 ### Keeping movies in sync
 
