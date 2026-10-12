@@ -7,6 +7,10 @@ libTAS's Stop button and OSD, correct audio at any libTAS frame rate, and an opt
 For the full setup, from WSL and libTAS to the libTAS settings to use, see the guide in the
 [`tas-mode` branch's README](https://github.com/grindersky/UnleashedRecomp/tree/tas-mode#setting-up-the-tas-version).
 
+> [!TIP]
+> Under WSL, libTAS runs the game on the CPU, which is slow (about 12 fps when fast-forwarding). Once the game is set
+> up, follow [DOZEN.md](DOZEN.md) to play back and encode movies on your graphics card instead, several times faster.
+
 ## Applying it
 
 ```bash
@@ -42,8 +46,6 @@ The collision view codes (`EnableStageCollisionDebugView`, `EnableEventCollision
 objects and triggers (magenta). The stage collision view also draws the grind rails' collision (orange). They're drawn
 over everything, walls included; F12 switches to hiding them behind walls and back (this needs anti-aliasing off).
 Under libTAS, F12 is recorded into the movie.
-
-To play back and encode movies on your graphics card instead of the CPU under WSL, see [DOZEN.md](DOZEN.md).
 
 ## Keeping movies in sync
 
