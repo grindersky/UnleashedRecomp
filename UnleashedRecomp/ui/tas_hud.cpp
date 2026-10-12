@@ -33,31 +33,56 @@ static constexpr uint32_t STATE_FLAGS_2_OFFSET = 0x4B0;
 // default): until then, stomping is refused.
 static constexpr uint32_t STOMP_DISABLED_FLAG = 20;
 static constexpr uint32_t STOMPING_DISABLE_TIME_PARAMETER = 292;
+// How many frames after an air boost (a one-frame tap) the stomp is accepted.
+static constexpr int AIR_BOOST_STOMP_FRAMES = 2;
+// The movement input is ignored while it's shorter than this (parameter 12, read by sub_823083F0).
+static constexpr uint32_t MOVEMENT_INPUT_DEADZONE_PARAMETER = 12;
 // Stomping is also refused while this is set, unless flag 7 of the second set is (sub_8231B7D8).
 static constexpr uint32_t STOMP_BLOCKER_OFFSET = 0xCC8;
 static constexpr uint32_t STOMP_BLOCKER_OVERRIDE_FLAG = 7;
+// Quick steps: the ground actions (the context's vfunc 36, sub_82386FF8) call TryQuickStep (sub_82386E60) when Sonic
+// is on the ground. It quick-steps if LB or RB was just pressed, unless the stomp's blocker above is set or this
+// byte is (sub_82316208). Above a speed (parameter 240) it's a CStateRunQuickStep, below a CStateQuickStep.
+static constexpr uint32_t QUICK_STEP_DISABLED_OFFSET = 0x4B4;
+// The quick steps only run the ground actions, and so allow the next quick step, from a frame of their animation on:
+// their updates (sub_823968D8 and sub_82397370) compare the animation frame (sub_82307D38) with these.
+static constexpr float QUICK_STEP_ACTIONS_FRAME = 20.0f;
+static constexpr float RUN_QUICK_STEP_ACTIONS_FRAME = 8.0f;
+// How many frames the run quick step's out-of-control lasts after its animation reaches that frame.
+static constexpr int RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES = 1;
 // Hedgehog engine states: the context at +8, the time spent in the state, in seconds, at +0x10.
 static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
 static constexpr uint32_t STATE_TIME_OFFSET = 0x10;
 // The parameter table in use (boost::shared_ptr, set by sub_8230B630). Each movement mode switches to its own table,
-// kept in a global shared_ptr: matched against a movie, free 3D starts with 0x83362FA4, a 2D section switched to
-// 0x83362FAC (sub_82320B70) and back, and the forward sections, with quick steps, to 0x83364750 (sub_82377D00).
-// sub_82378500 goes on from there to 0x83364758; CPlayerSpeedPosturePluginOnWater uses 0x83362FB4.
+// kept in a global shared_ptr. Sonic's parameter loader (sub_8237A828) fills them from the parameter groups named
+// below: free 3D is "ForwardView", a 2D section switches to "SideView" (sub_82320B70) and back, and the forward
+// sections, with quick steps, to "DashMode" (sub_82377D00), then "QSM" (sub_82378500). The others are switched to by
+// the context's update (sub_823746C0) while CPlayerSpeedPosturePluginOnWater or CSonicPosturePluginWallCorrection
+// (Rooftop Run's wall run) is on, and by MsgStartSonicSpecialMode, which the Egg Beetle, the Egg Ray Bird and the
+// E-BigChaser send (sub_82365BE8, an index of 0 to 3 into the "Special" tables).
 static constexpr uint32_t PARAMETERS_OFFSET = 0x1F4;
 
 struct MovementMode
 {
     uint32_t Parameters;
     const char* Name;
+    bool SideView = false;
 };
 
 static constexpr MovementMode MOVEMENT_MODES[] =
 {
     { 0x83362FA4, "3D" },
-    { 0x83362FAC, "2D" },
+    { 0x83362FAC, "2D", true },
     { 0x83364750, "FORWARD" },
     { 0x83364758, "FORWARD" },
     { 0x83362FB4, "ON WATER" },
+    { 0x83364728, "WALL RUN" },
+    { 0x83362FCC, "ON ICE" },
+    { 0x83362FD4, "ON ICE 2D", true },
+    { 0x83364760, "SPECIAL 0" },
+    { 0x83364768, "SPECIAL 1" },
+    { 0x83364770, "SPECIAL 2" },
+    { 0x83364778, "SPECIAL 3" },
 };
 
 // The Werehog's player context (SWA::Player::CEvilSonicContext). Both contexts are built on the same base
@@ -89,6 +114,7 @@ static constexpr uint32_t PLAYER_ANIMATION_STATE_MACHINE_OFFSET = 0xC0 + 380;
 // An animation state (SWA::CAnimationControlSingle): its Havok control (hkaDefaultAnimationControl) at +4, with the
 // local time at +8, the playback speed at +0x40 and the animation binding at +0x28, whose animation (+0) has its
 // duration at +12 (the state's vfunc 2, sub_82BC0870). The state's start time is at +20 (sub_82BBD030).
+static constexpr uint32_t ANIMATION_CONTROL_SINGLE_VFTABLE = 0x820CB3DC;
 static constexpr uint32_t ANIMATION_CONTROL_OFFSET = 4;
 static constexpr uint32_t ANIMATION_START_TIME_OFFSET = 20;
 static constexpr uint32_t ANIMATION_CONTROL_TIME_OFFSET = 8;
@@ -116,6 +142,21 @@ static uint32_t g_stompCheckFrame;
 static bool g_stompDisabledByHop;
 static bool g_stompBlocked;
 static float g_stompingDisableTime = 0.15f;
+static float g_movementInputDeadzone = 0.02f;
+static uint32_t g_quickStepCheckFrame;
+// Sonic's state on the last drawn frame.
+static std::string g_sonicPreviousState;
+static bool g_quickStepDisabled;
+static bool g_quickStepBlocked;
+
+// The animation frame a quick step's update compared on the last frame, with the animation and its local time then.
+static bool g_recordQuickStepFrame;
+static bool g_recordQuickStepAnimation;
+static uint32_t g_quickStepUpdateFrame;
+static float g_quickStepAnimationFrame;
+static uint32_t g_quickStepAnimation;
+static float g_quickStepLocalTime;
+static float g_quickStepPreviousLocalTime;
 
 // The Werehog's state and attack action on the last drawn frame, and the frame they started on.
 static uint32_t g_evilState;
@@ -282,17 +323,71 @@ static uint32_t GetAnimationState(uint32_t context, const std::string& name)
     return stateNode != 0 ? LoadU32(stateNode + 16) : 0;
 }
 
-// Sonic's movement mode, from the parameter table he uses, or "?" for one of the others.
-static const char* GetMovementMode(uint32_t context)
+// Sonic's movement mode, from the parameter table he uses, or null for another one.
+static const MovementMode* GetMovementMode(uint32_t context)
 {
     uint32_t parameters = LoadU32(context + PARAMETERS_OFFSET);
     for (auto& mode : MOVEMENT_MODES)
     {
         if (parameters != 0 && parameters == LoadU32(mode.Parameters))
-            return mode.Name;
+            return &mode;
     }
 
-    return "?";
+    return nullptr;
+}
+
+// During a quick step, in how many frames its update will find the animation at the frame it runs the ground actions
+// from, and so allow the next quick step, or -1. The animation's local time is stepped like Havok steps it: by the
+// frame's time times the playback speed, in single precision (or by how much it moved on the last frame, if that
+// didn't match). A run quick step also puts Sonic out of control (CPlayerSpeedPosturePluginOutOfControl, flag 3, which
+// makes the ground actions do nothing) until its animation reaches that frame (sub_8238D578): that lasts through the
+// update that gets there, so the next quick step comes a frame later (RooftopRunAct1.ltm, frames 2446-2458).
+static int GetQuickStepFramesLeft(float actionsFrame, int outOfControlFrames, float deltaTime)
+{
+    uint32_t animation = g_quickStepAnimation;
+    if (g_quickStepUpdateFrame != g_frame || LoadU32(animation) != ANIMATION_CONTROL_SINGLE_VFTABLE)
+        return -1;
+
+    if (g_quickStepAnimationFrame >= actionsFrame)
+        return outOfControlFrames > 0 ? outOfControlFrames : -1;
+
+    uint32_t control = LoadU32(animation + ANIMATION_CONTROL_OFFSET);
+    float start = LoadFloat(animation + ANIMATION_START_TIME_OFFSET);
+    float duration = LoadFloat(LoadU32(LoadU32(control + ANIMATION_CONTROL_BINDING_OFFSET)) + ANIMATION_DURATION_OFFSET);
+    float elapsed = g_quickStepLocalTime - start;
+    if (!(elapsed > 0.0f) || !(duration > 0.0f))
+        return -1;
+
+    // The animation's frame count - 1, from the frame the update got.
+    float frames = std::round(g_quickStepAnimationFrame * duration / elapsed);
+    float rate = frames / duration;
+
+    float step = deltaTime * LoadFloat(control + ANIMATION_CONTROL_SPEED_OFFSET);
+    float previous = g_quickStepPreviousLocalTime;
+    if (!std::isnan(previous))
+    {
+        float expected = previous + step;
+        if (expected != g_quickStepLocalTime)
+            step = g_quickStepLocalTime - previous;
+    }
+
+    // The animation may have moved on since the update.
+    float time = g_quickStepLocalTime;
+    float drawnTime = LoadFloat(control + ANIMATION_CONTROL_TIME_OFFSET);
+    for (int framesLeft = 1; framesLeft < 100; framesLeft++)
+    {
+        if (framesLeft == 1 && drawnTime != g_quickStepLocalTime)
+            time = drawnTime;
+        else
+            time += step;
+
+        float sinceStart = time - start;
+        float frame = sinceStart * rate;
+        if (frame >= actionsFrame)
+            return framesLeft + outOfControlFrames;
+    }
+
+    return -1;
 }
 
 static bool GetFlag(uint32_t context, uint32_t flagsOffset, uint32_t flag)
@@ -312,6 +407,12 @@ PPC_FUNC(sub_82330CB0)
     __imp__sub_82330CB0(ctx, base);
 }
 
+// The blocker that refuses stomps and quick steps (sub_8231B7D8).
+static bool IsActionBlocked(uint32_t context)
+{
+    return LoadU32(context + STOMP_BLOCKER_OFFSET) != 0 && !GetFlag(context, STATE_FLAGS_2_OFFSET, STOMP_BLOCKER_OVERRIDE_FLAG);
+}
+
 // The context's TryStomp, called by the air states when no action tried before it (like a homing attack) was taken.
 PPC_FUNC_IMPL(__imp__sub_823765C0);
 PPC_FUNC(sub_823765C0)
@@ -322,13 +423,92 @@ PPC_FUNC(sub_823765C0)
     {
         g_stompCheckFrame = g_frame;
         g_stompDisabledByHop = GetFlag(context, STATE_FLAGS_OFFSET, STOMP_DISABLED_FLAG);
-        g_stompBlocked = LoadU32(context + STOMP_BLOCKER_OFFSET) != 0 && !GetFlag(context, STATE_FLAGS_2_OFFSET, STOMP_BLOCKER_OVERRIDE_FLAG);
+        g_stompBlocked = IsActionBlocked(context);
     }
 
     __imp__sub_823765C0(ctx, base);
 }
 
-// Reads a float parameter of the player by ID. Records StompingDisableTime when the short hop reads it.
+// The context's TryQuickStep, called by the ground actions when no jump was taken.
+PPC_FUNC_IMPL(__imp__sub_82386E60);
+PPC_FUNC(sub_82386E60)
+{
+    uint32_t context = ctx.r3.u32;
+
+    if (TasHud::IsEnabled() && context == g_speedContext)
+    {
+        g_quickStepCheckFrame = g_frame;
+        g_quickStepDisabled = LoadU8(context + QUICK_STEP_DISABLED_OFFSET) != 0;
+        g_quickStepBlocked = IsActionBlocked(context);
+    }
+
+    __imp__sub_82386E60(ctx, base);
+}
+
+// The quick steps' updates, which first read the animation frame they compare.
+static void UpdateQuickStep(PPCContext& ctx, uint8_t* base, void (*update)(PPCContext&, uint8_t*))
+{
+    uint32_t state = ctx.r3.u32;
+    g_recordQuickStepFrame = TasHud::IsEnabled() && g_speedContext != 0 && LoadU32(state + STATE_CONTEXT_OFFSET) == g_speedContext;
+    update(ctx, base);
+    g_recordQuickStepFrame = false;
+}
+
+// SWA::Player::CSonicContext::CStateQuickStep::UpdateState
+PPC_FUNC_IMPL(__imp__sub_823968D8);
+PPC_FUNC(sub_823968D8)
+{
+    UpdateQuickStep(ctx, base, __imp__sub_823968D8);
+}
+
+// SWA::Player::CStateRunQuickStep::UpdateState
+PPC_FUNC_IMPL(__imp__sub_82397370);
+PPC_FUNC(sub_82397370)
+{
+    UpdateQuickStep(ctx, base, __imp__sub_82397370);
+}
+
+// The frame of the player's current animation: the elapsed time times the animation's frame count - 1 over its
+// duration, in single precision (sub_82BBD568).
+PPC_FUNC_IMPL(__imp__sub_82307D38);
+PPC_FUNC(sub_82307D38)
+{
+    bool record = g_recordQuickStepFrame;
+    g_recordQuickStepFrame = false;
+
+    if (record)
+    {
+        g_recordQuickStepAnimation = true;
+        g_quickStepAnimation = 0;
+    }
+
+    __imp__sub_82307D38(ctx, base);
+
+    if (record)
+    {
+        g_recordQuickStepAnimation = false;
+        g_quickStepPreviousLocalTime = g_quickStepUpdateFrame + 1 == g_frame ? g_quickStepLocalTime : NAN;
+        g_quickStepLocalTime = LoadFloat(LoadU32(g_quickStepAnimation + ANIMATION_CONTROL_OFFSET) + ANIMATION_CONTROL_TIME_OFFSET);
+        g_quickStepAnimationFrame = float(ctx.f1.f64);
+        g_quickStepUpdateFrame = g_frame;
+    }
+}
+
+// The animation state behind sub_82307D38.
+PPC_FUNC_IMPL(__imp__sub_82BBD568);
+PPC_FUNC(sub_82BBD568)
+{
+    if (g_recordQuickStepAnimation)
+    {
+        g_quickStepAnimation = ctx.r3.u32;
+        g_recordQuickStepAnimation = false;
+    }
+
+    __imp__sub_82BBD568(ctx, base);
+}
+
+// Reads a float parameter of the player by ID. Records StompingDisableTime when the short hop reads it, and the
+// movement input's deadzone when the input is read.
 PPC_FUNC_IMPL(__imp__sub_8245DB60);
 PPC_FUNC(sub_8245DB60)
 {
@@ -336,7 +516,11 @@ PPC_FUNC(sub_8245DB60)
     __imp__sub_8245DB60(ctx, base);
 
     if (parameter == STOMPING_DISABLE_TIME_PARAMETER && TasHud::IsEnabled())
-        g_stompingDisableTime = float(ctx.f1.f64);}
+        g_stompingDisableTime = float(ctx.f1.f64);
+
+    if (parameter == MOVEMENT_INPUT_DEADZONE_PARAMETER && TasHud::IsEnabled())
+        g_movementInputDeadzone = float(ctx.f1.f64);
+}
 
 // The current state of the player's state machine, or 0. The machine points to the current state's record
 // at +0x58 (compared with the new state in sub_82E669D8), which points to the state at +0x1C.
@@ -399,7 +583,7 @@ static float VectorLength(uint32_t address, float& y)
     return std::sqrt(x * x + y * y + z * z);
 }
 
-// The target zones of the M-/D-Speed Visualiser, on the stick as SDL reports it: -1..1, Y pointing
+// The D-Speed target zones of the M-/D-Speed Visualiser, on the stick as SDL reports it: -1..1, Y pointing
 // down, angles as atan2(y, x). Its per-axis deadzone applies before checking them.
 struct TargetZone
 {
@@ -415,10 +599,41 @@ static constexpr float STICK_DEADZONE = 0.05f;
 
 static constexpr TargetZone TARGET_ZONES[] =
 {
-    { "M-Speed", 5 * PI / 4, 7 * PI / 4, 0.45f, 0.70f }, // Up
     { "D-Speed", -PI / 4, PI / 4, 0.29f, 0.50f },        // Right
     { "D-Speed", 3 * PI / 4, 5 * PI / 4, 0.29f, 0.50f }, // Left
 };
+
+// M-Speed, from the 3D air update (sub_82346880). Leaving the ground sets flag 27 (the context's vfunc 25,
+// sub_82374360; landing clears it), and the update clears it as soon as the movement input is longer than 0.3; while
+// it's set, the air deceleration is 0. The update aims for the input's part along Sonic's facing times
+// max(InAirMaxAccelVelocity, his speed) (sub_8234C5F8). A short input puts that below his speed, so the update
+// decelerates him, by 0, and then pushes him along his velocity instead, by a force that grows with the square of his
+// speed: he gains speed every frame. The 3D input (CPlayerSpeedPostureInput3DStandard, sub_8234EE88; PathLocal,
+// sub_8234F4D0, does the same) is the stick's direction times (length / 0.9)³, at most 1, and is ignored below
+// parameter 12 (0.02, sub_823083F0). So on the stick as the game reads it, M-Speed takes a length from about 0.244 to
+// 0.602, in any direction. 2D reads the stick without the curve.
+static constexpr float MOVEMENT_INPUT_SCALE = 1.0f / 0.9f;
+static constexpr float M_SPEED_MAX_INPUT = 0.3f;
+
+// The 3D movement input's length for a stick length.
+static float GetMovementInput(float stickLength)
+{
+    if (!(stickLength > 0.01f))
+        return 0.0f;
+
+    return std::min(float(std::pow(double(stickLength * MOVEMENT_INPUT_SCALE), 3.0)), 1.0f);
+}
+
+static float GetStickLengthForMovementInput(float input)
+{
+    return std::cbrt(input) / MOVEMENT_INPUT_SCALE;
+}
+
+static bool IsMSpeedInput(float stickLength)
+{
+    float input = GetMovementInput(stickLength);
+    return input >= g_movementInputDeadzone && input <= M_SPEED_MAX_INPUT;
+}
 
 static bool IsInZone(const TargetZone& zone, float x, float y)
 {
@@ -450,7 +665,7 @@ static constexpr float BREAK_JUMP_MAX_LENGTH = 0.3f;
 // The raw stick positions the game reads as a given length form a square with rounded corners: the
 // deadzone cross in the middle, then arcs of radius length * (1 - deadzone) around (±deadzone, ±deadzone).
 // The zone is the ring between the two lengths.
-static void DrawBreakJumpZone(ImDrawList* drawList, ImVec2 centre, float scale, bool active)
+static void DrawLengthZone(ImDrawList* drawList, ImVec2 centre, float scale, float minLength, float maxLength, ImU32 fill, ImU32 outline)
 {
     constexpr int ARC_SEGMENTS = 8;
     constexpr int POINTS = 4 * (ARC_SEGMENTS + 1);
@@ -470,13 +685,10 @@ static void DrawBreakJumpZone(ImDrawList* drawList, ImVec2 centre, float scale, 
             float cosine = std::cos(angle) * (1.0f - GAME_STICK_DEADZONE);
             float sine = std::sin(angle) * (1.0f - GAME_STICK_DEADZONE);
 
-            inner[count] = { centre.x + (cornerX + cosine * BREAK_JUMP_MIN_LENGTH) * scale, centre.y + (cornerY + sine * BREAK_JUMP_MIN_LENGTH) * scale };
-            outer[count] = { centre.x + (cornerX + cosine * BREAK_JUMP_MAX_LENGTH) * scale, centre.y + (cornerY + sine * BREAK_JUMP_MAX_LENGTH) * scale };
+            inner[count] = { centre.x + (cornerX + cosine * minLength) * scale, centre.y + (cornerY + sine * minLength) * scale };
+            outer[count] = { centre.x + (cornerX + cosine * maxLength) * scale, centre.y + (cornerY + sine * maxLength) * scale };
         }
     }
-
-    ImU32 fill = active ? IM_COL32(255, 150, 30, 200) : IM_COL32(255, 150, 30, 70);
-    ImU32 outline = active ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 120);
 
     // The ring isn't convex, so fill it one quad at a time; the gaps between quadrants are the straight sides.
     for (int i = 0; i < POINTS; i++)
@@ -669,8 +881,7 @@ void TasHud::Draw()
         3 * (indicatorText + Scale(10)) + 2 * gap + 2 * padding });
     ImVec2 panelMax = { res.x - Scale(40), res.y - Scale(22) };
     ImVec2 centre = { panelMax.x - width / 2, panelMax.y - Scale(58 + CONTROLLER_HEIGHT) - radius };
-    // The Werehog's panel has a row more, for when his attack ends.
-    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(werehog ? 122 : 102) };
+    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(122) };
     float left = panelMin.x + padding;
 
     drawList->AddRectFilled(panelMin, panelMax, IM_COL32(0, 0, 0, 140), Scale(6));
@@ -703,7 +914,10 @@ void TasHud::Draw()
     // doesn't count.
     float row = panelMin.y + Scale(46);
     float pressRow = row + Scale(20);
-    float stateRow = pressRow + Scale(20);
+    // Sonic has a second row of presses, for the quick step; the Werehog has a row under his state instead, for when
+    // his attack ends.
+    float quickStepRow = pressRow + Scale(20);
+    float stateRow = (werehog ? pressRow : quickStepRow) + Scale(20);
     float attackRow = stateRow + Scale(20);
 
     uint32_t state = GetCurrentState(context);
@@ -838,8 +1052,10 @@ void TasHud::Draw()
         DrawIndicator(drawList, font, { column2, row }, indicatorWidth, "SLIDING", IM_COL32(255, 200, 60, 230), sliding);
         DrawIndicator(drawList, font, { column3, row }, indicatorWidth, "STOMPING", IM_COL32(255, 110, 80, 230), stomping);
 
-        // The movement mode, where the Werehog has the stage time.
-        std::string mode = fmt::format("MODE {}", GetMovementMode(context));
+        // The movement mode, where the Werehog has the stage time. Diving (CSonicPostureDiving) keeps the table it
+        // started with.
+        auto movementMode = GetMovementMode(context);
+        std::string mode = fmt::format("MODE {}", stateName.starts_with("Diving") ? "DIVING" : movementMode != nullptr ? movementMode->Name : "?");
         DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), mode), panelMin.y + Scale(10) },
             IM_COL32(220, 220, 220, 255), mode);
 
@@ -848,20 +1064,66 @@ void TasHud::Draw()
 
         // During a short hop: in how many frames the stomp will be accepted. The hop adds the frame's time
         // (in single precision) to its own, and only then compares it and tries the stomp. Leaving the hop
-        // (for an air boost, say) clears the flag right away instead.
+        // (for an air boost, say) clears the flag right away instead. The air boost's state doesn't try the stomp,
+        // and ends on the update after the boost button is let go (CSonicStateAirBoost, sub_82390198): after a
+        // one-frame tap, the stomp is accepted 2 frames after the boost (jump, air boost, a frame, stomp in
+        // RooftopRunAct1.ltm).
         bool hopping = stateName == "JumpShort" || stateName == "JumpHurdle";
+        int stompFrames = -1;
         if (stompChecked && g_stompDisabledByHop && hopping)
         {
-            int frames = 0;
             float time = stateTime;
+            stompFrames = 0;
             do
             {
                 time += deltaTime;
-                frames++;
-            } while (time <= g_stompingDisableTime && frames < 99);
+                stompFrames++;
+            } while (time <= g_stompingDisableTime && stompFrames < 99);
 
-            DrawText(drawList, font, Scale(11), { column3, pressRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", frames));
+            // The air actions try the air boost (sub_82375748) after the refused stomp, so an air boost on this frame
+            // is the quicker way, if Sonic can air-boost.
+            if (stompFrames > AIR_BOOST_STOMP_FRAMES)
+            {
+                std::string text = fmt::format("air boost: in {}f", AIR_BOOST_STOMP_FRAMES);
+                DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), text), stateRow },
+                    IM_COL32(255, 200, 60, 255), text);
+            }
         }
+        else if (!canStomp && !grounded && stateName == "AirBoost")
+        {
+            stompFrames = AIR_BOOST_STOMP_FRAMES;
+        }
+        else if (!canStomp && !grounded && g_sonicPreviousState == "AirBoost")
+        {
+            // The air boost ended on this frame's update, instead of the new state's trying the stomp.
+            stompFrames = 1;
+        }
+
+        if (stompFrames > 0)
+            DrawText(drawList, font, Scale(11), { column3, pressRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", stompFrames));
+
+        // Whether LB or RB on this frame would quick-step: the ground actions tried it during this frame's update. It
+        // also needs a new press. During a quick step: in how many frames it lets the next one start.
+        bool canQuickStep = g_quickStepCheckFrame == g_frame && !g_quickStepDisabled && !g_quickStepBlocked;
+        DrawIndicator(drawList, font, { left, quickStepRow }, 2 * indicatorWidth + gap, "CAN QUICKSTEP", IM_COL32(80, 230, 80, 255), canQuickStep, true);
+
+        bool quickStepping = stateName == "QuickStep" || stateName == "RunQuickStep";
+        int quickStepFrames = -1;
+        if (!canQuickStep && quickStepping)
+        {
+            quickStepFrames = stateName == "QuickStep" ? GetQuickStepFramesLeft(QUICK_STEP_ACTIONS_FRAME, 0, deltaTime) :
+                GetQuickStepFramesLeft(RUN_QUICK_STEP_ACTIONS_FRAME, RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES, deltaTime);
+        }
+        else if (!canQuickStep && grounded && (g_sonicPreviousState == "QuickStep" || g_sonicPreviousState == "RunQuickStep"))
+        {
+            // The quick step ended on this frame's update, instead of the new state's running the ground actions.
+            quickStepFrames = 1;
+        }
+
+        if (quickStepFrames > 0)
+            DrawText(drawList, font, Scale(11), { column3, quickStepRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", quickStepFrames));
+
+        g_sonicPreviousState = stateName;
     }
 
     DrawText(drawList, font, Scale(11), { left, stateRow }, IM_COL32(220, 220, 220, 255),
@@ -888,19 +1150,35 @@ void TasHud::Draw()
     drawList->AddLine({ centre.x - radius, centre.y }, { centre.x + radius, centre.y }, IM_COL32(255, 255, 255, 90), Scale(1));
     drawList->AddLine({ centre.x, centre.y - radius }, { centre.x, centre.y + radius }, IM_COL32(255, 255, 255, 90), Scale(1));
 
-    // M-Speed, D-Speed and the break-jump are Sonic's: the Werehog can't do them.
-    int activeZone = -1;
+    // M-Speed, D-Speed and the break-jump are Sonic's: the Werehog can't do them. M-Speed is for 3D, where the stick
+    // goes through the curve, D-Speed for 2D.
+    std::string zoneText;
     if (!werehog)
     {
-        DrawBreakJumpZone(drawList, centre, radius, breakJump);
+        DrawLengthZone(drawList, centre, radius, BREAK_JUMP_MIN_LENGTH, BREAK_JUMP_MAX_LENGTH,
+            breakJump ? IM_COL32(255, 150, 30, 200) : IM_COL32(255, 150, 30, 70), breakJump ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 120));
 
-        for (int i = 0; i < int(std::size(TARGET_ZONES)); i++)
+        auto movementMode = GetMovementMode(context);
+        if (movementMode != nullptr && movementMode->SideView)
         {
-            bool active = IsInZone(TARGET_ZONES[i], x, y);
-            if (active && activeZone < 0)
-                activeZone = i;
+            for (auto& zone : TARGET_ZONES)
+            {
+                bool active = IsInZone(zone, x, y);
+                if (active && zoneText.empty())
+                    zoneText = zone.Name;
 
-            DrawZone(drawList, centre, radius, TARGET_ZONES[i], active);
+                DrawZone(drawList, centre, radius, zone, active);
+            }
+        }
+        else
+        {
+            bool active = IsMSpeedInput(std::sqrt(gameLengthSquared));
+            if (active)
+                zoneText = "M-Speed";
+
+            DrawLengthZone(drawList, centre, radius, GetStickLengthForMovementInput(g_movementInputDeadzone),
+                GetStickLengthForMovementInput(M_SPEED_MAX_INPUT), active ? IM_COL32(0, 255, 0, 200) : IM_COL32(0, 255, 0, 80),
+                active ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 160));
         }
     }
 
@@ -910,11 +1188,11 @@ void TasHud::Draw()
 
     if (!werehog)
     {
-        std::string zoneText = activeZone >= 0 ? TARGET_ZONES[activeZone].Name : "";
+        bool zone = !zoneText.empty();
         if (breakJump)
             zoneText += zoneText.empty() ? "Break-jump" : " + Break-jump";
 
-        ImU32 zoneColour = activeZone >= 0 ? IM_COL32(80, 255, 80, 255) : breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
+        ImU32 zoneColour = zone ? IM_COL32(80, 255, 80, 255) : breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
         DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(6) }, zoneColour, zoneText.empty() ? "No zone" : zoneText);
     }
 
