@@ -2581,10 +2581,10 @@ index 0000000..f0fb735
 +}
 diff --git a/UnleashedRecomp/ui/collision_overlay.cpp b/UnleashedRecomp/ui/collision_overlay.cpp
 new file mode 100644
-index 0000000..3724b20
+index 0000000..b065203
 --- /dev/null
 +++ b/UnleashedRecomp/ui/collision_overlay.cpp
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,687 @@
 +#include "collision_overlay.h"
 +#include <api/SWA.h>
 +#include <kernel/function.h>
@@ -2592,8 +2592,11 @@ index 0000000..3724b20
 +#include <ui/imgui_utils.h>
 +#include <ui/tas_hud.h>
 +#include <user/config.h>
++#include <sdl_listener.h>
 +
 +#include <algorithm>
++#include <array>
++#include <atomic>
 +#include <cmath>
 +#include <map>
 +#include <mutex>
@@ -2622,6 +2625,9 @@ index 0000000..3724b20
 +// Its triangle subparts (+0x50, how many at +0x54): the triangle count at +0x10, then the vertices (base, stride and
 +// count at +0x14/+0x18/+0x1C) and the indices (base, stride and type at +0x30/+0x34/+0x38: 1 = 16-bit, 2 = 32-bit).
 +static constexpr uint32_t EXTENDED_MESH_SUBPARTS_OFFSET = 0x50;
++// The triangles' radius: Havok's triangles collide this far out on both sides (0.05 for the rails, like the half height
++// of their bounding box).
++static constexpr uint32_t EXTENDED_MESH_RADIUS_OFFSET = 0xB0;
 +// Convex shapes have their convex radius at +0x10: a cylinder (hkpCylinderShape) adds it to its own radius at +0x14,
 +// between the points at +0x20 and +0x30, like a capsule (hkpCapsuleShape) without the cylinder radius; a sphere
 +// (hkpSphereShape) has only it; a box (hkpBoxShape) has its half extents at +0x20.
@@ -2652,10 +2658,9 @@ index 0000000..3724b20
 +static constexpr uint32_t EVENT_COLLISION_BODY_OFFSET = 4;
 +static constexpr uint32_t BODY_COLLISION_ID = 1;
 +
-+static const ImU32 RAIL_FILL = IM_COL32(255, 140, 0, 60);
-+static const ImU32 RAIL_OUTLINE = IM_COL32(255, 160, 40, 230);
-+static const ImU32 BODY_COLOUR = IM_COL32(0, 230, 255, 230);
-+static const ImU32 TRIGGER_COLOUR = IM_COL32(255, 80, 255, 230);
++static const ImU32 RAIL_COLOUR = IM_COL32(255, 140, 0, 130);
++static const ImU32 BODY_COLOUR = IM_COL32(0, 230, 255, 140);
++static const ImU32 TRIGGER_COLOUR = IM_COL32(255, 80, 255, 100);
 +
 +static constexpr float PI = std::numbers::pi_v<float>;
 +
@@ -2675,6 +2680,11 @@ index 0000000..3724b20
 +static float Length(const Vector3& v)
 +{
 +    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
++}
++
++static float Dot(const Vector3& a, const Vector3& b)
++{
++    return a.x * b.x + a.y * b.y + a.z * b.z;
 +}
 +
 +static Vector3 Cross(const Vector3& a, const Vector3& b)
@@ -2740,7 +2750,12 @@ index 0000000..3724b20
 +
 +    Vector3 operator()(const Vector3& p) const
 +    {
-+        return columns[0] * p.x + columns[1] * p.y + columns[2] * p.z + translation;
++        return Rotate(p) + translation;
++    }
++
++    Vector3 Rotate(const Vector3& v) const
++    {
++        return columns[0] * v.x + columns[1] * v.y + columns[2] * v.z;
 +    }
 +};
 +
@@ -2751,20 +2766,43 @@ index 0000000..3724b20
 +static std::mutex g_grindPathsMutex;
 +static std::vector<uint32_t> g_grindPaths;
 +
-+// The rails' outlines: the triangle edges that only one triangle has, by mesh.
-+struct RailOutline
++// A rail's mesh, read once, by mesh: its vertices, its triangles, each vertex's normal (the average of its triangles'),
++// and the edges only one triangle has, with that triangle's other vertex, for the sides of the slab.
++struct RailMesh
 +{
-+    uint32_t Indices;
-+    uint32_t Triangles;
-+    std::vector<std::pair<uint32_t, uint32_t>> Edges;
++    uint32_t Vertices = 0;
++    uint32_t Indices = 0;
++    uint32_t Triangles = 0;
++    std::vector<Vector3> Points;
++    std::vector<Vector3> Normals;
++    std::vector<std::array<uint32_t, 3>> Faces;
++    std::vector<std::array<uint32_t, 3>> Edges;
++    bool Used = false;
 +};
 +
-+static std::unordered_map<uint32_t, RailOutline> g_railOutlines;
++static std::unordered_map<uint32_t, RailMesh> g_railMeshes;
 +
 +bool CollisionOverlay::IsEnabled()
 +{
 +    return Config::EnableStageCollisionDebugView || Config::EnableEventCollisionDebugView || Config::EnableObjectCollisionDebugView;
 +}
++
++// F12 hides and shows the overlay. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is
++// passed on as a key, so it goes into the movie like the game's keys.
++static std::atomic<bool> g_hidden;
++
++static class CollisionOverlayListener : public SDLEventListener
++{
++public:
++    bool OnSDLEvent(SDL_Event* event) override
++    {
++        if (CollisionOverlay::IsEnabled() && event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_F12 && !event->key.repeat)
++            g_hidden = !g_hidden;
++
++        return false;
++    }
++}
++g_collisionOverlayListener;
 +
 +void CollisionOverlay::OnCameraUpdate(uint32_t camera)
 +{
@@ -2835,22 +2873,7 @@ index 0000000..3724b20
 +            return { Origin.x + (x / w * 0.5f + 0.5f) * Size.x, Origin.y + (0.5f - y / w * 0.5f) * Size.y };
 +        }
 +
-+        // A line, cut where it goes behind the near plane.
-+        void Line(ImDrawList* drawList, const Vector3& a, const Vector3& b, ImU32 colour, float thickness = 1.5f) const
-+        {
-+            Vector3 va = ToView(a);
-+            Vector3 vb = ToView(b);
-+            if (!IsVisible(va) && !IsVisible(vb))
-+                return;
-+
-+            if (!IsVisible(va))
-+                va = vb + (va - vb) * ((-NEAR_PLANE - vb.z) / (va.z - vb.z));
-+            else if (!IsVisible(vb))
-+                vb = va + (vb - va) * ((-NEAR_PLANE - va.z) / (vb.z - va.z));
-+
-+            drawList->AddLine(ToScreen(va), ToScreen(vb), colour, Scale(thickness));
-+        }
-+
++        // A triangle, left out if it reaches behind the near plane.
 +        void Triangle(ImDrawList* drawList, const Vector3& a, const Vector3& b, const Vector3& c, ImU32 colour) const
 +        {
 +            Vector3 va = ToView(a);
@@ -2876,53 +2899,86 @@ index 0000000..3724b20
 +    v = Cross(axis, u);
 +}
 +
-+// A circle in the shape's own space, around a centre in the plane of u and v.
-+static void DrawCircle(ImDrawList* drawList, const Projector& projector, const Transform& transform, const Vector3& centre,
-+    const Vector3& u, const Vector3& v, float radius, ImU32 colour, float startAngle = 0.0f, float endAngle = 2.0f * PI)
++// A shape's surface, in triangles, in the shape's own space; all the shapes are convex, around their centre.
++struct Surface
 +{
-+    constexpr int SEGMENTS = 24;
-+    Vector3 previous{};
-+    for (int i = 0; i <= SEGMENTS; i++)
++    std::vector<Vector3> Triangles;
++    Vector3 Centre{};
++
++    void Quad(const Vector3& a, const Vector3& b, const Vector3& c, const Vector3& d)
 +    {
-+        float angle = startAngle + (endAngle - startAngle) * i / SEGMENTS;
-+        Vector3 point = transform(centre + u * (std::cos(angle) * radius) + v * (std::sin(angle) * radius));
-+        if (i > 0)
-+            projector.Line(drawList, previous, point, colour);
-+
-+        previous = point;
++        Triangles.insert(Triangles.end(), { a, b, c, a, c, d });
 +    }
-+}
++};
 +
-+// A cylinder or a capsule between two points; a capsule also gets its rounded ends.
-+static void DrawTube(ImDrawList* drawList, const Projector& projector, const Transform& transform, const Vector3& a, const Vector3& b,
-+    float radius, bool rounded, ImU32 colour)
++static constexpr int SEGMENTS = 24;
++static constexpr int RINGS = 6;
++
++// A cylinder between two points, or a capsule, with its rounded ends.
++static void BuildTube(Surface& surface, const Vector3& a, const Vector3& b, float radius, bool rounded)
 +{
 +    Vector3 axis = Normalised(b - a);
 +    Vector3 u, v;
 +    GetPerpendiculars(axis, u, v);
++    surface.Centre = (a + b) * 0.5f;
 +
-+    DrawCircle(drawList, projector, transform, a, u, v, radius, colour);
-+    DrawCircle(drawList, projector, transform, b, u, v, radius, colour);
++    auto around = [&](int i) { float angle = 2.0f * PI * i / SEGMENTS; return u * std::cos(angle) + v * std::sin(angle); };
 +
-+    for (int i = 0; i < 4; i++)
++    for (int i = 0; i < SEGMENTS; i++)
 +    {
-+        float angle = PI * i / 2;
-+        Vector3 offset = u * (std::cos(angle) * radius) + v * (std::sin(angle) * radius);
-+        projector.Line(drawList, transform(a + offset), transform(b + offset), colour);
-+    }
++        Vector3 r0 = around(i) * radius;
++        Vector3 r1 = around(i + 1) * radius;
++        surface.Quad(a + r0, a + r1, b + r1, b + r0);
 +
-+    if (rounded)
-+    {
-+        // Half circles over each end, in two planes through the axis.
-+        for (const Vector3& side : { u, v })
++        if (!rounded)
 +        {
-+            DrawCircle(drawList, projector, transform, b, side, axis, radius, colour, 0.0f, PI);
-+            DrawCircle(drawList, projector, transform, a, side, axis * -1.0f, radius, colour, 0.0f, PI);
++            surface.Triangles.insert(surface.Triangles.end(), { a, a + r1, a + r0, b, b + r0, b + r1 });
++            continue;
++        }
++
++        // The half spheres, ring by ring towards each end.
++        for (int k = 0; k < RINGS; k++)
++        {
++            float from = 0.5f * PI * k / RINGS;
++            float to = 0.5f * PI * (k + 1) / RINGS;
++            for (float sign : { 1.0f, -1.0f })
++            {
++                const Vector3& end = sign > 0.0f ? b : a;
++                Vector3 up = axis * (sign * radius);
++                auto point = [&](const Vector3& direction, float latitude) { return end + direction * (radius * std::cos(latitude)) + up * std::sin(latitude); };
++                surface.Quad(point(around(i), from), point(around(i + 1), from), point(around(i + 1), to), point(around(i), to));
++            }
 +        }
 +    }
 +}
 +
-+static void DrawShape(ImDrawList* drawList, const Projector& projector, const Transform& transform, uint32_t shape, ImU32 colour)
++static void BuildSphere(Surface& surface, float radius)
++{
++    auto point = [&](int i, int k)
++    {
++        float longitude = 2.0f * PI * i / SEGMENTS;
++        float latitude = PI * k / (2 * RINGS) - 0.5f * PI;
++        return Vector3{ std::cos(latitude) * std::cos(longitude), std::sin(latitude), std::cos(latitude) * std::sin(longitude) } * radius;
++    };
++
++    for (int i = 0; i < SEGMENTS; i++)
++    {
++        for (int k = 0; k < 2 * RINGS; k++)
++            surface.Quad(point(i, k), point(i + 1, k), point(i + 1, k + 1), point(i, k + 1));
++    }
++}
++
++static void BuildBox(Surface& surface, const Vector3& half)
++{
++    auto corner = [&](int i) { return Vector3{ (i & 1) ? half.x : -half.x, (i & 2) ? half.y : -half.y, (i & 4) ? half.z : -half.z }; };
++    for (auto [a, b, c, d] : { std::array{ 0, 1, 3, 2 }, std::array{ 4, 6, 7, 5 }, std::array{ 0, 4, 5, 1 }, std::array{ 2, 3, 7, 6 },
++        std::array{ 0, 2, 6, 4 }, std::array{ 1, 5, 7, 3 } })
++    {
++        surface.Quad(corner(a), corner(b), corner(c), corner(d));
++    }
++}
++
++static bool BuildShape(Surface& surface, uint32_t shape)
 +{
 +    uint32_t vftable = LoadU32(shape);
 +    float convexRadius = LoadFloat(shape + 0x10);
@@ -2931,35 +2987,72 @@ index 0000000..3724b20
 +    {
 +        bool cylinder = vftable == CYLINDER_SHAPE_VFTABLE;
 +        float radius = convexRadius + (cylinder ? LoadFloat(shape + 0x14) : 0.0f);
-+        if (radius > 0.0f && radius < 100.0f)
-+            DrawTube(drawList, projector, transform, LoadVector(shape + 0x20), LoadVector(shape + 0x30), radius, !cylinder, colour);
++        if (!(radius > 0.0f && radius < 100.0f))
++            return false;
++
++        BuildTube(surface, LoadVector(shape + 0x20), LoadVector(shape + 0x30), radius, !cylinder);
++        return true;
 +    }
-+    else if (vftable == SPHERE_SHAPE_VFTABLE)
++
++    if (vftable == SPHERE_SHAPE_VFTABLE)
 +    {
-+        if (convexRadius > 0.0f && convexRadius < 100.0f)
-+        {
-+            Vector3 x{ 1.0f, 0.0f, 0.0f }, y{ 0.0f, 1.0f, 0.0f }, z{ 0.0f, 0.0f, 1.0f };
-+            DrawCircle(drawList, projector, transform, {}, x, y, convexRadius, colour);
-+            DrawCircle(drawList, projector, transform, {}, y, z, convexRadius, colour);
-+            DrawCircle(drawList, projector, transform, {}, z, x, convexRadius, colour);
-+        }
++        if (!(convexRadius > 0.0f && convexRadius < 100.0f))
++            return false;
++
++        BuildSphere(surface, convexRadius);
++        return true;
 +    }
-+    else if (vftable == BOX_SHAPE_VFTABLE)
++
++    if (vftable == BOX_SHAPE_VFTABLE)
 +    {
 +        Vector3 half = LoadVector(shape + 0x20) + Vector3{ convexRadius, convexRadius, convexRadius };
-+        if (half.x > 0.0f && half.y > 0.0f && half.z > 0.0f && half.x < 100.0f && half.y < 100.0f && half.z < 100.0f)
-+        {
-+            auto corner = [&](int i) { return transform({ (i & 1) ? half.x : -half.x, (i & 2) ? half.y : -half.y, (i & 4) ? half.z : -half.z }); };
-+            for (int i = 0; i < 8; i++)
-+            {
-+                for (int bit : { 1, 2, 4 })
-+                {
-+                    if (!(i & bit))
-+                        projector.Line(drawList, corner(i), corner(i | bit), colour);
-+                }
-+            }
-+        }
++        if (!(half.x > 0.0f && half.y > 0.0f && half.z > 0.0f && half.x < 100.0f && half.y < 100.0f && half.z < 100.0f))
++            return false;
++
++        BuildBox(surface, half);
++        return true;
 +    }
++
++    return false;
++}
++
++// Fills a face of a solid if it faces the camera, lighter the more it does, so solids read as see-through volumes.
++// The face's outside is the side the direction points to.
++static void DrawFace(ImDrawList* drawList, const Projector& projector, const Vector3& a, const Vector3& b, const Vector3& c,
++    const Vector3& outside, ImU32 colour)
++{
++    Vector3 middle = (a + b + c) * (1.0f / 3.0f);
++    Vector3 normal = Normalised(Cross(b - a, c - a));
++    if (Dot(normal, outside) < 0.0f)
++        normal = normal * -1.0f;
++
++    float facing = Dot(normal, Normalised(projector.Eye - middle));
++    if (facing <= 0.0f)
++        return;
++
++    float light = 0.45f + 0.55f * facing;
++    auto channel = [&](int shift) { return uint32_t(((colour >> shift) & 0xFF) * light) << shift; };
++    ImU32 shaded = channel(IM_COL32_R_SHIFT) | channel(IM_COL32_G_SHIFT) | channel(IM_COL32_B_SHIFT) | (colour & IM_COL32_A_MASK);
++    projector.Triangle(drawList, a, b, c, shaded);
++}
++
++static void DrawSurface(ImDrawList* drawList, const Projector& projector, const Transform& transform, const Surface& surface, ImU32 colour)
++{
++    Vector3 centre = transform(surface.Centre);
++    for (size_t i = 0; i + 2 < surface.Triangles.size(); i += 3)
++    {
++        Vector3 a = transform(surface.Triangles[i]);
++        Vector3 b = transform(surface.Triangles[i + 1]);
++        Vector3 c = transform(surface.Triangles[i + 2]);
++        DrawFace(drawList, projector, a, b, c, (a + b + c) * (1.0f / 3.0f) - centre, colour);
++    }
++}
++
++static void DrawShape(ImDrawList* drawList, const Projector& projector, const Transform& transform, uint32_t shape, ImU32 colour)
++{
++    Surface surface;
++    if (BuildShape(surface, shape))
++        DrawSurface(drawList, projector, transform, surface, colour);
 +}
 +
 +// The player's collision that's on: the body and what touches rings, objects and triggers.
@@ -2973,6 +3066,7 @@ index 0000000..3724b20
 +
 +    // The tree's nodes: left at +0, right at +8, the ID at +12 and the shared_ptr at +16, the head's flag at +25.
 +    std::vector<uint32_t> nodes{ LoadU32(head + 4) };
++    std::vector<std::pair<uint32_t, uint32_t>> bodies;
 +    for (size_t i = 0; i < nodes.size() && i < 64; i++)
 +    {
 +        uint32_t node = nodes[i];
@@ -2987,44 +3081,70 @@ index 0000000..3724b20
 +            continue;
 +
 +        uint32_t body = LoadU32(collision + EVENT_COLLISION_BODY_OFFSET);
-+        if (LoadU32(body) != RIGID_BODY_VFTABLE || LoadU32(body + RIGID_BODY_WORLD_OFFSET) == 0)
-+            continue;
-+
-+        ImU32 colour = LoadU32(node + 12) == BODY_COLLISION_ID ? BODY_COLOUR : TRIGGER_COLOUR;
-+        DrawShape(drawList, projector, Transform(body), LoadU32(body + RIGID_BODY_SHAPE_OFFSET), colour);
++        if (LoadU32(body) == RIGID_BODY_VFTABLE && LoadU32(body + RIGID_BODY_WORLD_OFFSET) != 0)
++            bodies.emplace_back(LoadU32(node + 12), body);
 +    }
++
++    // The body first: the others are around it, and it shows through them.
++    std::stable_partition(bodies.begin(), bodies.end(), [](auto& entry) { return entry.first == BODY_COLLISION_ID; });
++    for (auto& [id, body] : bodies)
++        DrawShape(drawList, projector, Transform(body), LoadU32(body + RIGID_BODY_SHAPE_OFFSET), id == BODY_COLLISION_ID ? BODY_COLOUR : TRIGGER_COLOUR);
 +}
 +
-+static const RailOutline& GetRailOutline(uint32_t mesh, uint32_t indices, uint32_t indexStride, bool indices32, uint32_t triangles)
++static const RailMesh& GetRailMesh(uint32_t mesh, uint32_t vertices, uint32_t vertexStride, uint32_t vertexCount, uint32_t indices,
++    uint32_t indexStride, bool indices32, uint32_t triangles)
 +{
-+    auto& outline = g_railOutlines[mesh];
-+    if (outline.Indices == indices && outline.Triangles == triangles)
-+        return outline;
++    auto& rail = g_railMeshes[mesh];
++    rail.Used = true;
++    if (rail.Vertices == vertices && rail.Indices == indices && rail.Triangles == triangles)
++        return rail;
 +
-+    std::map<std::pair<uint32_t, uint32_t>, int> counts;
++    rail = { vertices, indices, triangles };
++    rail.Used = true;
++    rail.Points.resize(vertexCount);
++    rail.Normals.assign(vertexCount, {});
++    for (uint32_t v = 0; v < vertexCount; v++)
++        rail.Points[v] = LoadVector(vertices + v * vertexStride);
++
++    std::map<std::pair<uint32_t, uint32_t>, std::pair<int, uint32_t>> edges;
 +    for (uint32_t t = 0; t < triangles; t++)
 +    {
-+        uint32_t index[3];
++        std::array<uint32_t, 3> face;
 +        for (uint32_t k = 0; k < 3; k++)
 +        {
 +            uint32_t address = indices + t * indexStride + k * (indices32 ? 4 : 2);
-+            index[k] = indices32 ? LoadU32(address) : LoadU16(address);
++            face[k] = std::min(indices32 ? LoadU32(address) : uint32_t(LoadU16(address)), vertexCount - 1);
 +        }
 +
++        // The strips keep one winding, so their normals agree.
++        Vector3 normal = Normalised(Cross(rail.Points[face[1]] - rail.Points[face[0]], rail.Points[face[2]] - rail.Points[face[0]]));
++        for (uint32_t index : face)
++            rail.Normals[index] = rail.Normals[index] + normal;
++
 +        for (uint32_t k = 0; k < 3; k++)
-+            counts[std::minmax(index[k], index[(k + 1) % 3])]++;
++        {
++            auto& edge = edges[std::minmax(face[k], face[(k + 1) % 3])];
++            edge.first++;
++            edge.second = face[(k + 2) % 3];
++        }
++
++        rail.Faces.push_back(face);
 +    }
 +
-+    outline = { indices, triangles, {} };
-+    for (auto& [edge, count] : counts)
++    for (auto& normal : rail.Normals)
++        normal = Normalised(normal);
++
++    for (auto& [edge, count] : edges)
 +    {
-+        if (count == 1)
-+            outline.Edges.push_back(edge);
++        if (count.first == 1)
++            rail.Edges.push_back({ edge.first, edge.second, count.second });
 +    }
 +
-+    return outline;
++    return rail;
 +}
 +
++// A rail as the slab Havok makes of it: its strip pushed out by the triangles' radius on both sides, with the strip's
++// edges closing it.
 +static void DrawRail(ImDrawList* drawList, const Projector& projector, uint32_t path)
 +{
 +    if (LoadU32(path) != GRIND_PATH_VFTABLE)
@@ -3055,38 +3175,49 @@ index 0000000..3724b20
 +    if (triangles == 0 || triangles > 65536 || vertexCount > 65536 || vertexStride < 12 || (indexType != 1 && indexType != 2))
 +        return;
 +
-+    bool indices32 = indexType == 2;
++    if (vertexCount == 0)
++        return;
++
++    float radius = LoadFloat(mesh + EXTENDED_MESH_RADIUS_OFFSET);
++    if (!(radius > 0.0f && radius < 1.0f))
++        radius = 0.05f;
++
++    const RailMesh& rail = GetRailMesh(mesh, vertices, vertexStride, vertexCount, indices, indexStride, indexType == 2, triangles);
 +    Transform transform(body);
-+    auto vertex = [&](uint32_t index) { return transform(LoadVector(vertices + std::min(index, vertexCount - 1) * vertexStride)); };
++    auto top = [&](uint32_t index, float side) { return transform(rail.Points[index]) + transform.Rotate(rail.Normals[index]) * (radius * side); };
 +    auto fade = [&](const Vector3& point) { return 1.0f - (Length(point - projector.Eye) - RAIL_FADE_START) / (RAIL_FADE_END - RAIL_FADE_START); };
 +
-+    for (uint32_t t = 0; t < triangles; t++)
++    for (auto& face : rail.Faces)
 +    {
-+        uint32_t index[3];
-+        for (uint32_t k = 0; k < 3; k++)
-+        {
-+            uint32_t address = indices + t * indexStride + k * (indices32 ? 4 : 2);
-+            index[k] = indices32 ? LoadU32(address) : LoadU16(address);
-+        }
++        Vector3 middle = transform((rail.Points[face[0]] + rail.Points[face[1]] + rail.Points[face[2]]) * (1.0f / 3.0f));
++        float amount = fade(middle);
++        if (amount <= 0.0f)
++            continue;
 +
-+        Vector3 a = vertex(index[0]), b = vertex(index[1]), c = vertex(index[2]);
-+        float amount = fade((a + b + c) * (1.0f / 3.0f));
-+        if (amount > 0.0f)
-+            projector.Triangle(drawList, a, b, c, Fade(RAIL_FILL, amount));
++        Vector3 normal = transform.Rotate(rail.Normals[face[0]] + rail.Normals[face[1]] + rail.Normals[face[2]]);
++        for (float side : { 1.0f, -1.0f })
++            DrawFace(drawList, projector, top(face[0], side), top(face[1], side), top(face[2], side), normal * side, Fade(RAIL_COLOUR, amount));
 +    }
 +
-+    for (auto& [first, second] : GetRailOutline(mesh, indices, indexStride, indices32, triangles).Edges)
++    for (auto& [first, second, other] : rail.Edges)
 +    {
-+        Vector3 a = vertex(first), b = vertex(second);
++        Vector3 a = transform(rail.Points[first]);
++        Vector3 b = transform(rail.Points[second]);
 +        float amount = fade((a + b) * 0.5f);
-+        if (amount > 0.0f)
-+            projector.Line(drawList, a, b, Fade(RAIL_OUTLINE, amount), 2.5f);
++        if (amount <= 0.0f)
++            continue;
++
++        // Outwards: away from the triangle's other corner.
++        Vector3 outside = (a + b) * 0.5f - transform(rail.Points[other]);
++        ImU32 colour = Fade(RAIL_COLOUR, amount);
++        DrawFace(drawList, projector, top(first, 1.0f), top(second, 1.0f), top(second, -1.0f), outside, colour);
++        DrawFace(drawList, projector, top(first, 1.0f), top(second, -1.0f), top(first, -1.0f), outside, colour);
 +    }
 +}
 +
 +void CollisionOverlay::Draw()
 +{
-+    if (!IsEnabled())
++    if (!IsEnabled() || g_hidden)
 +        return;
 +
 +    // Only in levels, with the camera that was updated last.
@@ -3115,6 +3246,10 @@ index 0000000..3724b20
 +
 +    auto drawList = ImGui::GetBackgroundDrawList();
 +
++    // Without the anti-aliased fringes, which would overlap between the triangles of a see-through surface.
++    ImDrawListFlags flags = drawList->Flags;
++    drawList->Flags &= ~ImDrawListFlags_AntiAliasedFill;
++
 +    if (*SWA::SGlobals::ms_IsCollisionRender)
 +    {
 +        std::vector<uint32_t> paths;
@@ -3123,15 +3258,23 @@ index 0000000..3724b20
 +            paths = g_grindPaths;
 +        }
 +
++        for (auto& [mesh, rail] : g_railMeshes)
++            rail.Used = false;
++
 +        for (uint32_t path : paths)
 +            DrawRail(drawList, projector, path);
++
++        // Forget the meshes of the rails that are gone.
++        std::erase_if(g_railMeshes, [](auto& entry) { return !entry.second.Used; });
 +    }
 +
 +    DrawPlayerCollision(drawList, projector, context);
++
++    drawList->Flags = flags;
 +}
 diff --git a/UnleashedRecomp/ui/collision_overlay.h b/UnleashedRecomp/ui/collision_overlay.h
 new file mode 100644
-index 0000000..343ef72
+index 0000000..d8da969
 --- /dev/null
 +++ b/UnleashedRecomp/ui/collision_overlay.h
 @@ -0,0 +1,17 @@
@@ -3141,8 +3284,8 @@ index 0000000..343ef72
 +
 +// Draws what the game's collision debug views (the EnableStageCollisionDebugView, EnableEventCollisionDebugView and
 +// EnableObjectCollisionDebugView codes) leave out: with the stage collision view, the grind rails' collision, and with
-+// any of them, the player's collision (day Sonic's or the Werehog's). Lines over the frame, projected with the game's
-+// camera, without depth. It only reads the game's memory.
++// any of them, the player's collision (day Sonic's or the Werehog's), as see-through solids. Drawn over the frame,
++// projected with the game's camera, without depth; F12 hides and shows it. It only reads the game's memory.
 +namespace CollisionOverlay
 +{
 +    bool IsEnabled();
