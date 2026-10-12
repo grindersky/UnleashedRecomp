@@ -27,10 +27,12 @@ UNLEASHED_TAS_MODE=1 libTAS
 
 Add `UNLEASHED_TAS_HUD=1` for a HUD, shown in levels. It's drawn into the frames, so it also shows up in encodes.
 
-- As Sonic: his speed, his movement mode (free 3D, forward with quick steps, 2D, or running on water), his state (on
-  the ground or in the air, sliding, stomping, and whether a jump or stomp pressed on the current frame would work,
-  with a countdown until a stomp is allowed again after a jump), the stick with the M-/D-Speed zones and the
-  break-jump zone (orange), and the buttons (lit while held, with a ring on the frame they're pressed).
+- As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss
+  fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump,
+  stomp or quick step pressed on the current frame would work, with countdowns until a stomp is allowed again after a
+  jump, also with an air boost, which shortens the wait, and until the next quick step), the stick with the M-Speed
+  zone (in 3D, in any direction), the D-Speed zones (in 2D) and the break-jump zone (orange), and the buttons (lit
+  while held, with a ring on the frame they're pressed).
 - As the Werehog: his speed, his state (on the ground or in the air, dashing, attacking, which attack and in how many
   frames it ends on its own, with and without the stick), whether a guard (LB) pressed on the current frame would
   work, his Unleash gauge, the stage time, the stick and the buttons.
