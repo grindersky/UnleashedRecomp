@@ -209,6 +209,46 @@ index e12e91a..b5fbf3b 100644
  #ifdef USE_PTHREAD
      pthread_t thread;
  #else
+diff --git a/UnleashedRecomp/gpu/imgui/imgui_common.h b/UnleashedRecomp/gpu/imgui/imgui_common.h
+index 10c5ebb..e1b3bda 100644
+--- a/UnleashedRecomp/gpu/imgui/imgui_common.h
++++ b/UnleashedRecomp/gpu/imgui/imgui_common.h
+@@ -12,6 +12,9 @@
+ #define IMGUI_SHADER_MODIFIER_CATEGORY_BEVEL           9
+ #define IMGUI_SHADER_MODIFIER_RECTANGLE_BEVEL          10
+ #define IMGUI_SHADER_MODIFIER_LOW_QUALITY_TEXT         11
++// The vertices' depth (as the game's depth buffer has it: reversed, 1 at the near plane) in the texture coordinates' x,
++// and the texture is the game's depth buffer: pixels behind what the game drew are left out.
++#define IMGUI_SHADER_MODIFIER_DEPTH_TEST               12
+ 
+ #ifdef __cplusplus
+ 
+diff --git a/UnleashedRecomp/gpu/shader/imgui_ps.hlsl b/UnleashedRecomp/gpu/shader/imgui_ps.hlsl
+index ac0a598..a9812be 100644
+--- a/UnleashedRecomp/gpu/shader/imgui_ps.hlsl
++++ b/UnleashedRecomp/gpu/shader/imgui_ps.hlsl
+@@ -125,6 +125,21 @@ float4 SampleSdfFont(float4 color, Texture2D<float4> texture, float2 uv, float2
+ 
+ float4 main(in Interpolators interpolators) : SV_Target
+ {
++    if (g_PushConstants.ShaderModifier == IMGUI_SHADER_MODIFIER_DEPTH_TEST)
++    {
++        // The depth buffer may be at another resolution than the display.
++        Texture2D<float4> depthBuffer = g_Texture2DDescriptorHeap[g_PushConstants.Texture2DDescriptorIndex & 0x7FFFFFFF];
++        uint width, height;
++        depthBuffer.GetDimensions(width, height);
++
++        int2 texel = int2(interpolators.Position.xy * g_PushConstants.InverseDisplaySize * float2(width, height));
++        // The game's depth is reversed: 1 at the near plane, 0 at the far one.
++        if (interpolators.UV.x < depthBuffer.Load(int3(texel, 0)).x)
++            discard;
++
++        return interpolators.Color;
++    }
++
+     float4 color = interpolators.Color;
+     color *= PixelAntialiasing(interpolators.Position.xy - g_PushConstants.ProceduralOrigin);
+     
 diff --git a/UnleashedRecomp/gpu/tas_swap_chain.cpp b/UnleashedRecomp/gpu/tas_swap_chain.cpp
 new file mode 100644
 index 0000000..49c1a58
@@ -499,7 +539,7 @@ index 0000000..956be45
 +    void GetWindowPixelSize(uint32_t& width, uint32_t& height) const;
 +};
 diff --git a/UnleashedRecomp/gpu/video.cpp b/UnleashedRecomp/gpu/video.cpp
-index a9edd0b..ba3d830 100644
+index a9edd0b..7eb6aef 100644
 --- a/UnleashedRecomp/gpu/video.cpp
 +++ b/UnleashedRecomp/gpu/video.cpp
 @@ -3,6 +3,7 @@
@@ -558,7 +598,22 @@ index a9edd0b..ba3d830 100644
      g_swapChain->setVsyncEnabled(Config::VSync);
      g_swapChainValid = !g_swapChain->needsResize();
  
-@@ -2603,6 +2617,8 @@ static void DrawImGui()
+@@ -2146,8 +2160,14 @@ static uint32_t CreateDevice(uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
+     return 0;
+ }
+ 
++// The depth buffer the game drew its scene with, for the collision overlay (SetDepthStencilSurface).
++static GuestSurface* g_sceneDepthStencil;
++
+ static void DestructResource(GuestResource* resource) 
+ {
++    if (resource == reinterpret_cast<GuestResource*>(g_sceneDepthStencil))
++        g_sceneDepthStencil = nullptr;
++
+     RenderCommand cmd;
+     cmd.type = RenderCommandType::DestructResource;
+     cmd.destructResource.resource = resource;
+@@ -2603,6 +2623,8 @@ static void DrawImGui()
      assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
  
      DrawFPS();
@@ -567,7 +622,7 @@ index a9edd0b..ba3d830 100644
      DrawProfiler();
      ImGui::Render();
  
-@@ -2787,9 +2803,17 @@ void Video::WaitOnSwapChain()
+@@ -2787,9 +2809,17 @@ void Video::WaitOnSwapChain()
  
  static bool g_shouldPrecompilePipelines;
  static std::atomic<bool> g_executedCommandList;
@@ -586,7 +641,7 @@ index a9edd0b..ba3d830 100644
      g_readyForCommands = false;
  
      RenderCommand cmd;
-@@ -2802,9 +2826,13 @@ void Video::Present()
+@@ -2802,9 +2832,13 @@ void Video::Present()
      g_renderQueue.enqueue(cmd);
  
      // All the shaders are available at this point. We can precompile embedded PSOs then.
@@ -601,7 +656,7 @@ index a9edd0b..ba3d830 100644
          g_shouldPrecompilePipelines = false;
      }
  
-@@ -2824,6 +2852,10 @@ void Video::Present()
+@@ -2824,6 +2858,10 @@ void Video::Present()
          g_swapChainValid = g_swapChain->present(g_backBufferIndex, signalSemaphores, std::size(signalSemaphores));
      }
  
@@ -612,7 +667,7 @@ index a9edd0b..ba3d830 100644
      g_pendingWaitOnSwapChain = true;
  
      g_frame = g_nextFrame;
-@@ -2853,7 +2885,17 @@ void Video::Present()
+@@ -2853,7 +2891,17 @@ void Video::Present()
      cmd.type = RenderCommandType::BeginCommandList;
      g_renderQueue.enqueue(cmd);
  
@@ -631,7 +686,7 @@ index a9edd0b..ba3d830 100644
      {
          using namespace std::chrono_literals;
  
-@@ -2977,7 +3019,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
+@@ -2977,7 +3025,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
      commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
      commandList->end();
  
@@ -641,7 +696,7 @@ index a9edd0b..ba3d830 100644
      {
          const RenderCommandList *commandLists[] = { commandList.get() };
          RenderCommandSemaphore *waitSemaphores[] = { g_acquireSemaphores[g_frame].get() };
-@@ -3004,6 +3047,9 @@ static void ProcBeginCommandList(const RenderCommand& cmd)
+@@ -3004,6 +3053,9 @@ static void ProcBeginCommandList(const RenderCommand& cmd)
  {
      DestructTempResources();
      BeginCommandList();
@@ -651,7 +706,29 @@ index a9edd0b..ba3d830 100644
  }
  
  static GuestSurface* GetBackBuffer() 
-@@ -4512,6 +4558,12 @@ static void FlushRenderStateForRenderThread()
+@@ -3343,8 +3395,21 @@ static void ProcSetRenderTarget(const RenderCommand& cmd)
+     SetAlphaTestMode((g_pipelineState.specConstants & (SPEC_CONSTANT_ALPHA_TEST | SPEC_CONSTANT_ALPHA_TO_COVERAGE)) != 0);
+ }
+ 
++GuestSurface* Video::GetSceneDepthStencil()
++{
++    return g_sceneDepthStencil;
++}
++
+ static void SetDepthStencilSurface(GuestDevice* device, GuestSurface* depthStencil) 
+ {
++    // The scene's depth buffer is at the game's render resolution (SetResolution); shadow maps and such aren't.
++    if (depthStencil != nullptr && depthStencil->sampleCount == RenderSampleCount::COUNT_1 &&
++        depthStencil->width == uint32_t(round(Video::s_viewportWidth * Config::ResolutionScale)) &&
++        depthStencil->height == uint32_t(round(Video::s_viewportHeight * Config::ResolutionScale)))
++    {
++        g_sceneDepthStencil = depthStencil;
++    }
++
+     RenderCommand cmd;
+     cmd.type = RenderCommandType::SetDepthStencilSurface;
+     cmd.setDepthStencilSurface.depthStencil = depthStencil;
+@@ -4512,6 +4577,12 @@ static void FlushRenderStateForRenderThread()
          // D3D12 resets the depth bias values. Check if they need to be set again.
          if (g_capabilities.dynamicDepthBias && !g_vulkan)
              g_dirtyStates.depthBias = (g_depthBias != g_pipelineState.depthBias) || (g_slopeScaledDepthBias != g_pipelineState.slopeScaledDepthBias);
@@ -664,7 +741,7 @@ index a9edd0b..ba3d830 100644
      }
  
      if (g_dirtyStates.depthBias && g_capabilities.dynamicDepthBias)
-@@ -6947,6 +6999,23 @@ PPC_FUNC(sub_825369A0)
+@@ -6947,6 +7018,23 @@ PPC_FUNC(sub_825369A0)
      assert(std::this_thread::get_id() == g_mainThreadId);
  
      // Wait for pipeline compilations to finish.
@@ -688,7 +765,7 @@ index a9edd0b..ba3d830 100644
      uint32_t value;
      while ((value = g_compilingPipelineTaskCount.load()) != 0)
      {
-@@ -6961,10 +7030,28 @@ PPC_FUNC(sub_825369A0)
+@@ -6961,10 +7049,28 @@ PPC_FUNC(sub_825369A0)
      __imp__sub_825369A0(ctx, base);
  }
  
@@ -718,7 +795,7 @@ index a9edd0b..ba3d830 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -6978,7 +7065,9 @@ PPC_FUNC(sub_82E2EFB0)
+@@ -6978,7 +7084,9 @@ PPC_FUNC(sub_82E2EFB0)
  // CTerrainModelData::CheckMadeAll
  PPC_FUNC_IMPL(__imp__sub_82E243D8);
  PPC_FUNC(sub_82E243D8)
@@ -729,7 +806,7 @@ index a9edd0b..ba3d830 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -6992,7 +7081,9 @@ PPC_FUNC(sub_82E243D8)
+@@ -6992,7 +7100,9 @@ PPC_FUNC(sub_82E243D8)
  // CParticleMaterial::CheckMadeAll
  PPC_FUNC_IMPL(__imp__sub_82E87598);
  PPC_FUNC(sub_82E87598)
@@ -740,7 +817,7 @@ index a9edd0b..ba3d830 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -7005,6 +7096,12 @@ PPC_FUNC(sub_82E87598)
+@@ -7005,6 +7115,12 @@ PPC_FUNC(sub_82E87598)
  
  void GetDatabaseDataMidAsmHook(PPCRegister& r1, PPCRegister& r4)
  {
@@ -753,6 +830,30 @@ index a9edd0b..ba3d830 100644
      auto& databaseData = *reinterpret_cast<boost::shared_ptr<Hedgehog::Database::CDatabaseData>*>(
          g_memory.Translate(r1.u32 + 0x58));
  
+diff --git a/UnleashedRecomp/gpu/video.h b/UnleashedRecomp/gpu/video.h
+index 6c24d30..be284f0 100644
+--- a/UnleashedRecomp/gpu/video.h
++++ b/UnleashedRecomp/gpu/video.h
+@@ -13,6 +13,8 @@
+ 
+ using namespace plume;
+ 
++struct GuestSurface;
++
+ struct Video
+ {
+     static inline uint32_t s_viewportWidth;
+@@ -24,6 +26,10 @@ struct Video
+     static void StartPipelinePrecompilation();
+     static void WaitForGPU();
+     static void ComputeViewportDimensions();
++
++    // The depth buffer the game drew its scene with: the last depth stencil it set at its render resolution, without
++    // multisampling, or null.
++    static GuestSurface* GetSceneDepthStencil();
+ };
+ 
+ struct GuestSamplerState
 diff --git a/UnleashedRecomp/hid/hid.cpp b/UnleashedRecomp/hid/hid.cpp
 index 900de32..95f2e12 100644
 --- a/UnleashedRecomp/hid/hid.cpp
@@ -2581,10 +2682,10 @@ index 0000000..f0fb735
 +}
 diff --git a/UnleashedRecomp/ui/collision_overlay.cpp b/UnleashedRecomp/ui/collision_overlay.cpp
 new file mode 100644
-index 0000000..b065203
+index 0000000..ec347ca
 --- /dev/null
 +++ b/UnleashedRecomp/ui/collision_overlay.cpp
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,721 @@
 +#include "collision_overlay.h"
 +#include <api/SWA.h>
 +#include <kernel/function.h>
@@ -2787,9 +2888,10 @@ index 0000000..b065203
 +    return Config::EnableStageCollisionDebugView || Config::EnableEventCollisionDebugView || Config::EnableObjectCollisionDebugView;
 +}
 +
-+// F12 hides and shows the overlay. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is
-+// passed on as a key, so it goes into the movie like the game's keys.
-+static std::atomic<bool> g_hidden;
++// F12 switches between drawing the overlay over everything and hiding it behind what the game drew, with the game's
++// depth buffer. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is passed on as a key,
++// so it goes into the movie like the game's keys.
++static std::atomic<bool> g_depthTested;
 +
 +static class CollisionOverlayListener : public SDLEventListener
 +{
@@ -2797,7 +2899,7 @@ index 0000000..b065203
 +    bool OnSDLEvent(SDL_Event* event) override
 +    {
 +        if (CollisionOverlay::IsEnabled() && event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_F12 && !event->key.repeat)
-+            g_hidden = !g_hidden;
++            g_depthTested = !g_depthTested;
 +
 +        return false;
 +    }
@@ -2865,22 +2967,40 @@ index 0000000..b065203
 +            return viewPoint.z < -NEAR_PLANE;
 +        }
 +
-+        ImVec2 ToScreen(const Vector3& v) const
++        // A point on the screen, with its depth as the game's depth buffer has it. The game's viewport reverses the
++        // projection's depth (its minimum depth is 1, its maximum 0, SPEC_CONSTANT_REVERSE_Z): 1 at the near plane.
++        ImVec2 ToScreen(const Vector3& v, float& depth) const
 +        {
 +            float x = v.x * Projection[0] + v.y * Projection[4] + v.z * Projection[8] + Projection[12];
 +            float y = v.x * Projection[1] + v.y * Projection[5] + v.z * Projection[9] + Projection[13];
++            float z = v.x * Projection[2] + v.y * Projection[6] + v.z * Projection[10] + Projection[14];
 +            float w = v.x * Projection[3] + v.y * Projection[7] + v.z * Projection[11] + Projection[15];
++            depth = 1.0f - z / w;
 +            return { Origin.x + (x / w * 0.5f + 0.5f) * Size.x, Origin.y + (0.5f - y / w * 0.5f) * Size.y };
 +        }
++
++        // Whether the pixels behind the scene are left out (IMGUI_SHADER_MODIFIER_DEPTH_TEST): the triangles then carry
++        // their depth in their texture coordinates.
++        bool DepthTested = false;
 +
 +        // A triangle, left out if it reaches behind the near plane.
 +        void Triangle(ImDrawList* drawList, const Vector3& a, const Vector3& b, const Vector3& c, ImU32 colour) const
 +        {
-+            Vector3 va = ToView(a);
-+            Vector3 vb = ToView(b);
-+            Vector3 vc = ToView(c);
-+            if (IsVisible(va) && IsVisible(vb) && IsVisible(vc))
-+                drawList->AddTriangleFilled(ToScreen(va), ToScreen(vb), ToScreen(vc), colour);
++            Vector3 view[3] = { ToView(a), ToView(b), ToView(c) };
++            if (!IsVisible(view[0]) || !IsVisible(view[1]) || !IsVisible(view[2]))
++                return;
++
++            drawList->PrimReserve(3, 3);
++            ImDrawIdx index = ImDrawIdx(drawList->_VtxCurrentIdx);
++            for (int i = 0; i < 3; i++)
++                drawList->PrimWriteIdx(ImDrawIdx(index + i));
++
++            for (auto& point : view)
++            {
++                float depth;
++                ImVec2 position = ToScreen(point, depth);
++                drawList->PrimWriteVtx(position, DepthTested ? ImVec2(depth, 0.0f) : drawList->_Data->TexUvWhitePixel, colour);
++            }
 +        }
 +    };
 +}
@@ -3217,7 +3337,7 @@ index 0000000..b065203
 +
 +void CollisionOverlay::Draw()
 +{
-+    if (!IsEnabled() || g_hidden)
++    if (!IsEnabled())
 +        return;
 +
 +    // Only in levels, with the camera that was updated last.
@@ -3250,6 +3370,15 @@ index 0000000..b065203
 +    ImDrawListFlags flags = drawList->Flags;
 +    drawList->Flags &= ~ImDrawListFlags_AntiAliasedFill;
 +
++    // Behind walls: the game's depth buffer as the texture. Without it (with multisampling, say), over everything.
++    GuestSurface* depthStencil = g_depthTested ? Video::GetSceneDepthStencil() : nullptr;
++    projector.DepthTested = depthStencil != nullptr;
++    if (projector.DepthTested)
++    {
++        drawList->PushTextureID(ImTextureID(depthStencil));
++        SetShaderModifier(IMGUI_SHADER_MODIFIER_DEPTH_TEST);
++    }
++
 +    if (*SWA::SGlobals::ms_IsCollisionRender)
 +    {
 +        std::vector<uint32_t> paths;
@@ -3270,14 +3399,20 @@ index 0000000..b065203
 +
 +    DrawPlayerCollision(drawList, projector, context);
 +
++    if (projector.DepthTested)
++    {
++        SetShaderModifier(IMGUI_SHADER_MODIFIER_NONE);
++        drawList->PopTextureID();
++    }
++
 +    drawList->Flags = flags;
 +}
 diff --git a/UnleashedRecomp/ui/collision_overlay.h b/UnleashedRecomp/ui/collision_overlay.h
 new file mode 100644
-index 0000000..d8da969
+index 0000000..2618a1a
 --- /dev/null
 +++ b/UnleashedRecomp/ui/collision_overlay.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +#pragma once
 +
 +#include <cstdint>
@@ -3285,7 +3420,8 @@ index 0000000..d8da969
 +// Draws what the game's collision debug views (the EnableStageCollisionDebugView, EnableEventCollisionDebugView and
 +// EnableObjectCollisionDebugView codes) leave out: with the stage collision view, the grind rails' collision, and with
 +// any of them, the player's collision (day Sonic's or the Werehog's), as see-through solids. Drawn over the frame,
-+// projected with the game's camera, without depth; F12 hides and shows it. It only reads the game's memory.
++// projected with the game's camera; F12 switches between over everything and behind what the game drew (tested
++// against its depth buffer). It only reads the game's memory.
 +namespace CollisionOverlay
 +{
 +    bool IsEnabled();
