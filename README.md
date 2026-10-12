@@ -40,7 +40,8 @@ Add `UNLEASHED_TAS_HUD=1` for a HUD, shown in levels. It's drawn into the frames
 The collision view codes (`EnableStageCollisionDebugView`, `EnableEventCollisionDebugView` and
 `EnableObjectCollisionDebugView`) also draw the player's collision that's on: his body (cyan) and what touches rings,
 objects and triggers (magenta). The stage collision view also draws the grind rails' collision (orange). They're drawn
-over the picture, so they show through walls; F12 hides and shows them (under libTAS, it's recorded into the movie).
+over everything, walls included; F12 switches to hiding them behind walls and back (this needs anti-aliasing off).
+Under libTAS, F12 is recorded into the movie.
 
 To play back and encode movies on your graphics card instead of the CPU under WSL, see [DOZEN.md](DOZEN.md).
 
