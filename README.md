@@ -8,6 +8,9 @@
 
 This branch adds a TAS mode to Unleashed Recompiled for [libTAS](https://github.com/clementgallet/libTAS) on Linux, and on Windows through WSL: deterministic movie playback, savestates, correct audio at any libTAS frame rate, libTAS's on-screen display and Stop button, and an optional HUD for TASing. Without the TAS mode turned on, the game runs like the normal port.
 
+> [!TIP]
+> Under WSL, libTAS runs the game on the CPU, which is slow (about 12 fps when fast-forwarding). Once the game is set up, follow the [dozen guide](https://github.com/grindersky/UnleashedRecomp/blob/patches/DOZEN.md) to play back and encode movies on your graphics card instead, several times faster.
+
 The original README follows [below](#unleashed-recompiled).
 
 ## Setting Up the TAS Version
@@ -86,6 +89,9 @@ Choose `out/build/linux-release/UnleashedRecomp/UnleashedRecomp` as the game exe
 - **Runtime → Prevent writing to disk**: on. Playing a movie then can't change your save, so every movie starts from the same save.
 - **Video → Force software rendering**: on. The game then draws with lavapipe, Mesa's renderer that runs on the CPU, which the TAS mode was made and tested with, savestates included.
 - **Input → Mouse support**: off, as the game doesn't use the mouse. **Joystick support**: 1 controller, for analog stick inputs.
+
+> [!TIP]
+> Software rendering is slow. To play back and encode movies on your graphics card, several times faster, set up dozen with the [dozen guide](https://github.com/grindersky/UnleashedRecomp/blob/patches/DOZEN.md). Keep software rendering on while making TASes: savestates haven't been tested on dozen.
 
 Start the game from libTAS and TAS as usual.
 
