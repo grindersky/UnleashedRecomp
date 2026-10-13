@@ -63,17 +63,21 @@ static constexpr uint32_t PATH_RIGID_BODY_COLLISION_BODY_OFFSET = 4;
 // std::map<uint32_t, boost::shared_ptr<...>> at +4 of the player's collision container (+616), its head at +8. Day
 // Sonic switches them by what he does (sub_82353ED8): ID 1 is his body, a cylinder CollisionRadius wide and
 // CollisionStandHeight (or CollisionSquatHeight) high, and the rest touch rings, objects and triggers (the item
-// collision, bigger while boosting, and others). The Werehog's ID 1 is a capsule.
+// collision, bigger while boosting, and others). The Werehog's ID 1 is a capsule. Day Sonic's set-up (sub_82362650)
+// names them as it makes them: Normal, Item, ItemBoost, SquatKick, then Path, ID 5, a capsule that's always on and
+// most likely what touches the game's paths, like the grind rails.
 static constexpr uint32_t PLAYER_OFFSET = 0x100;
 static constexpr uint32_t PLAYER_COLLISIONS_OFFSET = 616;
 static constexpr uint32_t COLLISIONS_HEAD_OFFSET = 8;
 static constexpr uint32_t EVENT_COLLISION_VFTABLE = 0x8202C7B4;
 static constexpr uint32_t EVENT_COLLISION_BODY_OFFSET = 4;
 static constexpr uint32_t BODY_COLLISION_ID = 1;
+static constexpr uint32_t SONIC_PATH_COLLISION_ID = 5;
 
 static const ImU32 RAIL_COLOUR = IM_COL32(255, 140, 0, 130);
 static const ImU32 BODY_COLOUR = IM_COL32(0, 230, 255, 140);
 static const ImU32 TRIGGER_COLOUR = IM_COL32(255, 80, 255, 100);
+static const ImU32 PATH_COLOUR = IM_COL32(60, 90, 255, 110);
 
 static constexpr float PI = std::numbers::pi_v<float>;
 
@@ -506,8 +510,8 @@ static void DrawShape(ImDrawList* drawList, const Projector& projector, const Tr
         DrawSurface(drawList, projector, transform, surface, colour);
 }
 
-// The player's collision that's on: the body and what touches rings, objects and triggers.
-static void DrawPlayerCollision(ImDrawList* drawList, const Projector& projector, uint32_t context)
+// The player's collision that's on: the body, day Sonic's path collision, and what touches rings, objects and triggers.
+static void DrawPlayerCollision(ImDrawList* drawList, const Projector& projector, uint32_t context, bool werehog)
 {
     uint32_t player = LoadU32(context + PLAYER_OFFSET);
     uint32_t container = player != 0 ? LoadU32(player + PLAYER_COLLISIONS_OFFSET) : 0;
@@ -539,7 +543,10 @@ static void DrawPlayerCollision(ImDrawList* drawList, const Projector& projector
     // The body first: the others are around it, and it shows through them.
     std::stable_partition(bodies.begin(), bodies.end(), [](auto& entry) { return entry.first == BODY_COLLISION_ID; });
     for (auto& [id, body] : bodies)
-        DrawShape(drawList, projector, Transform(body), LoadU32(body + RIGID_BODY_SHAPE_OFFSET), id == BODY_COLLISION_ID ? BODY_COLOUR : TRIGGER_COLOUR);
+    {
+        ImU32 colour = id == BODY_COLLISION_ID ? BODY_COLOUR : !werehog && id == SONIC_PATH_COLLISION_ID ? PATH_COLOUR : TRIGGER_COLOUR;
+        DrawShape(drawList, projector, Transform(body), LoadU32(body + RIGID_BODY_SHAPE_OFFSET), colour);
+    }
 }
 
 static const RailMesh& GetRailMesh(uint32_t mesh, uint32_t vertices, uint32_t vertexStride, uint32_t vertexCount, uint32_t indices,
@@ -728,7 +735,7 @@ void CollisionOverlay::Draw()
         std::erase_if(g_railMeshes, [](auto& entry) { return !entry.second.Used; });
     }
 
-    DrawPlayerCollision(drawList, projector, context);
+    DrawPlayerCollision(drawList, projector, context, werehog);
 
     if (projector.DepthTested)
     {
