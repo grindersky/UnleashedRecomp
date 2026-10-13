@@ -142,3 +142,14 @@ PPC_FUNC(sub_82334A50)
 
     __imp__sub_82334A50(ctx, base);
 }
+
+// Sonic's handling of MsgReopenActivity (sub_82354E20), which gives him control back after an event. The title update
+// made it leave him alone while he waits for Ready... GO! (StartEvent) or starts with a dash (StartDash). Before that,
+// restarting a stage during an in-game cutscene let the cutscene's message free him during the countdown, while the
+// stage time still started at GO. RestoreReadyGoSkip brings that back: clearing the check's result makes the handler
+// run as it did before the title update.
+void RestoreReadyGoSkipMidAsmHook(PPCRegister& r29)
+{
+    if (Config::RestoreReadyGoSkip)
+        r29.u64 = 0;
+}

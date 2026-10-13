@@ -1180,3 +1180,10 @@ name = "StageCollisionDebugViewTerrainMidAsmHook"
 address = 0x82564274
 registers = ["r1"]
 jump_address_on_true = 0x82564764
+
+# RestoreReadyGoSkip: undoes the title update's check that keeps Sonic in StartEvent or StartDash when
+# MsgReopenActivity comes (sub_82354E20), by clearing its result.
+[[midasm_hook]]
+name = "RestoreReadyGoSkipMidAsmHook"
+address = 0x82354ECC
+registers = ["r29"]
