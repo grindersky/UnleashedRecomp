@@ -2682,7 +2682,7 @@ index 0000000..f0fb735
 +}
 diff --git a/UnleashedRecomp/ui/collision_overlay.cpp b/UnleashedRecomp/ui/collision_overlay.cpp
 new file mode 100644
-index 0000000..ec347ca
+index 0000000..9aeb4b0
 --- /dev/null
 +++ b/UnleashedRecomp/ui/collision_overlay.cpp
 @@ -0,0 +1,721 @@
@@ -2888,10 +2888,10 @@ index 0000000..ec347ca
 +    return Config::EnableStageCollisionDebugView || Config::EnableEventCollisionDebugView || Config::EnableObjectCollisionDebugView;
 +}
 +
-+// F12 switches between drawing the overlay over everything and hiding it behind what the game drew, with the game's
-+// depth buffer. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is passed on as a key,
-+// so it goes into the movie like the game's keys.
-+static std::atomic<bool> g_depthTested;
++// The overlay is hidden behind what the game drew, with the game's depth buffer; F12 switches to drawing it over
++// everything and back. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is passed on as a
++// key, so it goes into the movie like the game's keys.
++static std::atomic<bool> g_depthTested{ true };
 +
 +static class CollisionOverlayListener : public SDLEventListener
 +{
@@ -3409,7 +3409,7 @@ index 0000000..ec347ca
 +}
 diff --git a/UnleashedRecomp/ui/collision_overlay.h b/UnleashedRecomp/ui/collision_overlay.h
 new file mode 100644
-index 0000000..2618a1a
+index 0000000..61ba7eb
 --- /dev/null
 +++ b/UnleashedRecomp/ui/collision_overlay.h
 @@ -0,0 +1,18 @@
@@ -3420,8 +3420,8 @@ index 0000000..2618a1a
 +// Draws what the game's collision debug views (the EnableStageCollisionDebugView, EnableEventCollisionDebugView and
 +// EnableObjectCollisionDebugView codes) leave out: with the stage collision view, the grind rails' collision, and with
 +// any of them, the player's collision (day Sonic's or the Werehog's), as see-through solids. Drawn over the frame,
-+// projected with the game's camera; F12 switches between over everything and behind what the game drew (tested
-+// against its depth buffer). It only reads the game's memory.
++// projected with the game's camera, behind what the game drew (tested against its depth buffer); F12 switches to over
++// everything and back. It only reads the game's memory.
 +namespace CollisionOverlay
 +{
 +    bool IsEnabled();
