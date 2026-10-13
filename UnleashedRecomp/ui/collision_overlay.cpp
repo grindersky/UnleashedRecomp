@@ -2,6 +2,7 @@
 #include <api/SWA.h>
 #include <kernel/function.h>
 #include <kernel/memory.h>
+#include <patches/collision_view_patches.h>
 #include <ui/imgui_utils.h>
 #include <ui/tas_hud.h>
 #include <user/config.h>
@@ -11,10 +12,13 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <numbers>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // The game's camera (SWA::CCamera), as its UpdateSerial leaves it: the view matrix at +0x130 and the projection at
@@ -74,10 +78,55 @@ static constexpr uint32_t EVENT_COLLISION_BODY_OFFSET = 4;
 static constexpr uint32_t BODY_COLLISION_ID = 1;
 static constexpr uint32_t SONIC_PATH_COLLISION_ID = 5;
 
+// Sonic's attacks hit what his collision touches. His body (Normal) is a TypePlayer collision that detects TypeEvent
+// ones, the others (Item and the rest, all but Path) TypePlayerItem ones that detect TypeEventItem, TypeEvent and
+// TypeObjectPhysics ones (the filters made in sub_824950C0, and in the set-up). When one touches something
+// (MsgHitEventCollision, sub_82360248) while he has an attack type (sliding sets TypeSonicSliding, sub_8232F950), he
+// damages it: no shape of its own. Setting an attack type also sets this state flag, and removing it clears it.
+static constexpr uint32_t CONTEXT_STATE_FLAGS_OFFSET = 0x4AC;
+static constexpr uint32_t ATTACKING_FLAG = 6;
+
+// What other objects add: event collisions (sub_82516528, sub_82516690 and sub_82516838, which make them with
+// sub_8248F210), and SWA::CRigidBody objects (sub_825146A8). Both are physics units with their Havok object at +4; their
+// base's constructor is sub_824932A8 and its destructor sub_82493098.
+static constexpr uint32_t RIGID_BODY_UNIT_VFTABLE = 0x8200CC68;
+static constexpr uint32_t PHYSICS_UNIT_BODY_OFFSET = 4;
+// Some may be shape phantoms. Like rigid bodies, they keep their shape at +0x10, and their collidable's motion (+0x18)
+// points to their transform (a rigid body's at +0xE0).
+static constexpr uint32_t SIMPLE_SHAPE_PHANTOM_VFTABLE = 0x821280F4;
+static constexpr uint32_t CACHING_SHAPE_PHANTOM_VFTABLE = 0x82125A3C;
+static constexpr uint32_t COLLIDABLE_MOTION_OFFSET = 0x18;
+
+// Shapes made of others, as their methods read them: hkpConvexTranslateShape (its child at +0x18, moved by +0x20),
+// hkpConvexTransformShape (its child at +0x18, transformed by +0x20: columns, then the translation),
+// hkpTransformShape (its child at +0x14, transformed by +0x30) and hkpListShape (its children at +0x18, 16 bytes each
+// with the shape first, how many at +0x1C).
+static constexpr uint32_t CONVEX_TRANSLATE_SHAPE_VFTABLE = 0x8212F4CC;
+static constexpr uint32_t CONVEX_TRANSFORM_SHAPE_VFTABLE = 0x8212F574;
+static constexpr uint32_t TRANSFORM_SHAPE_VFTABLE = 0x8212EA84;
+static constexpr uint32_t LIST_SHAPE_VFTABLE = 0x82130428;
+
+// The player's matrix node (SWA::CMatrixNodeTransform, at +16 of both contexts), whose matrix at +128 (its vfunc 2) has
+// the axes as rows, then the position: his facing is its third row (sub_8230A4E0), and his position is at his feet.
+static constexpr uint32_t CONTEXT_MATRIX_NODE_OFFSET = 16;
+static constexpr uint32_t MATRIX_NODE_MATRIX_OFFSET = 128;
+
+// The arrow along his facing: a flat arrow given some thickness, a little above his feet.
+static constexpr float ARROW_HEIGHT = 0.05f;
+static constexpr float ARROW_THICKNESS = 0.05f;
+static constexpr float ARROW_LENGTH = 1.0f;
+static constexpr float ARROW_HEAD_LENGTH = 0.3f;
+static constexpr float ARROW_HALF_WIDTH = 0.04f;
+static constexpr float ARROW_HEAD_HALF_WIDTH = 0.15f;
+
 static const ImU32 RAIL_COLOUR = IM_COL32(255, 140, 0, 130);
-static const ImU32 BODY_COLOUR = IM_COL32(0, 230, 255, 140);
-static const ImU32 TRIGGER_COLOUR = IM_COL32(255, 80, 255, 100);
-static const ImU32 PATH_COLOUR = IM_COL32(60, 90, 255, 110);
+static const ImU32 BODY_COLOUR = IM_COL32(0, 240, 255, 200);
+static const ImU32 TRIGGER_COLOUR = IM_COL32(255, 80, 255, 85);
+static const ImU32 PATH_COLOUR = IM_COL32(60, 90, 255, 90);
+static const ImU32 ATTACK_COLOUR = IM_COL32(60, 255, 90, 100);
+static const ImU32 ENEMY_COLOUR = IM_COL32(255, 40, 40, 110);
+static const ImU32 GOAL_COLOUR = IM_COL32(255, 255, 255, 110);
+static const ImU32 ARROW_COLOUR = IM_COL32(255, 255, 255, 240);
 
 static constexpr float PI = std::numbers::pi_v<float>;
 
@@ -151,18 +200,38 @@ static Vector3 LoadVector(uint32_t address)
     return { LoadFloat(address), LoadFloat(address + 4), LoadFloat(address + 8) };
 }
 
-// A rigid body's transform.
+// A transform as Havok keeps it: the rotation's columns, then the translation.
 struct Transform
 {
-    Vector3 columns[3];
-    Vector3 translation;
+    Vector3 columns[3] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
+    Vector3 translation{};
 
-    explicit Transform(uint32_t body)
+    Transform() = default;
+
+    // A rigid body's.
+    explicit Transform(uint32_t body) : Transform(At(body + RIGID_BODY_TRANSFORM_OFFSET))
     {
-        for (int i = 0; i < 3; i++)
-            columns[i] = LoadVector(body + RIGID_BODY_TRANSFORM_OFFSET + i * 16);
+    }
 
-        translation = LoadVector(body + RIGID_BODY_TRANSFORM_OFFSET + 48);
+    static Transform At(uint32_t address)
+    {
+        Transform transform;
+        for (int i = 0; i < 3; i++)
+            transform.columns[i] = LoadVector(address + i * 16);
+
+        transform.translation = LoadVector(address + 48);
+        return transform;
+    }
+
+    // Another transform, in this one's space.
+    Transform operator*(const Transform& other) const
+    {
+        Transform result;
+        for (int i = 0; i < 3; i++)
+            result.columns[i] = Rotate(other.columns[i]);
+
+        result.translation = (*this)(other.translation);
+        return result;
     }
 
     Vector3 operator()(const Vector3& p) const
@@ -256,6 +325,155 @@ PPC_FUNC(sub_822E4290)
     }
 
     __imp__sub_822E4290(ctx, base);
+}
+
+// The objects whose collision is drawn: the enemies (any class with "Enemy" in its name among the object's classes,
+// like SWA::CSonicEnemyBase, the CEnemy* classes, their shots and weapons, and SWA::EvilEnemy::IEvilEnemy) and the goal
+// ring (SWA::CObjGoalRing). Only what the game's views don't draw: they decide as it's added, the event collision view
+// (ms_IsTriggerRender, read by the event collision helpers) for event collisions, the object collision view
+// (ms_IsObjectCollisionRender, read by sub_825146A8) for rigid bodies.
+enum class ObjectKind
+{
+    None,
+    Enemy,
+    GoalRing
+};
+
+// The physics units those objects added, until they're destroyed. The game adds them on its own threads.
+static std::mutex g_unitsMutex;
+static std::unordered_map<uint32_t, ObjectKind> g_units;
+static std::unordered_map<uint32_t, ObjectKind> g_objectKinds;
+
+// The object adding an event collision.
+static thread_local uint32_t g_eventCollisionOwner;
+
+// An object's kind, from its classes in the game's RTTI: its vtable is preceded by its complete object locator, whose
+// class hierarchy (+16) lists its classes (+12, how many at +8), each with its type descriptor first, whose mangled name
+// is at +8. Called with g_unitsMutex held.
+static ObjectKind GetObjectKind(uint32_t object)
+{
+    uint32_t vftable = LoadU32(object);
+    auto it = g_objectKinds.find(vftable);
+    if (it != g_objectKinds.end())
+        return it->second;
+
+    ObjectKind kind = ObjectKind::None;
+    uint32_t hierarchy = LoadU32(LoadU32(vftable - 4) + 16);
+    uint32_t count = LoadU32(hierarchy + 8);
+    uint32_t classes = LoadU32(hierarchy + 12);
+    if (vftable >= PPC_IMAGE_BASE && vftable < PPC_IMAGE_BASE + PPC_IMAGE_SIZE && count < 64)
+    {
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint32_t descriptor = LoadU32(LoadU32(classes + i * 4));
+            if (descriptor < PPC_IMAGE_BASE || descriptor >= PPC_IMAGE_BASE + PPC_IMAGE_SIZE)
+                break;
+
+            auto text = reinterpret_cast<const char*>(g_memory.Translate(descriptor + 8));
+            std::string_view name(text, strnlen(text, 128));
+            if (i == 0 && name == ".?AVCObjGoalRing@SWA@@")
+            {
+                kind = ObjectKind::GoalRing;
+                break;
+            }
+
+            if (name.find("Enemy") != std::string_view::npos)
+            {
+                kind = ObjectKind::Enemy;
+                break;
+            }
+        }
+    }
+
+    g_objectKinds.emplace(vftable, kind);
+    return kind;
+}
+
+static void TrackUnit(uint32_t object, uint32_t unit)
+{
+    if (!CollisionOverlay::IsEnabled() || !IsReadable(object) || !IsReadable(unit))
+        return;
+
+    std::lock_guard lock(g_unitsMutex);
+    ObjectKind kind = GetObjectKind(object);
+    if (kind != ObjectKind::None)
+        g_units[unit] = kind;
+}
+
+static bool IsViewOn(const bool* view)
+{
+    return view != nullptr && *view;
+}
+
+static void ForgetUnit(uint32_t unit)
+{
+    if (!CollisionOverlay::IsEnabled())
+        return;
+
+    std::lock_guard lock(g_unitsMutex);
+    g_units.erase(unit);
+}
+
+// The helpers objects (r3) add event collisions with.
+PPC_FUNC_IMPL(__imp__sub_82516528);
+PPC_FUNC(sub_82516528)
+{
+    uint32_t owner = std::exchange(g_eventCollisionOwner, ctx.r3.u32);
+    __imp__sub_82516528(ctx, base);
+    g_eventCollisionOwner = owner;
+}
+
+PPC_FUNC_IMPL(__imp__sub_82516690);
+PPC_FUNC(sub_82516690)
+{
+    uint32_t owner = std::exchange(g_eventCollisionOwner, ctx.r3.u32);
+    __imp__sub_82516690(ctx, base);
+    g_eventCollisionOwner = owner;
+}
+
+PPC_FUNC_IMPL(__imp__sub_82516838);
+PPC_FUNC(sub_82516838)
+{
+    uint32_t owner = std::exchange(g_eventCollisionOwner, ctx.r3.u32);
+    __imp__sub_82516838(ctx, base);
+    g_eventCollisionOwner = owner;
+}
+
+// Makes an event collision (SWA::CEventCollision) into the shared_ptr at r3.
+PPC_FUNC_IMPL(__imp__sub_8248F210);
+PPC_FUNC(sub_8248F210)
+{
+    uint32_t collision = ctx.r3.u32;
+    __imp__sub_8248F210(ctx, base);
+
+    if (g_eventCollisionOwner != 0 && !IsViewOn(SWA::SGlobals::ms_IsTriggerRender))
+        TrackUnit(g_eventCollisionOwner, LoadU32(collision));
+}
+
+// An object (r3) adds a SWA::CRigidBody (the shared_ptr at r4).
+PPC_FUNC_IMPL(__imp__sub_825146A8);
+PPC_FUNC(sub_825146A8)
+{
+    if (!IsViewOn(SWA::SGlobals::ms_IsObjectCollisionRender))
+        TrackUnit(ctx.r3.u32, LoadU32(ctx.r4.u32));
+
+    __imp__sub_825146A8(ctx, base);
+}
+
+// The physics units' base constructor and destructor: forget the units that are gone, and the new ones made where they
+// were.
+PPC_FUNC_IMPL(__imp__sub_824932A8);
+PPC_FUNC(sub_824932A8)
+{
+    ForgetUnit(ctx.r3.u32);
+    __imp__sub_824932A8(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82493098);
+PPC_FUNC(sub_82493098)
+{
+    ForgetUnit(ctx.r3.u32);
+    __imp__sub_82493098(ctx, base);
 }
 
 namespace
@@ -503,11 +721,120 @@ static void DrawSurface(ImDrawList* drawList, const Projector& projector, const 
     }
 }
 
-static void DrawShape(ImDrawList* drawList, const Projector& projector, const Transform& transform, uint32_t shape, ImU32 colour)
+static void DrawShape(ImDrawList* drawList, const Projector& projector, const Transform& transform, uint32_t shape, ImU32 colour,
+    int depth = 0)
 {
+    if (depth > 4 || !IsReadable(shape))
+        return;
+
+    uint32_t vftable = LoadU32(shape);
+    if (vftable == CONVEX_TRANSLATE_SHAPE_VFTABLE)
+    {
+        Transform translation;
+        translation.translation = LoadVector(shape + 0x20);
+        DrawShape(drawList, projector, transform * translation, LoadU32(shape + 0x18), colour, depth + 1);
+        return;
+    }
+
+    if (vftable == CONVEX_TRANSFORM_SHAPE_VFTABLE)
+    {
+        DrawShape(drawList, projector, transform * Transform::At(shape + 0x20), LoadU32(shape + 0x18), colour, depth + 1);
+        return;
+    }
+
+    if (vftable == TRANSFORM_SHAPE_VFTABLE)
+    {
+        DrawShape(drawList, projector, transform * Transform::At(shape + 0x30), LoadU32(shape + 0x14), colour, depth + 1);
+        return;
+    }
+
+    if (vftable == LIST_SHAPE_VFTABLE)
+    {
+        uint32_t children = LoadU32(shape + 0x18);
+        uint32_t count = std::min(LoadU32(shape + 0x1C), 64u);
+        for (uint32_t i = 0; i < count; i++)
+            DrawShape(drawList, projector, transform, LoadU32(children + i * 16), colour, depth + 1);
+
+        return;
+    }
+
     Surface surface;
     if (BuildShape(surface, shape))
         DrawSurface(drawList, projector, transform, surface, colour);
+}
+
+static bool IsAttacking(uint32_t context)
+{
+    uint32_t flags = LoadU32(context + CONTEXT_STATE_FLAGS_OFFSET);
+    return flags != 0 && LoadU8(LoadU32(flags + 4) + ATTACKING_FLAG) != 0;
+}
+
+// A rigid body or shape phantom in the world, where it is now; false if it isn't one, or isn't in the world.
+static bool GetCollidable(uint32_t body, Transform& transform, uint32_t& shape)
+{
+    uint32_t vftable = LoadU32(body);
+    if (vftable != RIGID_BODY_VFTABLE && vftable != SIMPLE_SHAPE_PHANTOM_VFTABLE && vftable != CACHING_SHAPE_PHANTOM_VFTABLE)
+        return false;
+
+    uint32_t motion = LoadU32(body + COLLIDABLE_MOTION_OFFSET);
+    if (LoadU32(body + RIGID_BODY_WORLD_OFFSET) == 0 || !IsReadable(motion))
+        return false;
+
+    transform = Transform::At(motion);
+    shape = LoadU32(body + RIGID_BODY_SHAPE_OFFSET);
+    return true;
+}
+
+// A solid arrow from the player's feet along his facing, a little above them: the flat arrow's outline, given thickness.
+static void DrawFacingArrow(ImDrawList* drawList, const Projector& projector, uint32_t context)
+{
+    uint32_t node = LoadU32(context + CONTEXT_MATRIX_NODE_OFFSET);
+    if (!IsReadable(node))
+        return;
+
+    uint32_t matrix = node + MATRIX_NODE_MATRIX_OFFSET;
+    Vector3 up = LoadVector(matrix + 16);
+    Vector3 front = LoadVector(matrix + 32);
+    Vector3 position = LoadVector(matrix + 48);
+    if (!(Length(up) > 0.5f) || !(Length(front) > 0.5f) || !std::isfinite(Length(position)))
+        return;
+
+    up = Normalised(up);
+    front = Normalised(front);
+    Vector3 side = Normalised(Cross(up, front));
+
+    // The outline, counterclockwise from the back of the shaft (along the facing, then to the side), so each edge's
+    // outside is to its right.
+    constexpr float NECK = ARROW_LENGTH - ARROW_HEAD_LENGTH;
+    constexpr std::array<std::array<float, 2>, 7> OUTLINE =
+    { {
+        { 0.0f, -ARROW_HALF_WIDTH }, { NECK, -ARROW_HALF_WIDTH }, { NECK, -ARROW_HEAD_HALF_WIDTH }, { ARROW_LENGTH, 0.0f },
+        { NECK, ARROW_HEAD_HALF_WIDTH }, { NECK, ARROW_HALF_WIDTH }, { 0.0f, ARROW_HALF_WIDTH },
+    } };
+
+    Vector3 bottom = position + up * ARROW_HEIGHT;
+    Vector3 top = bottom + up * ARROW_THICKNESS;
+    auto at = [&](const Vector3& base, int i) { return base + front * OUTLINE[i][0] + side * OUTLINE[i][1]; };
+
+    // The top and the bottom: the shaft, then the head.
+    for (auto [base, outside] : { std::pair{ top, up }, std::pair{ bottom, up * -1.0f } })
+    {
+        DrawFace(drawList, projector, at(base, 0), at(base, 1), at(base, 5), outside, ARROW_COLOUR);
+        DrawFace(drawList, projector, at(base, 0), at(base, 5), at(base, 6), outside, ARROW_COLOUR);
+        DrawFace(drawList, projector, at(base, 2), at(base, 3), at(base, 4), outside, ARROW_COLOUR);
+    }
+
+    // The sides.
+    for (int i = 0; i < int(OUTLINE.size()); i++)
+    {
+        int next = (i + 1) % int(OUTLINE.size());
+        float dx = OUTLINE[next][0] - OUTLINE[i][0];
+        float dy = OUTLINE[next][1] - OUTLINE[i][1];
+        Vector3 outside = front * dy - side * dx;
+
+        DrawFace(drawList, projector, at(bottom, i), at(bottom, next), at(top, next), outside, ARROW_COLOUR);
+        DrawFace(drawList, projector, at(bottom, i), at(top, next), at(top, i), outside, ARROW_COLOUR);
+    }
 }
 
 // The player's collision that's on: the body, day Sonic's path collision, and what touches rings, objects and triggers.
@@ -540,12 +867,46 @@ static void DrawPlayerCollision(ImDrawList* drawList, const Projector& projector
             bodies.emplace_back(LoadU32(node + 12), body);
     }
 
-    // The body first: the others are around it, and it shows through them.
-    std::stable_partition(bodies.begin(), bodies.end(), [](auto& entry) { return entry.first == BODY_COLLISION_ID; });
+    // While day Sonic attacks (a slide, say), the collision around his body is what reaches enemies first.
+    bool attacking = !werehog && IsAttacking(context);
+
+    // The body last, over the others around it, so it stands out.
+    std::stable_partition(bodies.begin(), bodies.end(), [](auto& entry) { return entry.first != BODY_COLLISION_ID; });
     for (auto& [id, body] : bodies)
     {
-        ImU32 colour = id == BODY_COLLISION_ID ? BODY_COLOUR : !werehog && id == SONIC_PATH_COLLISION_ID ? PATH_COLOUR : TRIGGER_COLOUR;
+        ImU32 colour = id == BODY_COLLISION_ID ? BODY_COLOUR : !werehog && id == SONIC_PATH_COLLISION_ID ? PATH_COLOUR :
+            attacking ? ATTACK_COLOUR : TRIGGER_COLOUR;
         DrawShape(drawList, projector, Transform(body), LoadU32(body + RIGID_BODY_SHAPE_OFFSET), colour);
+    }
+}
+
+// How far other objects' collision is drawn.
+static constexpr float OBJECT_DRAW_DISTANCE = 150.0f;
+
+// The collision of the enemies and of the goal ring that's on.
+static void DrawObjectCollision(ImDrawList* drawList, const Projector& projector)
+{
+    std::vector<std::pair<uint32_t, ObjectKind>> units;
+    {
+        std::lock_guard lock(g_unitsMutex);
+        units.assign(g_units.begin(), g_units.end());
+    }
+
+    for (auto& [unit, kind] : units)
+    {
+        uint32_t unitVftable = LoadU32(unit);
+        if (unitVftable != EVENT_COLLISION_VFTABLE && unitVftable != RIGID_BODY_UNIT_VFTABLE)
+            continue;
+
+        Transform transform;
+        uint32_t shape;
+        if (!GetCollidable(LoadU32(unit + PHYSICS_UNIT_BODY_OFFSET), transform, shape) ||
+            Length(transform.translation - projector.Eye) > OBJECT_DRAW_DISTANCE)
+        {
+            continue;
+        }
+
+        DrawShape(drawList, projector, transform, shape, kind == ObjectKind::GoalRing ? GOAL_COLOUR : ENEMY_COLOUR);
     }
 }
 
@@ -675,7 +1036,8 @@ static void DrawRail(ImDrawList* drawList, const Projector& projector, uint32_t 
 
 void CollisionOverlay::Draw()
 {
-    if (!IsEnabled())
+    // Hidden with the views (F11).
+    if (!IsEnabled() || !CollisionView::IsShown())
         return;
 
     // Only in levels, with the camera that was updated last.
@@ -735,7 +1097,9 @@ void CollisionOverlay::Draw()
         std::erase_if(g_railMeshes, [](auto& entry) { return !entry.second.Used; });
     }
 
+    DrawObjectCollision(drawList, projector);
     DrawPlayerCollision(drawList, projector, context, werehog);
+    DrawFacingArrow(drawList, projector, context);
 
     if (projector.DepthTested)
     {
