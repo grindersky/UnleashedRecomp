@@ -1,5 +1,5 @@
 diff --git a/UnleashedRecomp/CMakeLists.txt b/UnleashedRecomp/CMakeLists.txt
-index 01e040a..8280bf0 100644
+index 01e040a..6926fb7 100644
 --- a/UnleashedRecomp/CMakeLists.txt
 +++ b/UnleashedRecomp/CMakeLists.txt
 @@ -113,6 +113,7 @@ set(UNLEASHED_RECOMP_CPU_CXX_SOURCES
@@ -10,7 +10,15 @@ index 01e040a..8280bf0 100644
      "gpu/imgui/imgui_common.cpp"
      "gpu/imgui/imgui_font_builder.cpp"
      "gpu/imgui/imgui_snapshot.cpp"
-@@ -145,6 +146,7 @@ set(UNLEASHED_RECOMP_PATCHES_CXX_SOURCES
+@@ -137,6 +138,7 @@ set(UNLEASHED_RECOMP_PATCHES_CXX_SOURCES
+     "patches/CHudPause_patches.cpp"
+     "patches/CTitleStateIntro_patches.cpp"
+     "patches/CTitleStateMenu_patches.cpp"
++    "patches/collision_view_patches.cpp"
+     "patches/fps_patches.cpp"
+     "patches/frontend_listener.cpp"
+     "patches/input_patches.cpp"
+@@ -145,6 +147,7 @@ set(UNLEASHED_RECOMP_PATCHES_CXX_SOURCES
      "patches/object_patches.cpp"
      "patches/player_patches.cpp"
      "patches/resident_patches.cpp"
@@ -18,7 +26,7 @@ index 01e040a..8280bf0 100644
      "patches/video_patches.cpp"
  )
  
-@@ -153,6 +155,7 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
+@@ -153,6 +156,7 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
      "ui/achievement_overlay.cpp"
      "ui/black_bar.cpp"
      "ui/button_guide.cpp"
@@ -26,7 +34,7 @@ index 01e040a..8280bf0 100644
      "ui/fader.cpp"
      "ui/game_window.cpp"
      "ui/imgui_utils.cpp"
-@@ -160,6 +163,7 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
+@@ -160,6 +164,7 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
      "ui/message_window.cpp"
      "ui/options_menu.cpp"
      "ui/options_menu_thumbnails.cpp"
@@ -34,7 +42,7 @@ index 01e040a..8280bf0 100644
      "ui/tv_static.cpp"
  )
  
-@@ -228,6 +232,7 @@ set(UNLEASHED_RECOMP_CXX_SOURCES
+@@ -228,6 +233,7 @@ set(UNLEASHED_RECOMP_CXX_SOURCES
      "preload_executable.cpp"
      "sdl_listener.cpp"
      "stdafx.cpp"
@@ -42,7 +50,7 @@ index 01e040a..8280bf0 100644
      "version.cpp"
      
      ${UNLEASHED_RECOMP_KERNEL_CXX_SOURCES}
-@@ -413,6 +418,10 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+@@ -413,6 +419,10 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
      find_package(X11 REQUIRED)
      target_include_directories(UnleashedRecomp PRIVATE ${X11_INCLUDE_DIR})
      target_link_libraries(UnleashedRecomp PRIVATE ${X11_LIBRARIES})
@@ -539,7 +547,7 @@ index 0000000..956be45
 +    void GetWindowPixelSize(uint32_t& width, uint32_t& height) const;
 +};
 diff --git a/UnleashedRecomp/gpu/video.cpp b/UnleashedRecomp/gpu/video.cpp
-index a9edd0b..7eb6aef 100644
+index a9edd0b..1d12ec0 100644
 --- a/UnleashedRecomp/gpu/video.cpp
 +++ b/UnleashedRecomp/gpu/video.cpp
 @@ -3,6 +3,7 @@
@@ -575,7 +583,107 @@ index a9edd0b..7eb6aef 100644
  static bool g_triangleStripWorkaround = false;
  
  static bool g_hardwareResolve = true;
-@@ -1806,6 +1813,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
+@@ -383,6 +390,20 @@ static std::unique_ptr<RenderTextureView> g_blankTextureViews[TEXTURE_DESCRIPTOR
+ 
+ static TextureDescriptorAllocator g_textureDescriptorAllocator;
+ 
++// The collision debug views draw with DebugHavokPrimitiveTexNrm (any of its variants), which tints its texture (s0) by
++// each collision's colour. That texture, HavokRenderBlock.dds, a grey 2x2 checker with soft edges, is only in the
++// action stages' archive (ActionCommon.ar), so elsewhere (towns, say) the shader read whatever texture earlier draws
++// had left. Draw with a copy of the checker instead, everywhere, and give the texture that was there back afterwards.
++static constexpr XXH64_hash_t DEBUG_HAVOK_PRIMITIVE_SHADER_HASHES[] =
++{
++    0x5990016B666631DA, 0x8C4DE27769FE5C89, 0x91F8461807AD0626, 0x632295E78DE9CB33,
++    0xE550AE4BCBF42BBE, 0x36AC066D27DC1026, 0xFED92627A5611E78, 0x24E400DB094550BC,
++};
++
++static std::unique_ptr<GuestTexture> g_havokRenderBlockTexture;
++static bool g_havokRenderBlockBound;
++static uint32_t g_havokRenderBlockReplaced;
++
+ static std::unique_ptr<RenderPipelineLayout> g_pipelineLayout;
+ static xxHashMap<std::unique_ptr<RenderPipeline>> g_pipelines;
+ 
+@@ -1527,6 +1548,78 @@ static void CreateImGuiBackend()
+ #endif
+ }
+ 
++// The checker the collision debug views draw with (see g_havokRenderBlockTexture), made to look like HavokRenderBlock.dds:
++// 64-texel squares, dark in the top left, each fading to a slightly darker edge over its outer 12 texels, with mipmaps.
++static void CreateHavokRenderBlockTexture()
++{
++    constexpr uint32_t SIZE = 128;
++    constexpr uint32_t MIP_LEVELS = 8;
++    constexpr uint32_t SQUARE = 64;
++    constexpr float BEVEL = 12.0f;
++    constexpr float DARK[3] = { 139.0f, 142.0f, 148.0f };
++    constexpr float DARK_EDGE[3] = { 131.0f, 134.0f, 139.0f };
++    constexpr float LIGHT[3] = { 160.0f, 164.0f, 172.0f };
++    constexpr float LIGHT_EDGE[3] = { 150.0f, 153.0f, 160.0f };
++
++    std::vector<std::vector<uint8_t>> mips(1, std::vector<uint8_t>(SIZE * SIZE * 4));
++    for (uint32_t y = 0; y < SIZE; y++)
++    {
++        for (uint32_t x = 0; x < SIZE; x++)
++        {
++            bool light = ((x / SQUARE) + (y / SQUARE)) % 2 == 1;
++            uint32_t squareX = x % SQUARE;
++            uint32_t squareY = y % SQUARE;
++            uint32_t edgeDistance = std::min({ squareX, squareY, SQUARE - 1 - squareX, SQUARE - 1 - squareY });
++            float t = std::min(float(edgeDistance) / BEVEL, 1.0f);
++            t = t * t * (3.0f - 2.0f * t);
++
++            uint8_t* pixel = &mips[0][(y * SIZE + x) * 4];
++            for (int i = 0; i < 3; i++)
++            {
++                float edge = light ? LIGHT_EDGE[i] : DARK_EDGE[i];
++                float inside = light ? LIGHT[i] : DARK[i];
++                pixel[i] = uint8_t(std::lround(edge + (inside - edge) * t));
++            }
++
++            pixel[3] = 255;
++        }
++    }
++
++    // Each mipmap averages 2x2 texels of the one above.
++    for (uint32_t level = 1, size = SIZE / 2; level < MIP_LEVELS; level++, size /= 2)
++    {
++        const auto& above = mips.back();
++        std::vector<uint8_t> mip(size * size * 4);
++        for (uint32_t y = 0; y < size; y++)
++        {
++            for (uint32_t x = 0; x < size; x++)
++            {
++                for (uint32_t i = 0; i < 4; i++)
++                {
++                    uint32_t sum = above[((y * 2) * size * 2 + x * 2) * 4 + i] + above[((y * 2) * size * 2 + x * 2 + 1) * 4 + i] +
++                        above[((y * 2 + 1) * size * 2 + x * 2) * 4 + i] + above[((y * 2 + 1) * size * 2 + x * 2 + 1) * 4 + i];
++                    mip[(y * size + x) * 4 + i] = uint8_t((sum + 2) / 4);
++                }
++            }
++        }
++
++        mips.push_back(std::move(mip));
++    }
++
++    ddspp::Header header;
++    ddspp::HeaderDXT10 headerDX10;
++    ddspp::encode_header(ddspp::R8G8B8A8_UNORM, SIZE, SIZE, 1, ddspp::Texture2D, MIP_LEVELS, 1, header, headerDX10);
++
++    std::vector<uint8_t> dds(sizeof(ddspp::DDS_MAGIC) + sizeof(header) + sizeof(headerDX10));
++    memcpy(dds.data(), &ddspp::DDS_MAGIC, sizeof(ddspp::DDS_MAGIC));
++    memcpy(dds.data() + sizeof(ddspp::DDS_MAGIC), &header, sizeof(header));
++    memcpy(dds.data() + sizeof(ddspp::DDS_MAGIC) + sizeof(header), &headerDX10, sizeof(headerDX10));
++    for (const auto& mip : mips)
++        dds.insert(dds.end(), mip.begin(), mip.end());
++
++    g_havokRenderBlockTexture = LoadTexture(dds.data(), dds.size());
++}
++
+ static void CheckSwapChain()
+ {
+     g_swapChain->setVsyncEnabled(Config::VSync);
+@@ -1806,6 +1899,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
  
      g_capabilities = g_device->getCapabilities();
  
@@ -585,7 +693,7 @@ index a9edd0b..7eb6aef 100644
      LoadEmbeddedResources();
  
      constexpr uint64_t LowEndMemoryLimit = 2048ULL * 1024ULL * 1024ULL;
-@@ -1875,7 +1885,11 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
+@@ -1875,7 +1971,11 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
          break;
      }
  
@@ -598,7 +706,15 @@ index a9edd0b..7eb6aef 100644
      g_swapChain->setVsyncEnabled(Config::VSync);
      g_swapChainValid = !g_swapChain->needsResize();
  
-@@ -2146,8 +2160,14 @@ static uint32_t CreateDevice(uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
+@@ -2035,6 +2135,7 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
+     g_enhancedMotionBlurShader->shader = CREATE_SHADER(enhanced_motion_blur_ps);
+ 
+     CreateImGuiBackend();
++    CreateHavokRenderBlockTexture();
+ 
+     auto gammaCorrectionShader = CREATE_SHADER(gamma_correction_ps);
+ 
+@@ -2146,8 +2247,14 @@ static uint32_t CreateDevice(uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
      return 0;
  }
  
@@ -613,7 +729,7 @@ index a9edd0b..7eb6aef 100644
      RenderCommand cmd;
      cmd.type = RenderCommandType::DestructResource;
      cmd.destructResource.resource = resource;
-@@ -2603,6 +2623,8 @@ static void DrawImGui()
+@@ -2603,6 +2710,8 @@ static void DrawImGui()
      assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
  
      DrawFPS();
@@ -622,7 +738,7 @@ index a9edd0b..7eb6aef 100644
      DrawProfiler();
      ImGui::Render();
  
-@@ -2787,9 +2809,17 @@ void Video::WaitOnSwapChain()
+@@ -2787,9 +2896,17 @@ void Video::WaitOnSwapChain()
  
  static bool g_shouldPrecompilePipelines;
  static std::atomic<bool> g_executedCommandList;
@@ -641,7 +757,7 @@ index a9edd0b..7eb6aef 100644
      g_readyForCommands = false;
  
      RenderCommand cmd;
-@@ -2802,9 +2832,13 @@ void Video::Present()
+@@ -2802,9 +2919,13 @@ void Video::Present()
      g_renderQueue.enqueue(cmd);
  
      // All the shaders are available at this point. We can precompile embedded PSOs then.
@@ -656,7 +772,7 @@ index a9edd0b..7eb6aef 100644
          g_shouldPrecompilePipelines = false;
      }
  
-@@ -2824,6 +2858,10 @@ void Video::Present()
+@@ -2824,6 +2945,10 @@ void Video::Present()
          g_swapChainValid = g_swapChain->present(g_backBufferIndex, signalSemaphores, std::size(signalSemaphores));
      }
  
@@ -667,7 +783,7 @@ index a9edd0b..7eb6aef 100644
      g_pendingWaitOnSwapChain = true;
  
      g_frame = g_nextFrame;
-@@ -2853,7 +2891,17 @@ void Video::Present()
+@@ -2853,7 +2978,17 @@ void Video::Present()
      cmd.type = RenderCommandType::BeginCommandList;
      g_renderQueue.enqueue(cmd);
  
@@ -686,7 +802,7 @@ index a9edd0b..7eb6aef 100644
      {
          using namespace std::chrono_literals;
  
-@@ -2977,7 +3025,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
+@@ -2977,7 +3112,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
      commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
      commandList->end();
  
@@ -696,7 +812,7 @@ index a9edd0b..7eb6aef 100644
      {
          const RenderCommandList *commandLists[] = { commandList.get() };
          RenderCommandSemaphore *waitSemaphores[] = { g_acquireSemaphores[g_frame].get() };
-@@ -3004,6 +3053,9 @@ static void ProcBeginCommandList(const RenderCommand& cmd)
+@@ -3004,6 +3140,9 @@ static void ProcBeginCommandList(const RenderCommand& cmd)
  {
      DestructTempResources();
      BeginCommandList();
@@ -706,7 +822,7 @@ index a9edd0b..7eb6aef 100644
  }
  
  static GuestSurface* GetBackBuffer() 
-@@ -3343,8 +3395,21 @@ static void ProcSetRenderTarget(const RenderCommand& cmd)
+@@ -3343,8 +3482,21 @@ static void ProcSetRenderTarget(const RenderCommand& cmd)
      SetAlphaTestMode((g_pipelineState.specConstants & (SPEC_CONSTANT_ALPHA_TEST | SPEC_CONSTANT_ALPHA_TO_COVERAGE)) != 0);
  }
  
@@ -728,7 +844,68 @@ index a9edd0b..7eb6aef 100644
      RenderCommand cmd;
      cmd.type = RenderCommandType::SetDepthStencilSurface;
      cmd.setDepthStencilSurface.depthStencil = depthStencil;
-@@ -4512,6 +4577,12 @@ static void FlushRenderStateForRenderThread()
+@@ -3773,6 +3925,9 @@ static void SetTexture(GuestDevice* device, uint32_t index, GuestTexture* textur
+ 
+ static void SetTextureInRenderThread(uint32_t index, GuestTexture* texture)
+ {
++    if (index == 0)
++        g_havokRenderBlockBound = false;
++
+     AddBarrier(texture, RenderTextureLayout::SHADER_READ);
+ 
+     auto viewDimension = texture != nullptr ? texture->viewDimension : RenderTextureViewDimension::UNKNOWN;
+@@ -3797,6 +3952,9 @@ static void SetTextureInRenderThread(uint32_t index, GuestTexture* texture)
+ 
+ static void SetSurface(uint32_t index, GuestSurface* surface)
+ {
++    if (index == 0)
++        g_havokRenderBlockBound = false;
++
+     AddBarrier(surface, RenderTextureLayout::SHADER_READ);
+ 
+     SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[index], surface->descriptorIndex);
+@@ -4454,8 +4612,40 @@ static void ProcAddPipeline(const RenderCommand& cmd)
+ static constexpr int32_t COMMON_DEPTH_BIAS_VALUE = int32_t((1 << 24) * 0.002f);
+ static constexpr float COMMON_SLOPE_SCALED_DEPTH_BIAS_VALUE = 1.0f;
+ 
++static bool IsDebugHavokPrimitiveShader(const GuestShader* shader)
++{
++    if (shader == nullptr || shader->shaderCacheEntry == nullptr)
++        return false;
++
++    auto end = std::end(DEBUG_HAVOK_PRIMITIVE_SHADER_HASHES);
++    return std::find(std::begin(DEBUG_HAVOK_PRIMITIVE_SHADER_HASHES), end, shader->shaderCacheEntry->hash) != end;
++}
++
++// While a collision debug view draws, its texture is the checker (see g_havokRenderBlockTexture).
++static void SetHavokRenderBlockTexture()
++{
++    bool debugHavokPrimitive = g_havokRenderBlockTexture != nullptr && IsDebugHavokPrimitiveShader(g_pipelineState.pixelShader);
++    if (debugHavokPrimitive == g_havokRenderBlockBound)
++        return;
++
++    if (debugHavokPrimitive)
++    {
++        AddBarrier(g_havokRenderBlockTexture.get(), RenderTextureLayout::SHADER_READ);
++        g_havokRenderBlockReplaced = g_sharedConstants.texture2DIndices[0];
++        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[0], g_havokRenderBlockTexture->descriptorIndex);
++    }
++    else
++    {
++        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[0], g_havokRenderBlockReplaced);
++    }
++
++    g_havokRenderBlockBound = debugHavokPrimitive;
++}
++
+ static void FlushRenderStateForRenderThread()
+ {
++    SetHavokRenderBlockTexture();
++
+     auto renderTarget = g_pipelineState.colorWriteEnable ? g_renderTarget : nullptr;
+     auto depthStencil = g_pipelineState.zEnable ? g_depthStencil : nullptr;
+ 
+@@ -4512,6 +4702,12 @@ static void FlushRenderStateForRenderThread()
          // D3D12 resets the depth bias values. Check if they need to be set again.
          if (g_capabilities.dynamicDepthBias && !g_vulkan)
              g_dirtyStates.depthBias = (g_depthBias != g_pipelineState.depthBias) || (g_slopeScaledDepthBias != g_pipelineState.slopeScaledDepthBias);
@@ -741,7 +918,7 @@ index a9edd0b..7eb6aef 100644
      }
  
      if (g_dirtyStates.depthBias && g_capabilities.dynamicDepthBias)
-@@ -6947,6 +7018,23 @@ PPC_FUNC(sub_825369A0)
+@@ -6947,6 +7143,23 @@ PPC_FUNC(sub_825369A0)
      assert(std::this_thread::get_id() == g_mainThreadId);
  
      // Wait for pipeline compilations to finish.
@@ -765,7 +942,7 @@ index a9edd0b..7eb6aef 100644
      uint32_t value;
      while ((value = g_compilingPipelineTaskCount.load()) != 0)
      {
-@@ -6961,10 +7049,28 @@ PPC_FUNC(sub_825369A0)
+@@ -6961,10 +7174,28 @@ PPC_FUNC(sub_825369A0)
      __imp__sub_825369A0(ctx, base);
  }
  
@@ -795,7 +972,7 @@ index a9edd0b..7eb6aef 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -6978,7 +7084,9 @@ PPC_FUNC(sub_82E2EFB0)
+@@ -6978,7 +7209,9 @@ PPC_FUNC(sub_82E2EFB0)
  // CTerrainModelData::CheckMadeAll
  PPC_FUNC_IMPL(__imp__sub_82E243D8);
  PPC_FUNC(sub_82E243D8)
@@ -806,7 +983,7 @@ index a9edd0b..7eb6aef 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -6992,7 +7100,9 @@ PPC_FUNC(sub_82E243D8)
+@@ -6992,7 +7225,9 @@ PPC_FUNC(sub_82E243D8)
  // CParticleMaterial::CheckMadeAll
  PPC_FUNC_IMPL(__imp__sub_82E87598);
  PPC_FUNC(sub_82E87598)
@@ -817,7 +994,7 @@ index a9edd0b..7eb6aef 100644
      if (reinterpret_cast<Hedgehog::Database::CDatabaseData*>(base + ctx.r3.u32)->m_Flags & eDatabaseDataFlags_CompilingPipelines)
      {
          ctx.r3.u64 = 0;
-@@ -7005,6 +7115,12 @@ PPC_FUNC(sub_82E87598)
+@@ -7005,6 +7240,12 @@ PPC_FUNC(sub_82E87598)
  
  void GetDatabaseDataMidAsmHook(PPCRegister& r1, PPCRegister& r4)
  {
@@ -1361,22 +1538,451 @@ diff --git a/UnleashedRecomp/patches/camera_patches.cpp b/UnleashedRecomp/patche
 index 059f5c6..edf0b77 100644
 --- a/UnleashedRecomp/patches/camera_patches.cpp
 +++ b/UnleashedRecomp/patches/camera_patches.cpp
-@@ -2,6 +2,7 @@
- #include <ui/game_window.h>
- #include <user/config.h>
- #include <gpu/video.h>
+@@ -1,67 +1,70 @@
+-#include <api/SWA.h>
+-#include <ui/game_window.h>
+-#include <user/config.h>
+-#include <gpu/video.h>
+-#include "camera_patches.h"
+-#include "aspect_ratio_patches.h"
+-
+-void CameraAspectRatioMidAsmHook(PPCRegister& r30, PPCRegister& r31)
+-{
+-    r30.u32 = 0;
+-
+-    auto camera = (SWA::CCamera*)g_memory.Translate(r31.u32);
+-
+-    // Dynamically adjust horizontal aspect ratio to window dimensions.
+-    camera->m_HorzAspectRatio = g_aspectRatio;
+-}
+-
+-float AdjustFieldOfView(float fieldOfView, float aspectRatio)
+-{
+-    if (Config::AspectRatio == EAspectRatio::OriginalNarrow)
+-    {
+-        // Replicate the original incorrect field of view formula if requested. 
+-        fieldOfView *= NARROW_ASPECT_RATIO;
+-    }
+-    else if (aspectRatio < WIDE_ASPECT_RATIO)
+-    {
+-        // Use proper VERT+ otherwise for narrow aspect ratios.
+-        fieldOfView = 2.0 * atan(tan(0.5 * fieldOfView) / aspectRatio * WIDE_ASPECT_RATIO);
+-    }
+-
+-    return fieldOfView;
+-}
+-
+-void CameraFieldOfViewMidAsmHook(PPCRegister& r31, PPCRegister& f31)
+-{
+-    auto camera = (SWA::CCamera*)g_memory.Translate(r31.u32);
+-
+-    f31.f64 = AdjustFieldOfView(f31.f64, camera->m_HorzAspectRatio);
+-}
+-
+-PPC_FUNC_IMPL(__imp__sub_824697B0);
+-PPC_FUNC(sub_824697B0)
+-{
+-    auto pCamera = (SWA::CCamera*)g_memory.Translate(ctx.r3.u32);
+-
+-    pCamera->m_InvertX = Config::HorizontalCamera == ECameraRotationMode::Reverse;
+-    pCamera->m_InvertY = Config::VerticalCamera == ECameraRotationMode::Reverse;
+-
+-    __imp__sub_824697B0(ctx, base);
+-}
+-
+-// SWA::CCamera::UpdateSerial
+-PPC_FUNC_IMPL(__imp__sub_82467890);
+-PPC_FUNC(sub_82467890)
+-{
+-    if (g_needsResize)
+-    {
+-        // Recompute the projection matrix for one frame to fix stretching on pause menu.
+-        auto r3 = ctx.r3;
+-        auto r4 = ctx.r4;
+-        sub_82468E38(ctx, base);
+-        ctx.r3 = r3;
+-        ctx.r4 = r4;
+-    }
+-
+-    __imp__sub_82467890(ctx, base);
+-}
++#include <api/SWA.h>
++#include <ui/game_window.h>
++#include <user/config.h>
++#include <gpu/video.h>
 +#include <ui/collision_overlay.h>
- #include "camera_patches.h"
- #include "aspect_ratio_patches.h"
- 
-@@ -63,5 +64,7 @@ PPC_FUNC(sub_82467890)
-         ctx.r4 = r4;
-     }
- 
++#include "camera_patches.h"
++#include "aspect_ratio_patches.h"
++
++void CameraAspectRatioMidAsmHook(PPCRegister& r30, PPCRegister& r31)
++{
++    r30.u32 = 0;
++
++    auto camera = (SWA::CCamera*)g_memory.Translate(r31.u32);
++
++    // Dynamically adjust horizontal aspect ratio to window dimensions.
++    camera->m_HorzAspectRatio = g_aspectRatio;
++}
++
++float AdjustFieldOfView(float fieldOfView, float aspectRatio)
++{
++    if (Config::AspectRatio == EAspectRatio::OriginalNarrow)
++    {
++        // Replicate the original incorrect field of view formula if requested. 
++        fieldOfView *= NARROW_ASPECT_RATIO;
++    }
++    else if (aspectRatio < WIDE_ASPECT_RATIO)
++    {
++        // Use proper VERT+ otherwise for narrow aspect ratios.
++        fieldOfView = 2.0 * atan(tan(0.5 * fieldOfView) / aspectRatio * WIDE_ASPECT_RATIO);
++    }
++
++    return fieldOfView;
++}
++
++void CameraFieldOfViewMidAsmHook(PPCRegister& r31, PPCRegister& f31)
++{
++    auto camera = (SWA::CCamera*)g_memory.Translate(r31.u32);
++
++    f31.f64 = AdjustFieldOfView(f31.f64, camera->m_HorzAspectRatio);
++}
++
++PPC_FUNC_IMPL(__imp__sub_824697B0);
++PPC_FUNC(sub_824697B0)
++{
++    auto pCamera = (SWA::CCamera*)g_memory.Translate(ctx.r3.u32);
++
++    pCamera->m_InvertX = Config::HorizontalCamera == ECameraRotationMode::Reverse;
++    pCamera->m_InvertY = Config::VerticalCamera == ECameraRotationMode::Reverse;
++
++    __imp__sub_824697B0(ctx, base);
++}
++
++// SWA::CCamera::UpdateSerial
++PPC_FUNC_IMPL(__imp__sub_82467890);
++PPC_FUNC(sub_82467890)
++{
++    if (g_needsResize)
++    {
++        // Recompute the projection matrix for one frame to fix stretching on pause menu.
++        auto r3 = ctx.r3;
++        auto r4 = ctx.r4;
++        sub_82468E38(ctx, base);
++        ctx.r3 = r3;
++        ctx.r4 = r4;
++    }
++
 +    uint32_t camera = ctx.r3.u32;
-     __imp__sub_82467890(ctx, base);
++    __imp__sub_82467890(ctx, base);
 +    CollisionOverlay::OnCameraUpdate(camera);
- }
++}
+diff --git a/UnleashedRecomp/patches/collision_view_patches.cpp b/UnleashedRecomp/patches/collision_view_patches.cpp
+new file mode 100644
+index 0000000..1514c6d
+--- /dev/null
++++ b/UnleashedRecomp/patches/collision_view_patches.cpp
+@@ -0,0 +1,283 @@
++#include "collision_view_patches.h"
++#include <api/SWA.h>
++#include <kernel/function.h>
++#include <kernel/memory.h>
++#include <user/config.h>
++#include <sdl_listener.h>
++
++#include <atomic>
++#include <mutex>
++#include <unordered_set>
++#include <utility>
++
++// The collision views make what they draw as the stage loads, so they can't be switched by switching the codes. With
++// any of them on, the stage loads both what they draw and the terrain the stage collision view leaves out, and F11
++// leaves one or the other out while the game draws: the stage's terrain while the views are shown, what they draw
++// while they aren't. Under libTAS, F11 is passed on as a key, so it goes into the movie like the game's keys.
++
++// SWA::CTerrainManager2nd, which draws the stage's terrain (the Terrain block of Stage.set.xml with a TerrainInfoFile).
++static constexpr uint32_t TERRAIN_MANAGER_2ND_VFTABLE = 0x820339F8;
++
++// The literal "" the stage loader compares its strings with. A CSharedString holds literals from the image as they are,
++// without counting references.
++static constexpr uint32_t EMPTY_STRING = 0x8200A621;
++
++// The shadow map's mode, the second of its parameters.
++static constexpr uint32_t SHADOW_MAP_MODE = 0x83302768;
++
++static std::atomic<bool> g_shown{ true };
++
++bool CollisionView::IsEnabled()
++{
++    return Config::EnableStageCollisionDebugView || Config::EnableEventCollisionDebugView || Config::EnableObjectCollisionDebugView;
++}
++
++bool CollisionView::IsShown()
++{
++    return g_shown;
++}
++
++// The stage collision view's switch, set every frame from its code.
++static bool IsStageViewOn()
++{
++    return SWA::SGlobals::ms_IsCollisionRender != nullptr && *SWA::SGlobals::ms_IsCollisionRender;
++}
++
++static class CollisionViewListener : public SDLEventListener
++{
++public:
++    bool OnSDLEvent(SDL_Event* event) override
++    {
++        if (CollisionView::IsEnabled() && event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_F11 && !event->key.repeat)
++            g_shown = !g_shown;
++
++        return false;
++    }
++}
++g_collisionViewListener;
++
++// The renderables (Hedgehog::Mirage::CRenderable) the views draw, and the stage's terrain.
++static std::mutex g_renderablesMutex;
++static std::unordered_set<uint32_t> g_viewRenderables;
++static std::unordered_set<uint32_t> g_terrainRenderables;
++
++// While the views make their renderables.
++static thread_local int g_makingViewRenderables;
++
++// Makes the getter of ms_IsCollisionRender answer that the stage collision view is off: for a while, or once.
++static thread_local bool g_stageViewHidden;
++static thread_local bool g_stageViewHiddenOnce;
++
++// The stage loader's terrain pass for a Terrain block that also holds the stage's collision.
++static thread_local bool g_terrainPass;
++static thread_local bool g_needsTerrainPass;
++
++// SWA::SGlobals::ms_IsCollisionRender's getter.
++PPC_FUNC_IMPL(__imp__sub_824F7098);
++PPC_FUNC(sub_824F7098)
++{
++    __imp__sub_824F7098(ctx, base);
++
++    if (g_stageViewHidden || std::exchange(g_stageViewHiddenOnce, false))
++        ctx.r3.u64 = 0;
++}
++
++// The stage collision view (ms_IsCollisionRender) makes the stage loader (sub_82564100) skip the Terrain blocks of
++// Stage.set.xml with a TerrainInfoFile, and load the blocks with only a RigidBodyContainer as collision it draws. A few
++// stages, like Rooftop Run's day acts, have both in one block: load its collision like a collision-only block's, then
++// load the block again for its terrain, without its collision. Load the other terrain blocks like without the view.
++// Without the view, the loader runs unchanged.
++bool StageCollisionDebugViewTerrainMidAsmHook(PPCRegister& r1)
++{
++    if (!IsStageViewOn())
++        return false;
++
++    // The block's RigidBodyContainer, read into a CSharedString on the stack.
++    uint8_t* base = g_memory.base;
++    uint32_t rigidBodyContainer = PPC_LOAD_U32(r1.u32 + 108);
++    bool hasCollision = rigidBodyContainer != 0 && PPC_LOAD_U8(rigidBodyContainer) != '\0';
++
++    if (hasCollision && !g_terrainPass)
++    {
++        g_needsTerrainPass = true;
++        return true;
++    }
++
++    // The ms_IsCollisionRender check next decides whether to skip the terrain.
++    g_stageViewHiddenOnce = true;
++    return false;
++}
++
++// The stage loader's handler for a Terrain block of Stage.set.xml.
++PPC_FUNC_IMPL(__imp__sub_82564100);
++PPC_FUNC(sub_82564100)
++{
++    if (!IsStageViewOn())
++    {
++        __imp__sub_82564100(ctx, base);
++        return;
++    }
++
++    PPCRegister arguments[] = { ctx.r3, ctx.r4, ctx.r5, ctx.r6, ctx.r7 };
++
++    g_needsTerrainPass = false;
++    __imp__sub_82564100(ctx, base);
++    g_stageViewHiddenOnce = false;
++
++    if (!g_needsTerrainPass)
++        return;
++
++    g_needsTerrainPass = false;
++    ctx.r3 = arguments[0];
++    ctx.r4 = arguments[1];
++    ctx.r5 = arguments[2];
++    ctx.r6 = arguments[3];
++    ctx.r7 = arguments[4];
++
++    g_terrainPass = true;
++    __imp__sub_82564100(ctx, base);
++    g_terrainPass = false;
++    g_stageViewHiddenOnce = false;
++}
++
++// Makes the loading of a Terrain block's RigidBodyContainer (the CSharedString at r4), in its folder (r5). In the terrain
++// pass, the block's collision is loaded already: load it like a block without a RigidBodyContainer.
++PPC_FUNC_IMPL(__imp__sub_8255F970);
++PPC_FUNC(sub_8255F970)
++{
++    if (!g_terrainPass)
++    {
++        __imp__sub_8255F970(ctx, base);
++        return;
++    }
++
++    uint32_t name = ctx.r4.u32;
++    uint32_t rigidBodyContainer = PPC_LOAD_U32(name);
++    PPC_STORE_U32(name, EMPTY_STRING);
++
++    __imp__sub_8255F970(ctx, base);
++
++    PPC_STORE_U32(name, rigidBodyContainer);
++}
++
++// SWA::CGameObjectTerrain's update (its vfunc 2), which makes the stage collision view's renderables, ten at a time.
++PPC_FUNC_IMPL(__imp__sub_82518C50);
++PPC_FUNC(sub_82518C50)
++{
++    g_makingViewRenderables++;
++    __imp__sub_82518C50(ctx, base);
++    g_makingViewRenderables--;
++}
++
++// SWA::CGameObjectCollisionRender's, for the object and event collision views.
++PPC_FUNC_IMPL(__imp__sub_82490EB0);
++PPC_FUNC(sub_82490EB0)
++{
++    g_makingViewRenderables++;
++    __imp__sub_82490EB0(ctx, base);
++    g_makingViewRenderables--;
++}
++
++// Makes a SWA::CHavokRenderable, a rigid body's shape drawn as a mesh, into the shared_ptr at r3. Not only for the views:
++// SWA::CObjBendBox draws itself with one.
++PPC_FUNC_IMPL(__imp__sub_822F3348);
++PPC_FUNC(sub_822F3348)
++{
++    uint32_t renderable = ctx.r3.u32;
++    __imp__sub_822F3348(ctx, base);
++
++    if (g_makingViewRenderables > 0 && CollisionView::IsEnabled())
++    {
++        std::lock_guard lock(g_renderablesMutex);
++        g_viewRenderables.insert(PPC_LOAD_U32(renderable));
++    }
++}
++
++// Adds a game object's (r3) renderable (the shared_ptr at r5) to a render category (r4).
++PPC_FUNC_IMPL(__imp__sub_82514360);
++PPC_FUNC(sub_82514360)
++{
++    if (CollisionView::IsEnabled() && ctx.r3.u32 != 0 && PPC_LOAD_U32(ctx.r3.u32) == TERRAIN_MANAGER_2ND_VFTABLE)
++    {
++        std::lock_guard lock(g_renderablesMutex);
++        g_terrainRenderables.insert(PPC_LOAD_U32(ctx.r5.u32));
++    }
++
++    __imp__sub_82514360(ctx, base);
++}
++
++static void Forget(uint32_t renderable)
++{
++    if (!CollisionView::IsEnabled())
++        return;
++
++    std::lock_guard lock(g_renderablesMutex);
++    g_viewRenderables.erase(renderable);
++    g_terrainRenderables.erase(renderable);
++}
++
++// Hedgehog::Mirage::CRenderable's constructor and destructor: forget the renderables that are gone, and the new ones
++// made where they were.
++PPC_FUNC_IMPL(__imp__sub_82E1A4D0);
++PPC_FUNC(sub_82E1A4D0)
++{
++    Forget(ctx.r3.u32);
++    __imp__sub_82E1A4D0(ctx, base);
++}
++
++PPC_FUNC_IMPL(__imp__sub_82E1A4E8);
++PPC_FUNC(sub_82E1A4E8)
++{
++    Forget(ctx.r3.u32);
++    __imp__sub_82E1A4E8(ctx, base);
++}
++
++// Draws a renderable (r3) unless it's disabled (CRenderable::m_Enabled): Hedgehog::Mirage::CBundle draws its renderables
++// with it.
++PPC_FUNC_IMPL(__imp__sub_82E1A4F8);
++PPC_FUNC(sub_82E1A4F8)
++{
++    if (CollisionView::IsEnabled())
++    {
++        std::lock_guard lock(g_renderablesMutex);
++        auto& hidden = g_shown ? g_terrainRenderables : g_viewRenderables;
++        if (hidden.contains(ctx.r3.u32))
++            return;
++    }
++
++    __imp__sub_82E1A4F8(ctx, base);
++}
++
++// SWA::CFxShadowMap's vfuncs 1 and 2. The stage collision view sets the shadow map's mode to 0 in vfunc 1, every frame,
++// where the stage's parameters set it, and both use it. Keep the stage's mode for the level as it normally looks, and
++// give the shadow map 0 only while the view is shown.
++PPC_FUNC_IMPL(__imp__sub_82BAE248);
++PPC_FUNC(sub_82BAE248)
++{
++    if (!IsStageViewOn())
++    {
++        __imp__sub_82BAE248(ctx, base);
++        return;
++    }
++
++    uint32_t mode = PPC_LOAD_U32(SHADOW_MAP_MODE);
++    g_stageViewHidden = !g_shown;
++    __imp__sub_82BAE248(ctx, base);
++    g_stageViewHidden = false;
++    PPC_STORE_U32(SHADOW_MAP_MODE, mode);
++}
++
++PPC_FUNC_IMPL(__imp__sub_82BADDF0);
++PPC_FUNC(sub_82BADDF0)
++{
++    if (!IsStageViewOn() || !g_shown)
++    {
++        __imp__sub_82BADDF0(ctx, base);
++        return;
++    }
++
++    uint32_t mode = PPC_LOAD_U32(SHADOW_MAP_MODE);
++    PPC_STORE_U32(SHADOW_MAP_MODE, 0);
++    __imp__sub_82BADDF0(ctx, base);
++    PPC_STORE_U32(SHADOW_MAP_MODE, mode);
++}
+diff --git a/UnleashedRecomp/patches/collision_view_patches.h b/UnleashedRecomp/patches/collision_view_patches.h
+new file mode 100644
+index 0000000..c946c6f
+--- /dev/null
++++ b/UnleashedRecomp/patches/collision_view_patches.h
+@@ -0,0 +1,12 @@
++#pragma once
++
++// The game's collision debug views (the EnableStageCollisionDebugView, EnableEventCollisionDebugView and
++// EnableObjectCollisionDebugView codes). F11 switches between them and the level as it normally looks.
++namespace CollisionView
++{
++    // Whether any of the codes is on.
++    bool IsEnabled();
++
++    // Whether the views are shown (with IsEnabled), or the level as it normally looks.
++    bool IsShown();
++}
 diff --git a/UnleashedRecomp/patches/fps_patches.cpp b/UnleashedRecomp/patches/fps_patches.cpp
 index 322073c..37f695e 100644
 --- a/UnleashedRecomp/patches/fps_patches.cpp
@@ -1418,34 +2024,8 @@ index 322073c..37f695e 100644
      auto now = std::chrono::steady_clock::now();
      constexpr auto INTERVAL = 1000000000ns / 60;
      auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);
-diff --git a/UnleashedRecomp/patches/misc_patches.cpp b/UnleashedRecomp/patches/misc_patches.cpp
-index ec4e1a8..25d5b2d 100644
---- a/UnleashedRecomp/patches/misc_patches.cpp
-+++ b/UnleashedRecomp/patches/misc_patches.cpp
-@@ -193,3 +193,21 @@ PPC_FUNC(sub_824EE620)
- 
-     ctx.r3.u32 = PersistentStorageManager::ShouldDisplayDLCMessage(true);
- }
-+
-+// The stage collision debug view (EnableStageCollisionDebugView) sets the game's ms_IsCollisionRender, and with
-+// it, the stage loader (sub_82564100) skips every Terrain block of Stage.set.xml that has a TerrainInfoFile, so
-+// that the blocks with only a RigidBodyContainer get loaded and drawn as collision instead. A few stages, like
-+// Rooftop Run's day acts, have both in one block, which then got skipped: they lost their terrain and their
-+// collision, and the player fell through the stage. Load such blocks like the collision-only ones, which only
-+// read the block's collision fields: these stages then show their collision like the others. Without the debug
-+// view, the loader runs unchanged.
-+bool StageCollisionDebugViewTerrainMidAsmHook(PPCRegister& r1)
-+{
-+    if (!*SWA::SGlobals::ms_IsCollisionRender)
-+        return false;
-+
-+    // The block's RigidBodyContainer, read into a CSharedString on the stack.
-+    uint8_t* base = g_memory.base;
-+    uint32_t rigidBodyContainer = PPC_LOAD_U32(r1.u32 + 108);
-+    return rigidBodyContainer != 0 && PPC_LOAD_U8(rigidBodyContainer) != '\0';
-+}
 diff --git a/UnleashedRecomp/patches/player_patches.cpp b/UnleashedRecomp/patches/player_patches.cpp
-index cce0a58..4c184cb 100644
+index cce0a58..c47d6f5 100644
 --- a/UnleashedRecomp/patches/player_patches.cpp
 +++ b/UnleashedRecomp/patches/player_patches.cpp
 @@ -4,6 +4,7 @@
@@ -1468,7 +2048,7 @@ index cce0a58..4c184cb 100644
      App::s_isWerehog = true;
  
      SDL_User_EvilSonic(true);
-@@ -116,3 +120,25 @@ PPC_FUNC(sub_823B4590)
+@@ -116,3 +120,36 @@ PPC_FUNC(sub_823B4590)
  
      SDL_User_EvilSonic(false);
  }
@@ -1493,6 +2073,17 @@ index cce0a58..4c184cb 100644
 +    }
 +
 +    __imp__sub_82334A50(ctx, base);
++}
++
++// Sonic's handling of MsgReopenActivity (sub_82354E20), which gives him control back after an event. The title update
++// made it leave him alone while he waits for Ready... GO! (StartEvent) or starts with a dash (StartDash). Before that,
++// restarting a stage during an in-game cutscene let the cutscene's message free him during the countdown, while the
++// stage time still started at GO. RestoreReadyGoSkip brings that back: clearing the check's result makes the handler
++// run as it did before the title update.
++void RestoreReadyGoSkipMidAsmHook(PPCRegister& r29)
++{
++    if (Config::RestoreReadyGoSkip)
++        r29.u64 = 0;
 +}
 diff --git a/UnleashedRecomp/patches/tas_patches.cpp b/UnleashedRecomp/patches/tas_patches.cpp
 new file mode 100644
@@ -2682,14 +3273,15 @@ index 0000000..f0fb735
 +}
 diff --git a/UnleashedRecomp/ui/collision_overlay.cpp b/UnleashedRecomp/ui/collision_overlay.cpp
 new file mode 100644
-index 0000000..15ab10d
+index 0000000..e0019f6
 --- /dev/null
 +++ b/UnleashedRecomp/ui/collision_overlay.cpp
-@@ -0,0 +1,747 @@
+@@ -0,0 +1,1111 @@
 +#include "collision_overlay.h"
 +#include <api/SWA.h>
 +#include <kernel/function.h>
 +#include <kernel/memory.h>
++#include <patches/collision_view_patches.h>
 +#include <ui/imgui_utils.h>
 +#include <ui/tas_hud.h>
 +#include <user/config.h>
@@ -2699,10 +3291,13 @@ index 0000000..15ab10d
 +#include <array>
 +#include <atomic>
 +#include <cmath>
++#include <cstring>
 +#include <map>
 +#include <mutex>
 +#include <numbers>
++#include <string_view>
 +#include <unordered_map>
++#include <utility>
 +#include <vector>
 +
 +// The game's camera (SWA::CCamera), as its UpdateSerial leaves it: the view matrix at +0x130 and the projection at
@@ -2762,10 +3357,55 @@ index 0000000..15ab10d
 +static constexpr uint32_t BODY_COLLISION_ID = 1;
 +static constexpr uint32_t SONIC_PATH_COLLISION_ID = 5;
 +
++// Sonic's attacks hit what his collision touches. His body (Normal) is a TypePlayer collision that detects TypeEvent
++// ones, the others (Item and the rest, all but Path) TypePlayerItem ones that detect TypeEventItem, TypeEvent and
++// TypeObjectPhysics ones (the filters made in sub_824950C0, and in the set-up). When one touches something
++// (MsgHitEventCollision, sub_82360248) while he has an attack type (sliding sets TypeSonicSliding, sub_8232F950), he
++// damages it: no shape of its own. Setting an attack type also sets this state flag, and removing it clears it.
++static constexpr uint32_t CONTEXT_STATE_FLAGS_OFFSET = 0x4AC;
++static constexpr uint32_t ATTACKING_FLAG = 6;
++
++// What other objects add: event collisions (sub_82516528, sub_82516690 and sub_82516838, which make them with
++// sub_8248F210), and SWA::CRigidBody objects (sub_825146A8). Both are physics units with their Havok object at +4; their
++// base's constructor is sub_824932A8 and its destructor sub_82493098.
++static constexpr uint32_t RIGID_BODY_UNIT_VFTABLE = 0x8200CC68;
++static constexpr uint32_t PHYSICS_UNIT_BODY_OFFSET = 4;
++// Some may be shape phantoms. Like rigid bodies, they keep their shape at +0x10, and their collidable's motion (+0x18)
++// points to their transform (a rigid body's at +0xE0).
++static constexpr uint32_t SIMPLE_SHAPE_PHANTOM_VFTABLE = 0x821280F4;
++static constexpr uint32_t CACHING_SHAPE_PHANTOM_VFTABLE = 0x82125A3C;
++static constexpr uint32_t COLLIDABLE_MOTION_OFFSET = 0x18;
++
++// Shapes made of others, as their methods read them: hkpConvexTranslateShape (its child at +0x18, moved by +0x20),
++// hkpConvexTransformShape (its child at +0x18, transformed by +0x20: columns, then the translation),
++// hkpTransformShape (its child at +0x14, transformed by +0x30) and hkpListShape (its children at +0x18, 16 bytes each
++// with the shape first, how many at +0x1C).
++static constexpr uint32_t CONVEX_TRANSLATE_SHAPE_VFTABLE = 0x8212F4CC;
++static constexpr uint32_t CONVEX_TRANSFORM_SHAPE_VFTABLE = 0x8212F574;
++static constexpr uint32_t TRANSFORM_SHAPE_VFTABLE = 0x8212EA84;
++static constexpr uint32_t LIST_SHAPE_VFTABLE = 0x82130428;
++
++// The player's matrix node (SWA::CMatrixNodeTransform, at +16 of both contexts), whose matrix at +128 (its vfunc 2) has
++// the axes as rows, then the position: his facing is its third row (sub_8230A4E0), and his position is at his feet.
++static constexpr uint32_t CONTEXT_MATRIX_NODE_OFFSET = 16;
++static constexpr uint32_t MATRIX_NODE_MATRIX_OFFSET = 128;
++
++// The arrow along his facing: a flat arrow given some thickness, a little above his feet.
++static constexpr float ARROW_HEIGHT = 0.05f;
++static constexpr float ARROW_THICKNESS = 0.05f;
++static constexpr float ARROW_LENGTH = 1.0f;
++static constexpr float ARROW_HEAD_LENGTH = 0.3f;
++static constexpr float ARROW_HALF_WIDTH = 0.04f;
++static constexpr float ARROW_HEAD_HALF_WIDTH = 0.15f;
++
 +static const ImU32 RAIL_COLOUR = IM_COL32(255, 140, 0, 130);
-+static const ImU32 BODY_COLOUR = IM_COL32(0, 230, 255, 140);
-+static const ImU32 TRIGGER_COLOUR = IM_COL32(255, 80, 255, 100);
-+static const ImU32 PATH_COLOUR = IM_COL32(60, 90, 255, 110);
++static const ImU32 BODY_COLOUR = IM_COL32(0, 240, 255, 200);
++static const ImU32 TRIGGER_COLOUR = IM_COL32(255, 80, 255, 85);
++static const ImU32 PATH_COLOUR = IM_COL32(60, 90, 255, 90);
++static const ImU32 ATTACK_COLOUR = IM_COL32(60, 255, 90, 100);
++static const ImU32 ENEMY_COLOUR = IM_COL32(255, 40, 40, 110);
++static const ImU32 GOAL_COLOUR = IM_COL32(255, 255, 255, 110);
++static const ImU32 ARROW_COLOUR = IM_COL32(255, 255, 255, 240);
 +
 +static constexpr float PI = std::numbers::pi_v<float>;
 +
@@ -2839,18 +3479,38 @@ index 0000000..15ab10d
 +    return { LoadFloat(address), LoadFloat(address + 4), LoadFloat(address + 8) };
 +}
 +
-+// A rigid body's transform.
++// A transform as Havok keeps it: the rotation's columns, then the translation.
 +struct Transform
 +{
-+    Vector3 columns[3];
-+    Vector3 translation;
++    Vector3 columns[3] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
++    Vector3 translation{};
 +
-+    explicit Transform(uint32_t body)
++    Transform() = default;
++
++    // A rigid body's.
++    explicit Transform(uint32_t body) : Transform(At(body + RIGID_BODY_TRANSFORM_OFFSET))
 +    {
-+        for (int i = 0; i < 3; i++)
-+            columns[i] = LoadVector(body + RIGID_BODY_TRANSFORM_OFFSET + i * 16);
++    }
 +
-+        translation = LoadVector(body + RIGID_BODY_TRANSFORM_OFFSET + 48);
++    static Transform At(uint32_t address)
++    {
++        Transform transform;
++        for (int i = 0; i < 3; i++)
++            transform.columns[i] = LoadVector(address + i * 16);
++
++        transform.translation = LoadVector(address + 48);
++        return transform;
++    }
++
++    // Another transform, in this one's space.
++    Transform operator*(const Transform& other) const
++    {
++        Transform result;
++        for (int i = 0; i < 3; i++)
++            result.columns[i] = Rotate(other.columns[i]);
++
++        result.translation = (*this)(other.translation);
++        return result;
 +    }
 +
 +    Vector3 operator()(const Vector3& p) const
@@ -2944,6 +3604,155 @@ index 0000000..15ab10d
 +    }
 +
 +    __imp__sub_822E4290(ctx, base);
++}
++
++// The objects whose collision is drawn: the enemies (any class with "Enemy" in its name among the object's classes,
++// like SWA::CSonicEnemyBase, the CEnemy* classes, their shots and weapons, and SWA::EvilEnemy::IEvilEnemy) and the goal
++// ring (SWA::CObjGoalRing). Only what the game's views don't draw: they decide as it's added, the event collision view
++// (ms_IsTriggerRender, read by the event collision helpers) for event collisions, the object collision view
++// (ms_IsObjectCollisionRender, read by sub_825146A8) for rigid bodies.
++enum class ObjectKind
++{
++    None,
++    Enemy,
++    GoalRing
++};
++
++// The physics units those objects added, until they're destroyed. The game adds them on its own threads.
++static std::mutex g_unitsMutex;
++static std::unordered_map<uint32_t, ObjectKind> g_units;
++static std::unordered_map<uint32_t, ObjectKind> g_objectKinds;
++
++// The object adding an event collision.
++static thread_local uint32_t g_eventCollisionOwner;
++
++// An object's kind, from its classes in the game's RTTI: its vtable is preceded by its complete object locator, whose
++// class hierarchy (+16) lists its classes (+12, how many at +8), each with its type descriptor first, whose mangled name
++// is at +8. Called with g_unitsMutex held.
++static ObjectKind GetObjectKind(uint32_t object)
++{
++    uint32_t vftable = LoadU32(object);
++    auto it = g_objectKinds.find(vftable);
++    if (it != g_objectKinds.end())
++        return it->second;
++
++    ObjectKind kind = ObjectKind::None;
++    uint32_t hierarchy = LoadU32(LoadU32(vftable - 4) + 16);
++    uint32_t count = LoadU32(hierarchy + 8);
++    uint32_t classes = LoadU32(hierarchy + 12);
++    if (vftable >= PPC_IMAGE_BASE && vftable < PPC_IMAGE_BASE + PPC_IMAGE_SIZE && count < 64)
++    {
++        for (uint32_t i = 0; i < count; i++)
++        {
++            uint32_t descriptor = LoadU32(LoadU32(classes + i * 4));
++            if (descriptor < PPC_IMAGE_BASE || descriptor >= PPC_IMAGE_BASE + PPC_IMAGE_SIZE)
++                break;
++
++            auto text = reinterpret_cast<const char*>(g_memory.Translate(descriptor + 8));
++            std::string_view name(text, strnlen(text, 128));
++            if (i == 0 && name == ".?AVCObjGoalRing@SWA@@")
++            {
++                kind = ObjectKind::GoalRing;
++                break;
++            }
++
++            if (name.find("Enemy") != std::string_view::npos)
++            {
++                kind = ObjectKind::Enemy;
++                break;
++            }
++        }
++    }
++
++    g_objectKinds.emplace(vftable, kind);
++    return kind;
++}
++
++static void TrackUnit(uint32_t object, uint32_t unit)
++{
++    if (!CollisionOverlay::IsEnabled() || !IsReadable(object) || !IsReadable(unit))
++        return;
++
++    std::lock_guard lock(g_unitsMutex);
++    ObjectKind kind = GetObjectKind(object);
++    if (kind != ObjectKind::None)
++        g_units[unit] = kind;
++}
++
++static bool IsViewOn(const bool* view)
++{
++    return view != nullptr && *view;
++}
++
++static void ForgetUnit(uint32_t unit)
++{
++    if (!CollisionOverlay::IsEnabled())
++        return;
++
++    std::lock_guard lock(g_unitsMutex);
++    g_units.erase(unit);
++}
++
++// The helpers objects (r3) add event collisions with.
++PPC_FUNC_IMPL(__imp__sub_82516528);
++PPC_FUNC(sub_82516528)
++{
++    uint32_t owner = std::exchange(g_eventCollisionOwner, ctx.r3.u32);
++    __imp__sub_82516528(ctx, base);
++    g_eventCollisionOwner = owner;
++}
++
++PPC_FUNC_IMPL(__imp__sub_82516690);
++PPC_FUNC(sub_82516690)
++{
++    uint32_t owner = std::exchange(g_eventCollisionOwner, ctx.r3.u32);
++    __imp__sub_82516690(ctx, base);
++    g_eventCollisionOwner = owner;
++}
++
++PPC_FUNC_IMPL(__imp__sub_82516838);
++PPC_FUNC(sub_82516838)
++{
++    uint32_t owner = std::exchange(g_eventCollisionOwner, ctx.r3.u32);
++    __imp__sub_82516838(ctx, base);
++    g_eventCollisionOwner = owner;
++}
++
++// Makes an event collision (SWA::CEventCollision) into the shared_ptr at r3.
++PPC_FUNC_IMPL(__imp__sub_8248F210);
++PPC_FUNC(sub_8248F210)
++{
++    uint32_t collision = ctx.r3.u32;
++    __imp__sub_8248F210(ctx, base);
++
++    if (g_eventCollisionOwner != 0 && !IsViewOn(SWA::SGlobals::ms_IsTriggerRender))
++        TrackUnit(g_eventCollisionOwner, LoadU32(collision));
++}
++
++// An object (r3) adds a SWA::CRigidBody (the shared_ptr at r4).
++PPC_FUNC_IMPL(__imp__sub_825146A8);
++PPC_FUNC(sub_825146A8)
++{
++    if (!IsViewOn(SWA::SGlobals::ms_IsObjectCollisionRender))
++        TrackUnit(ctx.r3.u32, LoadU32(ctx.r4.u32));
++
++    __imp__sub_825146A8(ctx, base);
++}
++
++// The physics units' base constructor and destructor: forget the units that are gone, and the new ones made where they
++// were.
++PPC_FUNC_IMPL(__imp__sub_824932A8);
++PPC_FUNC(sub_824932A8)
++{
++    ForgetUnit(ctx.r3.u32);
++    __imp__sub_824932A8(ctx, base);
++}
++
++PPC_FUNC_IMPL(__imp__sub_82493098);
++PPC_FUNC(sub_82493098)
++{
++    ForgetUnit(ctx.r3.u32);
++    __imp__sub_82493098(ctx, base);
 +}
 +
 +namespace
@@ -3191,11 +4000,120 @@ index 0000000..15ab10d
 +    }
 +}
 +
-+static void DrawShape(ImDrawList* drawList, const Projector& projector, const Transform& transform, uint32_t shape, ImU32 colour)
++static void DrawShape(ImDrawList* drawList, const Projector& projector, const Transform& transform, uint32_t shape, ImU32 colour,
++    int depth = 0)
 +{
++    if (depth > 4 || !IsReadable(shape))
++        return;
++
++    uint32_t vftable = LoadU32(shape);
++    if (vftable == CONVEX_TRANSLATE_SHAPE_VFTABLE)
++    {
++        Transform translation;
++        translation.translation = LoadVector(shape + 0x20);
++        DrawShape(drawList, projector, transform * translation, LoadU32(shape + 0x18), colour, depth + 1);
++        return;
++    }
++
++    if (vftable == CONVEX_TRANSFORM_SHAPE_VFTABLE)
++    {
++        DrawShape(drawList, projector, transform * Transform::At(shape + 0x20), LoadU32(shape + 0x18), colour, depth + 1);
++        return;
++    }
++
++    if (vftable == TRANSFORM_SHAPE_VFTABLE)
++    {
++        DrawShape(drawList, projector, transform * Transform::At(shape + 0x30), LoadU32(shape + 0x14), colour, depth + 1);
++        return;
++    }
++
++    if (vftable == LIST_SHAPE_VFTABLE)
++    {
++        uint32_t children = LoadU32(shape + 0x18);
++        uint32_t count = std::min(LoadU32(shape + 0x1C), 64u);
++        for (uint32_t i = 0; i < count; i++)
++            DrawShape(drawList, projector, transform, LoadU32(children + i * 16), colour, depth + 1);
++
++        return;
++    }
++
 +    Surface surface;
 +    if (BuildShape(surface, shape))
 +        DrawSurface(drawList, projector, transform, surface, colour);
++}
++
++static bool IsAttacking(uint32_t context)
++{
++    uint32_t flags = LoadU32(context + CONTEXT_STATE_FLAGS_OFFSET);
++    return flags != 0 && LoadU8(LoadU32(flags + 4) + ATTACKING_FLAG) != 0;
++}
++
++// A rigid body or shape phantom in the world, where it is now; false if it isn't one, or isn't in the world.
++static bool GetCollidable(uint32_t body, Transform& transform, uint32_t& shape)
++{
++    uint32_t vftable = LoadU32(body);
++    if (vftable != RIGID_BODY_VFTABLE && vftable != SIMPLE_SHAPE_PHANTOM_VFTABLE && vftable != CACHING_SHAPE_PHANTOM_VFTABLE)
++        return false;
++
++    uint32_t motion = LoadU32(body + COLLIDABLE_MOTION_OFFSET);
++    if (LoadU32(body + RIGID_BODY_WORLD_OFFSET) == 0 || !IsReadable(motion))
++        return false;
++
++    transform = Transform::At(motion);
++    shape = LoadU32(body + RIGID_BODY_SHAPE_OFFSET);
++    return true;
++}
++
++// A solid arrow from the player's feet along his facing, a little above them: the flat arrow's outline, given thickness.
++static void DrawFacingArrow(ImDrawList* drawList, const Projector& projector, uint32_t context)
++{
++    uint32_t node = LoadU32(context + CONTEXT_MATRIX_NODE_OFFSET);
++    if (!IsReadable(node))
++        return;
++
++    uint32_t matrix = node + MATRIX_NODE_MATRIX_OFFSET;
++    Vector3 up = LoadVector(matrix + 16);
++    Vector3 front = LoadVector(matrix + 32);
++    Vector3 position = LoadVector(matrix + 48);
++    if (!(Length(up) > 0.5f) || !(Length(front) > 0.5f) || !std::isfinite(Length(position)))
++        return;
++
++    up = Normalised(up);
++    front = Normalised(front);
++    Vector3 side = Normalised(Cross(up, front));
++
++    // The outline, counterclockwise from the back of the shaft (along the facing, then to the side), so each edge's
++    // outside is to its right.
++    constexpr float NECK = ARROW_LENGTH - ARROW_HEAD_LENGTH;
++    constexpr std::array<std::array<float, 2>, 7> OUTLINE =
++    { {
++        { 0.0f, -ARROW_HALF_WIDTH }, { NECK, -ARROW_HALF_WIDTH }, { NECK, -ARROW_HEAD_HALF_WIDTH }, { ARROW_LENGTH, 0.0f },
++        { NECK, ARROW_HEAD_HALF_WIDTH }, { NECK, ARROW_HALF_WIDTH }, { 0.0f, ARROW_HALF_WIDTH },
++    } };
++
++    Vector3 bottom = position + up * ARROW_HEIGHT;
++    Vector3 top = bottom + up * ARROW_THICKNESS;
++    auto at = [&](const Vector3& base, int i) { return base + front * OUTLINE[i][0] + side * OUTLINE[i][1]; };
++
++    // The top and the bottom: the shaft, then the head.
++    for (auto [base, outside] : { std::pair{ top, up }, std::pair{ bottom, up * -1.0f } })
++    {
++        DrawFace(drawList, projector, at(base, 0), at(base, 1), at(base, 5), outside, ARROW_COLOUR);
++        DrawFace(drawList, projector, at(base, 0), at(base, 5), at(base, 6), outside, ARROW_COLOUR);
++        DrawFace(drawList, projector, at(base, 2), at(base, 3), at(base, 4), outside, ARROW_COLOUR);
++    }
++
++    // The sides.
++    for (int i = 0; i < int(OUTLINE.size()); i++)
++    {
++        int next = (i + 1) % int(OUTLINE.size());
++        float dx = OUTLINE[next][0] - OUTLINE[i][0];
++        float dy = OUTLINE[next][1] - OUTLINE[i][1];
++        Vector3 outside = front * dy - side * dx;
++
++        DrawFace(drawList, projector, at(bottom, i), at(bottom, next), at(top, next), outside, ARROW_COLOUR);
++        DrawFace(drawList, projector, at(bottom, i), at(top, next), at(top, i), outside, ARROW_COLOUR);
++    }
 +}
 +
 +// The player's collision that's on: the body, day Sonic's path collision, and what touches rings, objects and triggers.
@@ -3228,12 +4146,46 @@ index 0000000..15ab10d
 +            bodies.emplace_back(LoadU32(node + 12), body);
 +    }
 +
-+    // The body first: the others are around it, and it shows through them.
-+    std::stable_partition(bodies.begin(), bodies.end(), [](auto& entry) { return entry.first == BODY_COLLISION_ID; });
++    // While day Sonic attacks (a slide, say), the collision around his body is what reaches enemies first.
++    bool attacking = !werehog && IsAttacking(context);
++
++    // The body last, over the others around it, so it stands out.
++    std::stable_partition(bodies.begin(), bodies.end(), [](auto& entry) { return entry.first != BODY_COLLISION_ID; });
 +    for (auto& [id, body] : bodies)
 +    {
-+        ImU32 colour = id == BODY_COLLISION_ID ? BODY_COLOUR : !werehog && id == SONIC_PATH_COLLISION_ID ? PATH_COLOUR : TRIGGER_COLOUR;
++        ImU32 colour = id == BODY_COLLISION_ID ? BODY_COLOUR : !werehog && id == SONIC_PATH_COLLISION_ID ? PATH_COLOUR :
++            attacking ? ATTACK_COLOUR : TRIGGER_COLOUR;
 +        DrawShape(drawList, projector, Transform(body), LoadU32(body + RIGID_BODY_SHAPE_OFFSET), colour);
++    }
++}
++
++// How far other objects' collision is drawn.
++static constexpr float OBJECT_DRAW_DISTANCE = 150.0f;
++
++// The collision of the enemies and of the goal ring that's on.
++static void DrawObjectCollision(ImDrawList* drawList, const Projector& projector)
++{
++    std::vector<std::pair<uint32_t, ObjectKind>> units;
++    {
++        std::lock_guard lock(g_unitsMutex);
++        units.assign(g_units.begin(), g_units.end());
++    }
++
++    for (auto& [unit, kind] : units)
++    {
++        uint32_t unitVftable = LoadU32(unit);
++        if (unitVftable != EVENT_COLLISION_VFTABLE && unitVftable != RIGID_BODY_UNIT_VFTABLE)
++            continue;
++
++        Transform transform;
++        uint32_t shape;
++        if (!GetCollidable(LoadU32(unit + PHYSICS_UNIT_BODY_OFFSET), transform, shape) ||
++            Length(transform.translation - projector.Eye) > OBJECT_DRAW_DISTANCE)
++        {
++            continue;
++        }
++
++        DrawShape(drawList, projector, transform, shape, kind == ObjectKind::GoalRing ? GOAL_COLOUR : ENEMY_COLOUR);
 +    }
 +}
 +
@@ -3363,7 +4315,8 @@ index 0000000..15ab10d
 +
 +void CollisionOverlay::Draw()
 +{
-+    if (!IsEnabled())
++    // Hidden with the views (F11).
++    if (!IsEnabled() || !CollisionView::IsShown())
 +        return;
 +
 +    // Only in levels, with the camera that was updated last.
@@ -3423,7 +4376,9 @@ index 0000000..15ab10d
 +        std::erase_if(g_railMeshes, [](auto& entry) { return !entry.second.Used; });
 +    }
 +
++    DrawObjectCollision(drawList, projector);
 +    DrawPlayerCollision(drawList, projector, context, werehog);
++    DrawFacingArrow(drawList, projector, context);
 +
 +    if (projector.DepthTested)
 +    {
@@ -3435,19 +4390,21 @@ index 0000000..15ab10d
 +}
 diff --git a/UnleashedRecomp/ui/collision_overlay.h b/UnleashedRecomp/ui/collision_overlay.h
 new file mode 100644
-index 0000000..61ba7eb
+index 0000000..5d0eaf0
 --- /dev/null
 +++ b/UnleashedRecomp/ui/collision_overlay.h
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,20 @@
 +#pragma once
 +
 +#include <cstdint>
 +
 +// Draws what the game's collision debug views (the EnableStageCollisionDebugView, EnableEventCollisionDebugView and
 +// EnableObjectCollisionDebugView codes) leave out: with the stage collision view, the grind rails' collision, and with
-+// any of them, the player's collision (day Sonic's or the Werehog's), as see-through solids. Drawn over the frame,
-+// projected with the game's camera, behind what the game drew (tested against its depth buffer); F12 switches to over
-+// everything and back. It only reads the game's memory.
++// any of them, the player's collision (day Sonic's or the Werehog's; his body over the rest, and day Sonic's others
++// green while he attacks) and an arrow along his facing at his feet, and the enemies' (red) and the goal ring's (white)
++// where the event and object views don't draw them, as see-through solids.
++// Drawn over the frame, projected with the game's camera, behind what the game drew (tested against its depth buffer);
++// F12 switches to over everything and back. Hidden with the views (F11). It only reads the game's memory.
 +namespace CollisionOverlay
 +{
 +    bool IsEnabled();
@@ -3494,10 +4451,10 @@ index d15aac6..7112106 100644
          SDL_VideoInit(nullptr);
 diff --git a/UnleashedRecomp/ui/tas_hud.cpp b/UnleashedRecomp/ui/tas_hud.cpp
 new file mode 100644
-index 0000000..9285cd4
+index 0000000..400574e
 --- /dev/null
 +++ b/UnleashedRecomp/ui/tas_hud.cpp
-@@ -0,0 +1,1198 @@
+@@ -0,0 +1,1465 @@
 +#include "tas_hud.h"
 +#include <api/SWA.h>
 +#include <app.h>
@@ -3507,9 +4464,12 @@ index 0000000..9285cd4
 +#include <ui/imgui_utils.h>
 +#include <tas_mode.h>
 +
++#include <algorithm>
 +#include <cmath>
++#include <iterator>
 +#include <numbers>
 +#include <unordered_map>
++#include <vector>
 +
 +// The day Sonic player context (SWA::Player::CSonicContext), recorded when its constructor runs. Its
 +// velocity is split like in Sonic Generations' CPlayerSpeedContext: the full velocity, the part along the
@@ -3537,6 +4497,17 @@ index 0000000..9285cd4
 +static constexpr int AIR_BOOST_STOMP_FRAMES = 2;
 +// The movement input is ignored while it's shorter than this (parameter 12, read by sub_823083F0).
 +static constexpr uint32_t MOVEMENT_INPUT_DEADZONE_PARAMETER = 12;
++// InAirMaxAccelVelocity (15 by default), read by the 3D air update.
++static constexpr uint32_t IN_AIR_MAX_ACCEL_VELOCITY_PARAMETER = 22;
++// What the context reads its parameters by ID with (sub_8245DB60).
++static constexpr uint32_t PARAMETER_READER_OFFSET = 0x1FC;
++// The player's matrix node (SWA::CMatrixNodeTransform), whose matrix at +128 has the axes as rows: his facing is the
++// third (sub_8230A4E0).
++static constexpr uint32_t MATRIX_NODE_OFFSET = 16;
++static constexpr uint32_t MATRIX_NODE_FACING_OFFSET = 128 + 32;
++// The basis the 3D input turns the stick into the world with (sub_82316128): the stick's X along the first row, its Y
++// against the third.
++static constexpr uint32_t INPUT_BASIS_OFFSET = 0x290;
 +// Stomping is also refused while this is set, unless flag 7 of the second set is (sub_8231B7D8).
 +static constexpr uint32_t STOMP_BLOCKER_OFFSET = 0xCC8;
 +static constexpr uint32_t STOMP_BLOCKER_OVERRIDE_FLAG = 7;
@@ -3550,6 +4521,24 @@ index 0000000..9285cd4
 +static constexpr float RUN_QUICK_STEP_ACTIONS_FRAME = 8.0f;
 +// How many frames the run quick step's out-of-control lasts after its animation reaches that frame.
 +static constexpr int RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES = 1;
++// Out of control (CPlayerSpeedPosturePluginOutOfControl, the context's vfunc 56): the ground actions try nothing.
++static constexpr uint32_t OUT_OF_CONTROL_FLAG = 3;
++// The states whose update starts with the ground actions, which try the jump, then the quick step: entered during a
++// frame's update, they try them on the next. Land skips them only on the update that ends its animation.
++static constexpr uint32_t GROUND_ACTIONS_STATE_VFTABLES[] =
++{
++    0x820167F4, // CPlayerSpeedStateStand
++    0x820128B0, // CPlayerSpeedContext::CStateWalk
++    0x82016934, // CSonicContext::CStateWalk
++    0x82016A10, // CSonicContext::CStateBrakeEnd
++    0x820169B8, // CSonicStateMoveStop
++    0x8201B7F0, // CSonicStateDrift
++    0x8201BC60, // CSonicStateOnIce
++    0x82016B48, // CSonicStateShoesSliding
++    0x8201C550, // CSonicStateWallRunDamage
++    0x82011EF8, // CPlayerSpeedContext::CStateLand
++    0x82016A68, // CSonicStateLand
++};
 +// Hedgehog engine states: the context at +8, the time spent in the state, in seconds, at +0x10.
 +static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
 +static constexpr uint32_t STATE_TIME_OFFSET = 0x10;
@@ -3635,17 +4624,22 @@ index 0000000..9285cd4
 +static int16_t g_thumbLX;
 +static int16_t g_thumbLY;
 +
-+// Counts drawn frames, to tell whether the checks below ran during the update of the frame being drawn.
++// Counts drawn frames, to tell whether the checks below ran during the update of the frame being drawn, and in which
++// state.
 +static uint32_t g_frame = 1;
 +static uint32_t g_jumpCheckFrame;
++static uint32_t g_jumpCheckState;
 +static uint32_t g_stompCheckFrame;
 +static bool g_stompDisabledByHop;
 +static bool g_stompBlocked;
 +static float g_stompingDisableTime = 0.15f;
 +static float g_movementInputDeadzone = 0.02f;
++static float g_inAirMaxAccelVelocity = 15.0f;
 +static uint32_t g_quickStepCheckFrame;
++static uint32_t g_quickStepCheckState;
 +// Sonic's state on the last drawn frame.
 +static std::string g_sonicPreviousState;
++static uint32_t g_sonicPreviousStateObject;
 +static bool g_quickStepDisabled;
 +static bool g_quickStepBlocked;
 +
@@ -3891,13 +4885,18 @@ index 0000000..9285cd4
 +    return flags != 0 && LoadU8(LoadU32(flags + 4) + flag) != 0;
 +}
 +
++static uint32_t GetCurrentState(uint32_t context);
++
 +// The context's TryJump: jumps if the jump button is pressed. The states that allow jumping call it every
 +// frame; others, like a quick step until it ends, don't.
 +PPC_FUNC_IMPL(__imp__sub_82330CB0);
 +PPC_FUNC(sub_82330CB0)
 +{
 +    if (TasHud::IsEnabled() && ctx.r3.u32 == g_speedContext)
++    {
 +        g_jumpCheckFrame = g_frame;
++        g_jumpCheckState = GetCurrentState(ctx.r3.u32);
++    }
 +
 +    __imp__sub_82330CB0(ctx, base);
 +}
@@ -3933,6 +4932,7 @@ index 0000000..9285cd4
 +    if (TasHud::IsEnabled() && context == g_speedContext)
 +    {
 +        g_quickStepCheckFrame = g_frame;
++        g_quickStepCheckState = GetCurrentState(context);
 +        g_quickStepDisabled = LoadU8(context + QUICK_STEP_DISABLED_OFFSET) != 0;
 +        g_quickStepBlocked = IsActionBlocked(context);
 +    }
@@ -4002,11 +5002,12 @@ index 0000000..9285cd4
 +    __imp__sub_82BBD568(ctx, base);
 +}
 +
-+// Reads a float parameter of the player by ID. Records StompingDisableTime when the short hop reads it, and the
-+// movement input's deadzone when the input is read.
++// Reads a float parameter of the player by ID. Records StompingDisableTime when the short hop reads it, the
++// movement input's deadzone when the input is read, and day Sonic's InAirMaxAccelVelocity when the air update reads it.
 +PPC_FUNC_IMPL(__imp__sub_8245DB60);
 +PPC_FUNC(sub_8245DB60)
 +{
++    uint32_t reader = ctx.r3.u32;
 +    uint32_t parameter = ctx.r4.u32;
 +    __imp__sub_8245DB60(ctx, base);
 +
@@ -4015,6 +5016,12 @@ index 0000000..9285cd4
 +
 +    if (parameter == MOVEMENT_INPUT_DEADZONE_PARAMETER && TasHud::IsEnabled())
 +        g_movementInputDeadzone = float(ctx.f1.f64);
++
++    if (parameter == IN_AIR_MAX_ACCEL_VELOCITY_PARAMETER && TasHud::IsEnabled() && g_speedContext != 0 &&
++        reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
++    {
++        g_inAirMaxAccelVelocity = float(ctx.f1.f64);
++    }
 +}
 +
 +// The current state of the player's state machine, or 0. The machine points to the current state's record
@@ -4029,6 +5036,13 @@ index 0000000..9285cd4
 +    uint32_t record = LoadU32(stateMachine + 0x58);
 +    uint32_t state = LoadU32(record + 0x1C);
 +    return state != 0 && LoadU32(state + STATE_CONTEXT_OFFSET) == context ? state : 0;
++}
++
++static bool StartsWithGroundActions(uint32_t state)
++{
++    uint32_t vftable = state != 0 ? LoadU32(state) : 0;
++    return std::find(std::begin(GROUND_ACTIONS_STATE_VFTABLES), std::end(GROUND_ACTIONS_STATE_VFTABLES), vftable) !=
++        std::end(GROUND_ACTIONS_STATE_VFTABLES);
 +}
 +
 +// The name of the state's class, from the game's RTTI: "CStateJumpShort@CSonicContext@..." becomes "JumpShort".
@@ -4100,15 +5114,85 @@ index 0000000..9285cd4
 +
 +// M-Speed, from the 3D air update (sub_82346880). Leaving the ground sets flag 27 (the context's vfunc 25,
 +// sub_82374360; landing clears it), and the update clears it as soon as the movement input is longer than 0.3; while
-+// it's set, the air deceleration is 0. The update aims for the input's part along Sonic's facing times
-+// max(InAirMaxAccelVelocity, his speed) (sub_8234C5F8). A short input puts that below his speed, so the update
-+// decelerates him, by 0, and then pushes him along his velocity instead, by a force that grows with the square of his
-+// speed: he gains speed every frame. The 3D input (CPlayerSpeedPostureInput3DStandard, sub_8234EE88; PathLocal,
-+// sub_8234F4D0, does the same) is the stick's direction times (length / 0.9)³, at most 1, and is ignored below
-+// parameter 12 (0.02, sub_823083F0). So on the stick as the game reads it, M-Speed takes a length from about 0.244 to
-+// 0.602, in any direction. 2D reads the stick without the curve.
++// it's set, the air deceleration is 0. The update (sub_8234C5F8) aims for a speed along Sonic's facing: the input's part
++// along it times max(InAirMaxAccelVelocity, his speed). If that's above his speed along his facing, he accelerates
++// toward it (an input against his facing always is). Otherwise he decelerates, by 0, and then, while his speed along his
++// facing is below that max, he's pushed along his velocity by a force that grows with the square of his speed: he gains
++// speed every frame. Unless the aim is over 0.25 and within 0.1 of his speed along his facing: then nothing happens. So
++// the input has to point to his facing's side of the stick, and at low speeds, not too far toward it. The 3D input
++// (CPlayerSpeedPostureInput3DStandard, sub_8234EE88; PathLocal, sub_8234F4D0, does the same) is the stick's direction
++// times (length / 0.9)³, at most 1, turned into the world by the context's input basis (sub_82316128), and is ignored
++// below parameter 12 (0.02, sub_823083F0). So on the stick as the game reads it, M-Speed takes a length from about 0.244
++// to 0.602, on the side Sonic faces. 2D reads the stick without the curve.
 +static constexpr float MOVEMENT_INPUT_SCALE = 1.0f / 0.9f;
 +static constexpr float M_SPEED_MAX_INPUT = 0.3f;
++static constexpr float M_SPEED_STILL_MIN_AIM = 0.25f;
++static constexpr float M_SPEED_STILL_DIFFERENCE = 0.1f;
++
++// The flag that keeps the air deceleration at 0 (see above).
++static constexpr uint32_t NO_AIR_DECELERATION_FLAG = 27;
++
++// What decides M-Speed's directions, for the frame being drawn. Sonic's facing on the stick, as drawn (x right, y
++// down): an input of length m in direction a aims for m * (cos a * FacingX + sin a * FacingY) * Target along his facing.
++// Off in the air once the flag is cleared, until he lands.
++struct MSpeedRule
++{
++    float FacingX = 0.0f;
++    float FacingY = -1.0f;
++    float Target = 15.0f;
++    float AlongFacing = 0.0f;
++    bool Off = false;
++};
++
++static MSpeedRule GetMSpeedRule(uint32_t context, bool grounded)
++{
++    MSpeedRule rule;
++    rule.Off = !grounded && !GetFlag(context, STATE_FLAGS_OFFSET, NO_AIR_DECELERATION_FLAG);
++
++    uint32_t node = LoadU32(context + MATRIX_NODE_OFFSET);
++    float facing[3], right[3], back[3], velocity[3];
++    for (int i = 0; i < 3; i++)
++    {
++        facing[i] = LoadFloat(node + MATRIX_NODE_FACING_OFFSET + i * 4);
++        right[i] = LoadFloat(context + INPUT_BASIS_OFFSET + i * 4);
++        back[i] = LoadFloat(context + INPUT_BASIS_OFFSET + 32 + i * 4);
++        velocity[i] = LoadFloat(context + HORIZONTAL_VELOCITY_OFFSET + i * 4);
++    }
++
++    auto dot = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
++    float speed = std::sqrt(dot(velocity, velocity));
++
++    // The stick's X goes along the basis' first row and its Y against the third, and Y is drawn upside down.
++    if (node != 0 && std::isfinite(dot(facing, facing)))
++    {
++        rule.FacingX = dot(right, facing);
++        rule.FacingY = dot(back, facing);
++    }
++
++    rule.Target = std::max(g_inAirMaxAccelVelocity, speed);
++    rule.AlongFacing = dot(velocity, facing);
++    return rule;
++}
++
++// Whether direction a (as drawn) is on the side of the stick Sonic faces, where M-Speed can be. All of it if he faces
++// straight up or down.
++static bool IsFacingSide(const MSpeedRule& rule, float cosine, float sine)
++{
++    return std::hypot(rule.FacingX, rule.FacingY) < 0.001f || cosine * rule.FacingX + sine * rule.FacingY > 0.0f;
++}
++
++// The longest movement input that M-Speeds in direction a (as drawn), or 0.
++static float GetMSpeedMaxInput(const MSpeedRule& rule, float cosine, float sine)
++{
++    float forward = cosine * rule.FacingX + sine * rule.FacingY;
++    if (rule.Off || !(forward > 0.0f) || !(rule.AlongFacing < rule.Target))
++        return 0.0f;
++
++    float maxAim = rule.AlongFacing > M_SPEED_STILL_MIN_AIM ?
++        std::max(M_SPEED_STILL_MIN_AIM, rule.AlongFacing - M_SPEED_STILL_DIFFERENCE) : rule.AlongFacing;
++
++    return std::min(M_SPEED_MAX_INPUT, maxAim / (forward * rule.Target));
++}
 +
 +// The 3D movement input's length for a stick length.
 +static float GetMovementInput(float stickLength)
@@ -4124,10 +5208,27 @@ index 0000000..9285cd4
 +    return std::cbrt(input) / MOVEMENT_INPUT_SCALE;
 +}
 +
-+static bool IsMSpeedInput(float stickLength)
++// Where the stick as the game reads it (y up) is: in the M-Speed zone's range of lengths on the side Sonic faces, and
++// whether it M-Speeds there.
++struct MSpeedInput
 +{
-+    float input = GetMovementInput(stickLength);
-+    return input >= g_movementInputDeadzone && input <= M_SPEED_MAX_INPUT;
++    bool InZone = false;
++    bool Works = false;
++};
++
++static MSpeedInput GetMSpeedInput(const MSpeedRule& rule, float gameX, float gameY)
++{
++    MSpeedInput result;
++    float length = std::hypot(gameX, gameY);
++    float input = GetMovementInput(length);
++    if (!(length > 0.0f) || input < g_movementInputDeadzone || input > M_SPEED_MAX_INPUT)
++        return result;
++
++    float cosine = gameX / length;
++    float sine = -gameY / length;
++    result.InZone = IsFacingSide(rule, cosine, sine);
++    result.Works = result.InZone && input <= GetMSpeedMaxInput(rule, cosine, sine);
++    return result;
 +}
 +
 +static bool IsInZone(const TargetZone& zone, float x, float y)
@@ -4194,6 +5295,106 @@ index 0000000..9285cd4
 +
 +    drawList->AddPolyline(outer, POINTS, outline, ImDrawFlags_Closed, Scale(1));
 +    drawList->AddPolyline(inner, POINTS, outline, ImDrawFlags_Closed, Scale(1));
++}
++
++// The M-Speed zone: like the length zone, from the deadzone's input to 0.3, on the side of the stick Sonic faces. Green up
++// to the longest input that M-Speeds in each direction, red past it (all of it where nothing does). Bright where the
++// stick is.
++static void DrawMSpeedZone(ImDrawList* drawList, ImVec2 centre, float scale, const MSpeedRule& rule, const MSpeedInput& stick)
++{
++    constexpr int ARC_SEGMENTS = 24;
++
++    ImU32 works = stick.Works ? IM_COL32(0, 255, 0, 200) : IM_COL32(0, 255, 0, 80);
++    ImU32 fails = stick.InZone && !stick.Works ? IM_COL32(255, 40, 40, 200) : IM_COL32(255, 40, 40, 80);
++    ImU32 outline = stick.InZone ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 160);
++
++    float minLength = GetStickLengthForMovementInput(g_movementInputDeadzone);
++    float maxLength = GetStickLengthForMovementInput(M_SPEED_MAX_INPUT);
++
++    struct Sample
++    {
++        bool InZone;
++        bool Works;
++        bool Fails;
++        ImVec2 Inner;
++        ImVec2 Middle;
++        ImVec2 Outer;
++    };
++
++    // Around the stick, quadrant by quadrant: between two quadrants, at the same angle, the zone's straight sides.
++    std::vector<Sample> samples;
++    for (int quadrant = 0; quadrant < 4; quadrant++)
++    {
++        float cornerX = (quadrant == 0 || quadrant == 3) ? GAME_STICK_DEADZONE : -GAME_STICK_DEADZONE;
++        float cornerY = quadrant < 2 ? GAME_STICK_DEADZONE : -GAME_STICK_DEADZONE;
++
++        for (int i = 0; i <= ARC_SEGMENTS; i++)
++        {
++            float angle = (quadrant + float(i) / ARC_SEGMENTS) * PI / 2;
++            float cosine = std::cos(angle);
++            float sine = std::sin(angle);
++            float maxInput = GetMSpeedMaxInput(rule, cosine, sine);
++            float middleLength = GetStickLengthForMovementInput(std::clamp(maxInput, g_movementInputDeadzone, M_SPEED_MAX_INPUT));
++
++            float shrink = 1.0f - GAME_STICK_DEADZONE;
++            auto point = [&](float length)
++            {
++                return ImVec2{ centre.x + (cornerX + cosine * shrink * length) * scale, centre.y + (cornerY + sine * shrink * length) * scale };
++            };
++
++            samples.push_back({ IsFacingSide(rule, cosine, sine), maxInput > g_movementInputDeadzone, maxInput < M_SPEED_MAX_INPUT,
++                point(minLength), point(middleLength), point(maxLength) });
++        }
++    }
++
++    // Start outside the zone, so each part of it is drawn in one go.
++    size_t count = samples.size();
++    size_t start = 0;
++    while (start < count && samples[start].InZone)
++        start++;
++
++    std::vector<ImVec2> inner;
++    std::vector<ImVec2> outer;
++    const Sample* previous = nullptr;
++    auto flush = [&]()
++    {
++        if (outer.size() >= 2)
++        {
++            // The outline: the outer edge, then back along the inner one.
++            std::vector<ImVec2> line(outer);
++            line.insert(line.end(), inner.rbegin(), inner.rend());
++            drawList->AddPolyline(line.data(), int(line.size()), outline, ImDrawFlags_Closed, Scale(1));
++        }
++
++        inner.clear();
++        outer.clear();
++        previous = nullptr;
++    };
++
++    for (size_t step = 0; step <= count; step++)
++    {
++        const Sample& sample = samples[(start + step) % count];
++        if (!sample.InZone)
++        {
++            flush();
++            continue;
++        }
++
++        if (previous != nullptr)
++        {
++            if (previous->Works || sample.Works)
++                drawList->AddQuadFilled(previous->Middle, sample.Middle, sample.Inner, previous->Inner, works);
++
++            if (previous->Fails || sample.Fails)
++                drawList->AddQuadFilled(previous->Outer, sample.Outer, sample.Middle, previous->Middle, fails);
++        }
++
++        inner.push_back(sample.Inner);
++        outer.push_back(sample.Outer);
++        previous = &sample;
++    }
++
++    flush();
 +}
 +
 +bool TasHud::IsEnabled()
@@ -4404,9 +5605,8 @@ index 0000000..9285cd4
 +    DrawText(drawList, font, Scale(11), { left, panelMin.y + Scale(28) }, IM_COL32(220, 220, 220, 255),
 +        fmt::format("Total {:.2f}   Vertical {:.2f}", total, vertical));
 +
-+    // What the player is doing. For Sonic, then what a press on this frame would have done: the game checked
-+    // for the jump or stomp button during this frame's update. Both need a new press, holding the button
-+    // doesn't count.
++    // What the player is doing. For Sonic, then what a press entered now would do: whether the next update checks
++    // for the jump or stomp button. Both need a new press, holding the button doesn't count.
 +    float row = panelMin.y + Scale(46);
 +    float pressRow = row + Scale(20);
 +    // Sonic has a second row of presses, for the quick step; the Werehog has a row under his state instead, for when
@@ -4540,9 +5740,61 @@ index 0000000..9285cd4
 +    {
 +        bool sliding = stateName.starts_with("Sliding");
 +        bool stomping = stateName.starts_with("Stomping");
-+        bool canJump = g_jumpCheckFrame == g_frame;
++
++        // What a press entered now would do: the next update reads it. A state keeps trying what it tried during this
++        // frame's update, and a state entered during it tries what its update starts with.
++        bool entered = state != g_sonicPreviousStateObject;
++        bool outOfControl = GetFlag(context, STATE_FLAGS_OFFSET, OUT_OF_CONTROL_FLAG);
++        bool groundActionsNext = grounded && !outOfControl && entered && StartsWithGroundActions(state);
++
++        // A quick step runs the ground actions from a frame of its animation on: in how many updates. (The run quick
++        // step is still out of control then, and ends instead.)
++        bool quickStepping = stateName == "QuickStep" || stateName == "RunQuickStep";
++        int quickStepUpdates = -1;
++        if (quickStepping)
++        {
++            quickStepUpdates = stateName == "QuickStep" ? GetQuickStepFramesLeft(QUICK_STEP_ACTIONS_FRAME, 0, deltaTime) :
++                GetQuickStepFramesLeft(RUN_QUICK_STEP_ACTIONS_FRAME, RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES, deltaTime);
++        }
++
++        if (quickStepUpdates == 1 && grounded && !outOfControl)
++            groundActionsNext = true;
++
++        bool jumpTried = g_jumpCheckFrame == g_frame && (!entered || g_jumpCheckState == state);
++        bool canJump = grounded && (jumpTried || groundActionsNext);
++
++        // The air boost's state doesn't try the stomp, and stomping doesn't either.
 +        bool stompChecked = g_stompCheckFrame == g_frame;
-+        bool canStomp = stompChecked && !g_stompDisabledByHop && !g_stompBlocked;
++        bool stompTried = stompChecked && !g_stompDisabledByHop && !g_stompBlocked && stateName != "AirBoost" && !stomping;
++
++        // During a short hop: in how many updates the stomp will be accepted. The hop adds the frame's time
++        // (in single precision) to its own, and only then compares it and tries the stomp. Leaving the hop
++        // (for an air boost, say) clears the flag right away instead. The air boost's state ends on the update after
++        // the boost button is let go (CSonicStateAirBoost, sub_82390198): after a one-frame tap, the stomp is accepted
++        // 2 frames after the boost (jump, air boost, a frame, stomp in RooftopRunAct1.ltm).
++        bool hopping = stateName == "JumpShort" || stateName == "JumpHurdle";
++        int stompUpdates = -1;
++        if (hopping && GetFlag(context, STATE_FLAGS_OFFSET, STOMP_DISABLED_FLAG))
++        {
++            float time = stateTime;
++            stompUpdates = 0;
++            do
++            {
++                time += deltaTime;
++                stompUpdates++;
++            } while (time <= g_stompingDisableTime && stompUpdates < 99);
++        }
++        else if (!grounded && stateName == "AirBoost")
++        {
++            stompUpdates = AIR_BOOST_STOMP_FRAMES;
++        }
++        else if (!grounded && entered && g_sonicPreviousState == "AirBoost")
++        {
++            // The air boost ended during this frame's update: the new state tries the stomp.
++            stompUpdates = 1;
++        }
++
++        bool canStomp = !grounded && !stomping && (stompTried || (stompUpdates == 1 && !IsActionBlocked(context)));
 +
 +        DrawIndicator(drawList, font, { column2, row }, indicatorWidth, "SLIDING", IM_COL32(255, 200, 60, 230), sliding);
 +        DrawIndicator(drawList, font, { column3, row }, indicatorWidth, "STOMPING", IM_COL32(255, 110, 80, 230), stomping);
@@ -4557,59 +5809,23 @@ index 0000000..9285cd4
 +        DrawIndicator(drawList, font, { left, pressRow }, indicatorWidth, "CAN JUMP", IM_COL32(80, 230, 80, 255), canJump, true);
 +        DrawIndicator(drawList, font, { column2, pressRow }, indicatorWidth, "CAN STOMP", IM_COL32(80, 230, 80, 255), canStomp, true);
 +
-+        // During a short hop: in how many frames the stomp will be accepted. The hop adds the frame's time
-+        // (in single precision) to its own, and only then compares it and tries the stomp. Leaving the hop
-+        // (for an air boost, say) clears the flag right away instead. The air boost's state doesn't try the stomp,
-+        // and ends on the update after the boost button is let go (CSonicStateAirBoost, sub_82390198): after a
-+        // one-frame tap, the stomp is accepted 2 frames after the boost (jump, air boost, a frame, stomp in
-+        // RooftopRunAct1.ltm).
-+        bool hopping = stateName == "JumpShort" || stateName == "JumpHurdle";
-+        int stompFrames = -1;
-+        if (stompChecked && g_stompDisabledByHop && hopping)
-+        {
-+            float time = stateTime;
-+            stompFrames = 0;
-+            do
-+            {
-+                time += deltaTime;
-+                stompFrames++;
-+            } while (time <= g_stompingDisableTime && stompFrames < 99);
-+        }
-+        else if (!canStomp && !grounded && stateName == "AirBoost")
-+        {
-+            stompFrames = AIR_BOOST_STOMP_FRAMES;
-+        }
-+        else if (!canStomp && !grounded && g_sonicPreviousState == "AirBoost")
-+        {
-+            // The air boost ended on this frame's update, instead of the new state's trying the stomp.
-+            stompFrames = 1;
-+        }
++        // Otherwise, how many frames later a press would do it.
++        if (!canStomp && stompUpdates > 1)
++            DrawText(drawList, font, Scale(11), { column3, pressRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", stompUpdates - 1));
 +
-+        if (stompFrames > 0)
-+            DrawText(drawList, font, Scale(11), { column3, pressRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", stompFrames));
-+
-+        // Whether LB or RB on this frame would quick-step: the ground actions tried it during this frame's update. It
-+        // also needs a new press. During a quick step: in how many frames it lets the next one start.
-+        bool canQuickStep = g_quickStepCheckFrame == g_frame && !g_quickStepDisabled && !g_quickStepBlocked;
++        // Whether LB or RB would quick-step: the ground actions try it when no jump was taken. It also needs a new press.
++        // During a quick step: how many frames later the next one can start.
++        bool quickStepTried = g_quickStepCheckFrame == g_frame && (!entered || g_quickStepCheckState == state) &&
++            !g_quickStepDisabled && !g_quickStepBlocked;
++        bool quickStepFree = LoadU8(context + QUICK_STEP_DISABLED_OFFSET) == 0 && !IsActionBlocked(context);
++        bool canQuickStep = grounded && (quickStepTried || (groundActionsNext && quickStepFree));
 +        DrawIndicator(drawList, font, { left, quickStepRow }, 2 * indicatorWidth + gap, "CAN QUICKSTEP", IM_COL32(80, 230, 80, 255), canQuickStep, true);
 +
-+        bool quickStepping = stateName == "QuickStep" || stateName == "RunQuickStep";
-+        int quickStepFrames = -1;
-+        if (!canQuickStep && quickStepping)
-+        {
-+            quickStepFrames = stateName == "QuickStep" ? GetQuickStepFramesLeft(QUICK_STEP_ACTIONS_FRAME, 0, deltaTime) :
-+                GetQuickStepFramesLeft(RUN_QUICK_STEP_ACTIONS_FRAME, RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES, deltaTime);
-+        }
-+        else if (!canQuickStep && grounded && (g_sonicPreviousState == "QuickStep" || g_sonicPreviousState == "RunQuickStep"))
-+        {
-+            // The quick step ended on this frame's update, instead of the new state's running the ground actions.
-+            quickStepFrames = 1;
-+        }
-+
-+        if (quickStepFrames > 0)
-+            DrawText(drawList, font, Scale(11), { column3, quickStepRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", quickStepFrames));
++        if (!canQuickStep && quickStepUpdates > 1)
++            DrawText(drawList, font, Scale(11), { column3, quickStepRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", quickStepUpdates - 1));
 +
 +        g_sonicPreviousState = stateName;
++        g_sonicPreviousStateObject = state;
 +    }
 +
 +    DrawText(drawList, font, Scale(11), { left, stateRow }, IM_COL32(220, 220, 220, 255),
@@ -4639,6 +5855,7 @@ index 0000000..9285cd4
 +    // M-Speed, D-Speed and the break-jump are Sonic's: the Werehog can't do them. M-Speed is for 3D, where the stick
 +    // goes through the curve, D-Speed for 2D.
 +    std::string zoneText;
++    bool mSpeedBlocked = false;
 +    if (!werehog)
 +    {
 +        DrawLengthZone(drawList, centre, radius, BREAK_JUMP_MIN_LENGTH, BREAK_JUMP_MAX_LENGTH,
@@ -4658,13 +5875,19 @@ index 0000000..9285cd4
 +        }
 +        else
 +        {
-+            bool active = IsMSpeedInput(std::sqrt(gameLengthSquared));
-+            if (active)
++            MSpeedRule rule = GetMSpeedRule(context, grounded);
++            MSpeedInput input = GetMSpeedInput(rule, gameX, gameY);
++            if (input.Works)
++            {
 +                zoneText = "M-Speed";
++            }
++            else if (input.InZone)
++            {
++                zoneText = "M-Speed blocked";
++                mSpeedBlocked = true;
++            }
 +
-+            DrawLengthZone(drawList, centre, radius, GetStickLengthForMovementInput(g_movementInputDeadzone),
-+                GetStickLengthForMovementInput(M_SPEED_MAX_INPUT), active ? IM_COL32(0, 255, 0, 200) : IM_COL32(0, 255, 0, 80),
-+                active ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 160));
++            DrawMSpeedZone(drawList, centre, radius, rule, input);
 +        }
 +    }
 +
@@ -4678,7 +5901,8 @@ index 0000000..9285cd4
 +        if (breakJump)
 +            zoneText += zoneText.empty() ? "Break-jump" : " + Break-jump";
 +
-+        ImU32 zoneColour = zone ? IM_COL32(80, 255, 80, 255) : breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
++        ImU32 zoneColour = mSpeedBlocked ? IM_COL32(255, 80, 80, 255) : zone ? IM_COL32(80, 255, 80, 255) :
++            breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
 +        DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(6) }, zoneColour, zoneText.empty() ? "No zone" : zoneText);
 +    }
 +
@@ -4727,11 +5951,23 @@ index 0000000..5c7ebdd
 +
 +    void Draw();
 +}
+diff --git a/UnleashedRecomp/user/config_def.h b/UnleashedRecomp/user/config_def.h
+index 80eb29c..c282fb2 100644
+--- a/UnleashedRecomp/user/config_def.h
++++ b/UnleashedRecomp/user/config_def.h
+@@ -90,6 +90,7 @@ CONFIG_DEFINE_HIDDEN("Codes", bool, FixEggmanlandUsingEventGalleryTransition, fa
+ CONFIG_DEFINE_HIDDEN("Codes", bool, FixUnleashOutOfControlDrain, false);
+ CONFIG_DEFINE_HIDDEN("Codes", bool, HomingAttackOnJump, false);
+ CONFIG_DEFINE_HIDDEN("Codes", bool, HUDToggleKey, false);
++CONFIG_DEFINE_HIDDEN("Codes", bool, RestoreReadyGoSkip, false);
+ CONFIG_DEFINE_HIDDEN("Codes", bool, SaveScoreAtCheckpoints, false);
+ CONFIG_DEFINE_HIDDEN("Codes", bool, SkipIntroLogos, false);
+ CONFIG_DEFINE_HIDDEN("Codes", bool, UseAlternateTitle, false);
 diff --git a/UnleashedRecompLib/config/SWA.toml b/UnleashedRecompLib/config/SWA.toml
-index 5063e71..1808271 100644
+index 5063e71..98d2b84 100644
 --- a/UnleashedRecompLib/config/SWA.toml
 +++ b/UnleashedRecompLib/config/SWA.toml
-@@ -1153,3 +1153,29 @@ registers = ["f1"]
+@@ -1153,3 +1153,37 @@ registers = ["f1"]
  name = "CEvilSonicContext_CStateWall_LeaveRotationMidAsmHook"
  address = 0x82406774
  registers = ["f1"]
@@ -4755,12 +5991,20 @@ index 5063e71..1808271 100644
 +name = "TasStreamStopWaitMidAsmHook"
 +address = 0x8314A498
 +
-+# Stage collision debug view: load the Terrain blocks that also hold the stage's collision like collision-only ones.
++# Stage collision debug view: load the Terrain blocks that also hold the stage's collision like collision-only ones,
++# then again for their terrain, and the other ones like without the view (collision_view_patches.cpp).
 +[[midasm_hook]]
 +name = "StageCollisionDebugViewTerrainMidAsmHook"
 +address = 0x82564274
 +registers = ["r1"]
 +jump_address_on_true = 0x82564764
++
++# RestoreReadyGoSkip: undoes the title update's check that keeps Sonic in StartEvent or StartDash when
++# MsgReopenActivity comes (sub_82354E20), by clearing its result.
++[[midasm_hook]]
++name = "RestoreReadyGoSkipMidAsmHook"
++address = 0x82354ECC
++registers = ["r29"]
 Submodule thirdparty/plume 1192686..ab5289b:
 diff --git a/thirdparty/plume/plume_vulkan.cpp b/thirdparty/plume/plume_vulkan.cpp
 index 9103ca8..7243e60 100644
