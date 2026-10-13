@@ -7,9 +7,12 @@
 #include <ui/imgui_utils.h>
 #include <tas_mode.h>
 
+#include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <numbers>
 #include <unordered_map>
+#include <vector>
 
 // The day Sonic player context (SWA::Player::CSonicContext), recorded when its constructor runs. Its
 // velocity is split like in Sonic Generations' CPlayerSpeedContext: the full velocity, the part along the
@@ -37,6 +40,17 @@ static constexpr uint32_t STOMPING_DISABLE_TIME_PARAMETER = 292;
 static constexpr int AIR_BOOST_STOMP_FRAMES = 2;
 // The movement input is ignored while it's shorter than this (parameter 12, read by sub_823083F0).
 static constexpr uint32_t MOVEMENT_INPUT_DEADZONE_PARAMETER = 12;
+// InAirMaxAccelVelocity (15 by default), read by the 3D air update.
+static constexpr uint32_t IN_AIR_MAX_ACCEL_VELOCITY_PARAMETER = 22;
+// What the context reads its parameters by ID with (sub_8245DB60).
+static constexpr uint32_t PARAMETER_READER_OFFSET = 0x1FC;
+// The player's matrix node (SWA::CMatrixNodeTransform), whose matrix at +128 has the axes as rows: his facing is the
+// third (sub_8230A4E0).
+static constexpr uint32_t MATRIX_NODE_OFFSET = 16;
+static constexpr uint32_t MATRIX_NODE_FACING_OFFSET = 128 + 32;
+// The basis the 3D input turns the stick into the world with (sub_82316128): the stick's X along the first row, its Y
+// against the third.
+static constexpr uint32_t INPUT_BASIS_OFFSET = 0x290;
 // Stomping is also refused while this is set, unless flag 7 of the second set is (sub_8231B7D8).
 static constexpr uint32_t STOMP_BLOCKER_OFFSET = 0xCC8;
 static constexpr uint32_t STOMP_BLOCKER_OVERRIDE_FLAG = 7;
@@ -50,6 +64,24 @@ static constexpr float QUICK_STEP_ACTIONS_FRAME = 20.0f;
 static constexpr float RUN_QUICK_STEP_ACTIONS_FRAME = 8.0f;
 // How many frames the run quick step's out-of-control lasts after its animation reaches that frame.
 static constexpr int RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES = 1;
+// Out of control (CPlayerSpeedPosturePluginOutOfControl, the context's vfunc 56): the ground actions try nothing.
+static constexpr uint32_t OUT_OF_CONTROL_FLAG = 3;
+// The states whose update starts with the ground actions, which try the jump, then the quick step: entered during a
+// frame's update, they try them on the next. Land skips them only on the update that ends its animation.
+static constexpr uint32_t GROUND_ACTIONS_STATE_VFTABLES[] =
+{
+    0x820167F4, // CPlayerSpeedStateStand
+    0x820128B0, // CPlayerSpeedContext::CStateWalk
+    0x82016934, // CSonicContext::CStateWalk
+    0x82016A10, // CSonicContext::CStateBrakeEnd
+    0x820169B8, // CSonicStateMoveStop
+    0x8201B7F0, // CSonicStateDrift
+    0x8201BC60, // CSonicStateOnIce
+    0x82016B48, // CSonicStateShoesSliding
+    0x8201C550, // CSonicStateWallRunDamage
+    0x82011EF8, // CPlayerSpeedContext::CStateLand
+    0x82016A68, // CSonicStateLand
+};
 // Hedgehog engine states: the context at +8, the time spent in the state, in seconds, at +0x10.
 static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
 static constexpr uint32_t STATE_TIME_OFFSET = 0x10;
@@ -135,17 +167,22 @@ static bool g_evilContextIsNewer;
 static int16_t g_thumbLX;
 static int16_t g_thumbLY;
 
-// Counts drawn frames, to tell whether the checks below ran during the update of the frame being drawn.
+// Counts drawn frames, to tell whether the checks below ran during the update of the frame being drawn, and in which
+// state.
 static uint32_t g_frame = 1;
 static uint32_t g_jumpCheckFrame;
+static uint32_t g_jumpCheckState;
 static uint32_t g_stompCheckFrame;
 static bool g_stompDisabledByHop;
 static bool g_stompBlocked;
 static float g_stompingDisableTime = 0.15f;
 static float g_movementInputDeadzone = 0.02f;
+static float g_inAirMaxAccelVelocity = 15.0f;
 static uint32_t g_quickStepCheckFrame;
+static uint32_t g_quickStepCheckState;
 // Sonic's state on the last drawn frame.
 static std::string g_sonicPreviousState;
+static uint32_t g_sonicPreviousStateObject;
 static bool g_quickStepDisabled;
 static bool g_quickStepBlocked;
 
@@ -391,13 +428,18 @@ static bool GetFlag(uint32_t context, uint32_t flagsOffset, uint32_t flag)
     return flags != 0 && LoadU8(LoadU32(flags + 4) + flag) != 0;
 }
 
+static uint32_t GetCurrentState(uint32_t context);
+
 // The context's TryJump: jumps if the jump button is pressed. The states that allow jumping call it every
 // frame; others, like a quick step until it ends, don't.
 PPC_FUNC_IMPL(__imp__sub_82330CB0);
 PPC_FUNC(sub_82330CB0)
 {
     if (TasHud::IsEnabled() && ctx.r3.u32 == g_speedContext)
+    {
         g_jumpCheckFrame = g_frame;
+        g_jumpCheckState = GetCurrentState(ctx.r3.u32);
+    }
 
     __imp__sub_82330CB0(ctx, base);
 }
@@ -433,6 +475,7 @@ PPC_FUNC(sub_82386E60)
     if (TasHud::IsEnabled() && context == g_speedContext)
     {
         g_quickStepCheckFrame = g_frame;
+        g_quickStepCheckState = GetCurrentState(context);
         g_quickStepDisabled = LoadU8(context + QUICK_STEP_DISABLED_OFFSET) != 0;
         g_quickStepBlocked = IsActionBlocked(context);
     }
@@ -502,11 +545,12 @@ PPC_FUNC(sub_82BBD568)
     __imp__sub_82BBD568(ctx, base);
 }
 
-// Reads a float parameter of the player by ID. Records StompingDisableTime when the short hop reads it, and the
-// movement input's deadzone when the input is read.
+// Reads a float parameter of the player by ID. Records StompingDisableTime when the short hop reads it, the
+// movement input's deadzone when the input is read, and day Sonic's InAirMaxAccelVelocity when the air update reads it.
 PPC_FUNC_IMPL(__imp__sub_8245DB60);
 PPC_FUNC(sub_8245DB60)
 {
+    uint32_t reader = ctx.r3.u32;
     uint32_t parameter = ctx.r4.u32;
     __imp__sub_8245DB60(ctx, base);
 
@@ -515,6 +559,12 @@ PPC_FUNC(sub_8245DB60)
 
     if (parameter == MOVEMENT_INPUT_DEADZONE_PARAMETER && TasHud::IsEnabled())
         g_movementInputDeadzone = float(ctx.f1.f64);
+
+    if (parameter == IN_AIR_MAX_ACCEL_VELOCITY_PARAMETER && TasHud::IsEnabled() && g_speedContext != 0 &&
+        reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
+    {
+        g_inAirMaxAccelVelocity = float(ctx.f1.f64);
+    }
 }
 
 // The current state of the player's state machine, or 0. The machine points to the current state's record
@@ -529,6 +579,13 @@ static uint32_t GetCurrentState(uint32_t context)
     uint32_t record = LoadU32(stateMachine + 0x58);
     uint32_t state = LoadU32(record + 0x1C);
     return state != 0 && LoadU32(state + STATE_CONTEXT_OFFSET) == context ? state : 0;
+}
+
+static bool StartsWithGroundActions(uint32_t state)
+{
+    uint32_t vftable = state != 0 ? LoadU32(state) : 0;
+    return std::find(std::begin(GROUND_ACTIONS_STATE_VFTABLES), std::end(GROUND_ACTIONS_STATE_VFTABLES), vftable) !=
+        std::end(GROUND_ACTIONS_STATE_VFTABLES);
 }
 
 // The name of the state's class, from the game's RTTI: "CStateJumpShort@CSonicContext@..." becomes "JumpShort".
@@ -600,15 +657,85 @@ static constexpr TargetZone TARGET_ZONES[] =
 
 // M-Speed, from the 3D air update (sub_82346880). Leaving the ground sets flag 27 (the context's vfunc 25,
 // sub_82374360; landing clears it), and the update clears it as soon as the movement input is longer than 0.3; while
-// it's set, the air deceleration is 0. The update aims for the input's part along Sonic's facing times
-// max(InAirMaxAccelVelocity, his speed) (sub_8234C5F8). A short input puts that below his speed, so the update
-// decelerates him, by 0, and then pushes him along his velocity instead, by a force that grows with the square of his
-// speed: he gains speed every frame. The 3D input (CPlayerSpeedPostureInput3DStandard, sub_8234EE88; PathLocal,
-// sub_8234F4D0, does the same) is the stick's direction times (length / 0.9)³, at most 1, and is ignored below
-// parameter 12 (0.02, sub_823083F0). So on the stick as the game reads it, M-Speed takes a length from about 0.244 to
-// 0.602, in any direction. 2D reads the stick without the curve.
+// it's set, the air deceleration is 0. The update (sub_8234C5F8) aims for a speed along Sonic's facing: the input's part
+// along it times max(InAirMaxAccelVelocity, his speed). If that's above his speed along his facing, he accelerates
+// toward it (an input against his facing always is). Otherwise he decelerates, by 0, and then, while his speed along his
+// facing is below that max, he's pushed along his velocity by a force that grows with the square of his speed: he gains
+// speed every frame. Unless the aim is over 0.25 and within 0.1 of his speed along his facing: then nothing happens. So
+// the input has to point to his facing's side of the stick, and at low speeds, not too far toward it. The 3D input
+// (CPlayerSpeedPostureInput3DStandard, sub_8234EE88; PathLocal, sub_8234F4D0, does the same) is the stick's direction
+// times (length / 0.9)³, at most 1, turned into the world by the context's input basis (sub_82316128), and is ignored
+// below parameter 12 (0.02, sub_823083F0). So on the stick as the game reads it, M-Speed takes a length from about 0.244
+// to 0.602, on the side Sonic faces. 2D reads the stick without the curve.
 static constexpr float MOVEMENT_INPUT_SCALE = 1.0f / 0.9f;
 static constexpr float M_SPEED_MAX_INPUT = 0.3f;
+static constexpr float M_SPEED_STILL_MIN_AIM = 0.25f;
+static constexpr float M_SPEED_STILL_DIFFERENCE = 0.1f;
+
+// The flag that keeps the air deceleration at 0 (see above).
+static constexpr uint32_t NO_AIR_DECELERATION_FLAG = 27;
+
+// What decides M-Speed's directions, for the frame being drawn. Sonic's facing on the stick, as drawn (x right, y
+// down): an input of length m in direction a aims for m * (cos a * FacingX + sin a * FacingY) * Target along his facing.
+// Off in the air once the flag is cleared, until he lands.
+struct MSpeedRule
+{
+    float FacingX = 0.0f;
+    float FacingY = -1.0f;
+    float Target = 15.0f;
+    float AlongFacing = 0.0f;
+    bool Off = false;
+};
+
+static MSpeedRule GetMSpeedRule(uint32_t context, bool grounded)
+{
+    MSpeedRule rule;
+    rule.Off = !grounded && !GetFlag(context, STATE_FLAGS_OFFSET, NO_AIR_DECELERATION_FLAG);
+
+    uint32_t node = LoadU32(context + MATRIX_NODE_OFFSET);
+    float facing[3], right[3], back[3], velocity[3];
+    for (int i = 0; i < 3; i++)
+    {
+        facing[i] = LoadFloat(node + MATRIX_NODE_FACING_OFFSET + i * 4);
+        right[i] = LoadFloat(context + INPUT_BASIS_OFFSET + i * 4);
+        back[i] = LoadFloat(context + INPUT_BASIS_OFFSET + 32 + i * 4);
+        velocity[i] = LoadFloat(context + HORIZONTAL_VELOCITY_OFFSET + i * 4);
+    }
+
+    auto dot = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    float speed = std::sqrt(dot(velocity, velocity));
+
+    // The stick's X goes along the basis' first row and its Y against the third, and Y is drawn upside down.
+    if (node != 0 && std::isfinite(dot(facing, facing)))
+    {
+        rule.FacingX = dot(right, facing);
+        rule.FacingY = dot(back, facing);
+    }
+
+    rule.Target = std::max(g_inAirMaxAccelVelocity, speed);
+    rule.AlongFacing = dot(velocity, facing);
+    return rule;
+}
+
+// Whether direction a (as drawn) is on the side of the stick Sonic faces, where M-Speed can be. All of it if he faces
+// straight up or down.
+static bool IsFacingSide(const MSpeedRule& rule, float cosine, float sine)
+{
+    return std::hypot(rule.FacingX, rule.FacingY) < 0.001f || cosine * rule.FacingX + sine * rule.FacingY > 0.0f;
+}
+
+// The longest movement input that M-Speeds in direction a (as drawn), or 0.
+static float GetMSpeedMaxInput(const MSpeedRule& rule, float cosine, float sine)
+{
+    float forward = cosine * rule.FacingX + sine * rule.FacingY;
+    if (rule.Off || !(forward > 0.0f) || !(rule.AlongFacing < rule.Target))
+        return 0.0f;
+
+    float maxAim = rule.AlongFacing > M_SPEED_STILL_MIN_AIM ?
+        std::max(M_SPEED_STILL_MIN_AIM, rule.AlongFacing - M_SPEED_STILL_DIFFERENCE) : rule.AlongFacing;
+
+    return std::min(M_SPEED_MAX_INPUT, maxAim / (forward * rule.Target));
+}
 
 // The 3D movement input's length for a stick length.
 static float GetMovementInput(float stickLength)
@@ -624,10 +751,27 @@ static float GetStickLengthForMovementInput(float input)
     return std::cbrt(input) / MOVEMENT_INPUT_SCALE;
 }
 
-static bool IsMSpeedInput(float stickLength)
+// Where the stick as the game reads it (y up) is: in the M-Speed zone's range of lengths on the side Sonic faces, and
+// whether it M-Speeds there.
+struct MSpeedInput
 {
-    float input = GetMovementInput(stickLength);
-    return input >= g_movementInputDeadzone && input <= M_SPEED_MAX_INPUT;
+    bool InZone = false;
+    bool Works = false;
+};
+
+static MSpeedInput GetMSpeedInput(const MSpeedRule& rule, float gameX, float gameY)
+{
+    MSpeedInput result;
+    float length = std::hypot(gameX, gameY);
+    float input = GetMovementInput(length);
+    if (!(length > 0.0f) || input < g_movementInputDeadzone || input > M_SPEED_MAX_INPUT)
+        return result;
+
+    float cosine = gameX / length;
+    float sine = -gameY / length;
+    result.InZone = IsFacingSide(rule, cosine, sine);
+    result.Works = result.InZone && input <= GetMSpeedMaxInput(rule, cosine, sine);
+    return result;
 }
 
 static bool IsInZone(const TargetZone& zone, float x, float y)
@@ -694,6 +838,106 @@ static void DrawLengthZone(ImDrawList* drawList, ImVec2 centre, float scale, flo
 
     drawList->AddPolyline(outer, POINTS, outline, ImDrawFlags_Closed, Scale(1));
     drawList->AddPolyline(inner, POINTS, outline, ImDrawFlags_Closed, Scale(1));
+}
+
+// The M-Speed zone: like the length zone, from the deadzone's input to 0.3, on the side of the stick Sonic faces. Green up
+// to the longest input that M-Speeds in each direction, red past it (all of it where nothing does). Bright where the
+// stick is.
+static void DrawMSpeedZone(ImDrawList* drawList, ImVec2 centre, float scale, const MSpeedRule& rule, const MSpeedInput& stick)
+{
+    constexpr int ARC_SEGMENTS = 24;
+
+    ImU32 works = stick.Works ? IM_COL32(0, 255, 0, 200) : IM_COL32(0, 255, 0, 80);
+    ImU32 fails = stick.InZone && !stick.Works ? IM_COL32(255, 40, 40, 200) : IM_COL32(255, 40, 40, 80);
+    ImU32 outline = stick.InZone ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 160);
+
+    float minLength = GetStickLengthForMovementInput(g_movementInputDeadzone);
+    float maxLength = GetStickLengthForMovementInput(M_SPEED_MAX_INPUT);
+
+    struct Sample
+    {
+        bool InZone;
+        bool Works;
+        bool Fails;
+        ImVec2 Inner;
+        ImVec2 Middle;
+        ImVec2 Outer;
+    };
+
+    // Around the stick, quadrant by quadrant: between two quadrants, at the same angle, the zone's straight sides.
+    std::vector<Sample> samples;
+    for (int quadrant = 0; quadrant < 4; quadrant++)
+    {
+        float cornerX = (quadrant == 0 || quadrant == 3) ? GAME_STICK_DEADZONE : -GAME_STICK_DEADZONE;
+        float cornerY = quadrant < 2 ? GAME_STICK_DEADZONE : -GAME_STICK_DEADZONE;
+
+        for (int i = 0; i <= ARC_SEGMENTS; i++)
+        {
+            float angle = (quadrant + float(i) / ARC_SEGMENTS) * PI / 2;
+            float cosine = std::cos(angle);
+            float sine = std::sin(angle);
+            float maxInput = GetMSpeedMaxInput(rule, cosine, sine);
+            float middleLength = GetStickLengthForMovementInput(std::clamp(maxInput, g_movementInputDeadzone, M_SPEED_MAX_INPUT));
+
+            float shrink = 1.0f - GAME_STICK_DEADZONE;
+            auto point = [&](float length)
+            {
+                return ImVec2{ centre.x + (cornerX + cosine * shrink * length) * scale, centre.y + (cornerY + sine * shrink * length) * scale };
+            };
+
+            samples.push_back({ IsFacingSide(rule, cosine, sine), maxInput > g_movementInputDeadzone, maxInput < M_SPEED_MAX_INPUT,
+                point(minLength), point(middleLength), point(maxLength) });
+        }
+    }
+
+    // Start outside the zone, so each part of it is drawn in one go.
+    size_t count = samples.size();
+    size_t start = 0;
+    while (start < count && samples[start].InZone)
+        start++;
+
+    std::vector<ImVec2> inner;
+    std::vector<ImVec2> outer;
+    const Sample* previous = nullptr;
+    auto flush = [&]()
+    {
+        if (outer.size() >= 2)
+        {
+            // The outline: the outer edge, then back along the inner one.
+            std::vector<ImVec2> line(outer);
+            line.insert(line.end(), inner.rbegin(), inner.rend());
+            drawList->AddPolyline(line.data(), int(line.size()), outline, ImDrawFlags_Closed, Scale(1));
+        }
+
+        inner.clear();
+        outer.clear();
+        previous = nullptr;
+    };
+
+    for (size_t step = 0; step <= count; step++)
+    {
+        const Sample& sample = samples[(start + step) % count];
+        if (!sample.InZone)
+        {
+            flush();
+            continue;
+        }
+
+        if (previous != nullptr)
+        {
+            if (previous->Works || sample.Works)
+                drawList->AddQuadFilled(previous->Middle, sample.Middle, sample.Inner, previous->Inner, works);
+
+            if (previous->Fails || sample.Fails)
+                drawList->AddQuadFilled(previous->Outer, sample.Outer, sample.Middle, previous->Middle, fails);
+        }
+
+        inner.push_back(sample.Inner);
+        outer.push_back(sample.Outer);
+        previous = &sample;
+    }
+
+    flush();
 }
 
 bool TasHud::IsEnabled()
@@ -904,9 +1148,8 @@ void TasHud::Draw()
     DrawText(drawList, font, Scale(11), { left, panelMin.y + Scale(28) }, IM_COL32(220, 220, 220, 255),
         fmt::format("Total {:.2f}   Vertical {:.2f}", total, vertical));
 
-    // What the player is doing. For Sonic, then what a press on this frame would have done: the game checked
-    // for the jump or stomp button during this frame's update. Both need a new press, holding the button
-    // doesn't count.
+    // What the player is doing. For Sonic, then what a press entered now would do: whether the next update checks
+    // for the jump or stomp button. Both need a new press, holding the button doesn't count.
     float row = panelMin.y + Scale(46);
     float pressRow = row + Scale(20);
     // Sonic has a second row of presses, for the quick step; the Werehog has a row under his state instead, for when
@@ -1040,9 +1283,61 @@ void TasHud::Draw()
     {
         bool sliding = stateName.starts_with("Sliding");
         bool stomping = stateName.starts_with("Stomping");
-        bool canJump = g_jumpCheckFrame == g_frame;
+
+        // What a press entered now would do: the next update reads it. A state keeps trying what it tried during this
+        // frame's update, and a state entered during it tries what its update starts with.
+        bool entered = state != g_sonicPreviousStateObject;
+        bool outOfControl = GetFlag(context, STATE_FLAGS_OFFSET, OUT_OF_CONTROL_FLAG);
+        bool groundActionsNext = grounded && !outOfControl && entered && StartsWithGroundActions(state);
+
+        // A quick step runs the ground actions from a frame of its animation on: in how many updates. (The run quick
+        // step is still out of control then, and ends instead.)
+        bool quickStepping = stateName == "QuickStep" || stateName == "RunQuickStep";
+        int quickStepUpdates = -1;
+        if (quickStepping)
+        {
+            quickStepUpdates = stateName == "QuickStep" ? GetQuickStepFramesLeft(QUICK_STEP_ACTIONS_FRAME, 0, deltaTime) :
+                GetQuickStepFramesLeft(RUN_QUICK_STEP_ACTIONS_FRAME, RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES, deltaTime);
+        }
+
+        if (quickStepUpdates == 1 && grounded && !outOfControl)
+            groundActionsNext = true;
+
+        bool jumpTried = g_jumpCheckFrame == g_frame && (!entered || g_jumpCheckState == state);
+        bool canJump = grounded && (jumpTried || groundActionsNext);
+
+        // The air boost's state doesn't try the stomp, and stomping doesn't either.
         bool stompChecked = g_stompCheckFrame == g_frame;
-        bool canStomp = stompChecked && !g_stompDisabledByHop && !g_stompBlocked;
+        bool stompTried = stompChecked && !g_stompDisabledByHop && !g_stompBlocked && stateName != "AirBoost" && !stomping;
+
+        // During a short hop: in how many updates the stomp will be accepted. The hop adds the frame's time
+        // (in single precision) to its own, and only then compares it and tries the stomp. Leaving the hop
+        // (for an air boost, say) clears the flag right away instead. The air boost's state ends on the update after
+        // the boost button is let go (CSonicStateAirBoost, sub_82390198): after a one-frame tap, the stomp is accepted
+        // 2 frames after the boost (jump, air boost, a frame, stomp in RooftopRunAct1.ltm).
+        bool hopping = stateName == "JumpShort" || stateName == "JumpHurdle";
+        int stompUpdates = -1;
+        if (hopping && GetFlag(context, STATE_FLAGS_OFFSET, STOMP_DISABLED_FLAG))
+        {
+            float time = stateTime;
+            stompUpdates = 0;
+            do
+            {
+                time += deltaTime;
+                stompUpdates++;
+            } while (time <= g_stompingDisableTime && stompUpdates < 99);
+        }
+        else if (!grounded && stateName == "AirBoost")
+        {
+            stompUpdates = AIR_BOOST_STOMP_FRAMES;
+        }
+        else if (!grounded && entered && g_sonicPreviousState == "AirBoost")
+        {
+            // The air boost ended during this frame's update: the new state tries the stomp.
+            stompUpdates = 1;
+        }
+
+        bool canStomp = !grounded && !stomping && (stompTried || (stompUpdates == 1 && !IsActionBlocked(context)));
 
         DrawIndicator(drawList, font, { column2, row }, indicatorWidth, "SLIDING", IM_COL32(255, 200, 60, 230), sliding);
         DrawIndicator(drawList, font, { column3, row }, indicatorWidth, "STOMPING", IM_COL32(255, 110, 80, 230), stomping);
@@ -1057,59 +1352,23 @@ void TasHud::Draw()
         DrawIndicator(drawList, font, { left, pressRow }, indicatorWidth, "CAN JUMP", IM_COL32(80, 230, 80, 255), canJump, true);
         DrawIndicator(drawList, font, { column2, pressRow }, indicatorWidth, "CAN STOMP", IM_COL32(80, 230, 80, 255), canStomp, true);
 
-        // During a short hop: in how many frames the stomp will be accepted. The hop adds the frame's time
-        // (in single precision) to its own, and only then compares it and tries the stomp. Leaving the hop
-        // (for an air boost, say) clears the flag right away instead. The air boost's state doesn't try the stomp,
-        // and ends on the update after the boost button is let go (CSonicStateAirBoost, sub_82390198): after a
-        // one-frame tap, the stomp is accepted 2 frames after the boost (jump, air boost, a frame, stomp in
-        // RooftopRunAct1.ltm).
-        bool hopping = stateName == "JumpShort" || stateName == "JumpHurdle";
-        int stompFrames = -1;
-        if (stompChecked && g_stompDisabledByHop && hopping)
-        {
-            float time = stateTime;
-            stompFrames = 0;
-            do
-            {
-                time += deltaTime;
-                stompFrames++;
-            } while (time <= g_stompingDisableTime && stompFrames < 99);
-        }
-        else if (!canStomp && !grounded && stateName == "AirBoost")
-        {
-            stompFrames = AIR_BOOST_STOMP_FRAMES;
-        }
-        else if (!canStomp && !grounded && g_sonicPreviousState == "AirBoost")
-        {
-            // The air boost ended on this frame's update, instead of the new state's trying the stomp.
-            stompFrames = 1;
-        }
+        // Otherwise, how many frames later a press would do it.
+        if (!canStomp && stompUpdates > 1)
+            DrawText(drawList, font, Scale(11), { column3, pressRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", stompUpdates - 1));
 
-        if (stompFrames > 0)
-            DrawText(drawList, font, Scale(11), { column3, pressRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", stompFrames));
-
-        // Whether LB or RB on this frame would quick-step: the ground actions tried it during this frame's update. It
-        // also needs a new press. During a quick step: in how many frames it lets the next one start.
-        bool canQuickStep = g_quickStepCheckFrame == g_frame && !g_quickStepDisabled && !g_quickStepBlocked;
+        // Whether LB or RB would quick-step: the ground actions try it when no jump was taken. It also needs a new press.
+        // During a quick step: how many frames later the next one can start.
+        bool quickStepTried = g_quickStepCheckFrame == g_frame && (!entered || g_quickStepCheckState == state) &&
+            !g_quickStepDisabled && !g_quickStepBlocked;
+        bool quickStepFree = LoadU8(context + QUICK_STEP_DISABLED_OFFSET) == 0 && !IsActionBlocked(context);
+        bool canQuickStep = grounded && (quickStepTried || (groundActionsNext && quickStepFree));
         DrawIndicator(drawList, font, { left, quickStepRow }, 2 * indicatorWidth + gap, "CAN QUICKSTEP", IM_COL32(80, 230, 80, 255), canQuickStep, true);
 
-        bool quickStepping = stateName == "QuickStep" || stateName == "RunQuickStep";
-        int quickStepFrames = -1;
-        if (!canQuickStep && quickStepping)
-        {
-            quickStepFrames = stateName == "QuickStep" ? GetQuickStepFramesLeft(QUICK_STEP_ACTIONS_FRAME, 0, deltaTime) :
-                GetQuickStepFramesLeft(RUN_QUICK_STEP_ACTIONS_FRAME, RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES, deltaTime);
-        }
-        else if (!canQuickStep && grounded && (g_sonicPreviousState == "QuickStep" || g_sonicPreviousState == "RunQuickStep"))
-        {
-            // The quick step ended on this frame's update, instead of the new state's running the ground actions.
-            quickStepFrames = 1;
-        }
-
-        if (quickStepFrames > 0)
-            DrawText(drawList, font, Scale(11), { column3, quickStepRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", quickStepFrames));
+        if (!canQuickStep && quickStepUpdates > 1)
+            DrawText(drawList, font, Scale(11), { column3, quickStepRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", quickStepUpdates - 1));
 
         g_sonicPreviousState = stateName;
+        g_sonicPreviousStateObject = state;
     }
 
     DrawText(drawList, font, Scale(11), { left, stateRow }, IM_COL32(220, 220, 220, 255),
@@ -1139,6 +1398,7 @@ void TasHud::Draw()
     // M-Speed, D-Speed and the break-jump are Sonic's: the Werehog can't do them. M-Speed is for 3D, where the stick
     // goes through the curve, D-Speed for 2D.
     std::string zoneText;
+    bool mSpeedBlocked = false;
     if (!werehog)
     {
         DrawLengthZone(drawList, centre, radius, BREAK_JUMP_MIN_LENGTH, BREAK_JUMP_MAX_LENGTH,
@@ -1158,13 +1418,19 @@ void TasHud::Draw()
         }
         else
         {
-            bool active = IsMSpeedInput(std::sqrt(gameLengthSquared));
-            if (active)
+            MSpeedRule rule = GetMSpeedRule(context, grounded);
+            MSpeedInput input = GetMSpeedInput(rule, gameX, gameY);
+            if (input.Works)
+            {
                 zoneText = "M-Speed";
+            }
+            else if (input.InZone)
+            {
+                zoneText = "M-Speed blocked";
+                mSpeedBlocked = true;
+            }
 
-            DrawLengthZone(drawList, centre, radius, GetStickLengthForMovementInput(g_movementInputDeadzone),
-                GetStickLengthForMovementInput(M_SPEED_MAX_INPUT), active ? IM_COL32(0, 255, 0, 200) : IM_COL32(0, 255, 0, 80),
-                active ? IM_COL32(255, 255, 255, 220) : IM_COL32(0, 0, 0, 160));
+            DrawMSpeedZone(drawList, centre, radius, rule, input);
         }
     }
 
@@ -1178,7 +1444,8 @@ void TasHud::Draw()
         if (breakJump)
             zoneText += zoneText.empty() ? "Break-jump" : " + Break-jump";
 
-        ImU32 zoneColour = zone ? IM_COL32(80, 255, 80, 255) : breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
+        ImU32 zoneColour = mSpeedBlocked ? IM_COL32(255, 80, 80, 255) : zone ? IM_COL32(80, 255, 80, 255) :
+            breakJump ? IM_COL32(255, 160, 40, 255) : IM_COL32(200, 200, 200, 255);
         DrawText(drawList, font, Scale(11), { left, centre.y + radius + Scale(6) }, zoneColour, zoneText.empty() ? "No zone" : zoneText);
     }
 
