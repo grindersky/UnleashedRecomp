@@ -43,9 +43,9 @@ Add `UNLEASHED_TAS_HUD=1` for a HUD, shown in levels. It's drawn into the frames
 
 The collision view codes (`EnableStageCollisionDebugView`, `EnableEventCollisionDebugView` and
 `EnableObjectCollisionDebugView`) also draw the player's collision that's on: his body (cyan) and what touches rings,
-objects and triggers (magenta). The stage collision view also draws the grind rails' collision (orange). They're drawn
-over everything, walls included; F12 switches to hiding them behind walls and back (this needs anti-aliasing off).
-Under libTAS, F12 is recorded into the movie.
+objects and triggers (magenta). The stage collision view also draws the grind rails' collision (orange). They're
+hidden behind walls; F12 switches to drawing them over everything, walls included, and back. Hiding them needs
+anti-aliasing off: with it on, they're always drawn over everything. Under libTAS, F12 is recorded into the movie.
 
 ## Keeping movies in sync
 
