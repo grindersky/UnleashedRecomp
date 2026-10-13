@@ -34,19 +34,25 @@ Add `UNLEASHED_TAS_HUD=1` for a HUD, shown in levels. It's drawn into the frames
 - As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss
   fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump,
   stomp or quick step pressed on the current frame would work, with countdowns until a stomp is allowed again after a
-  jump or an air boost, and until the next quick step), the stick with the M-Speed zone (in 3D, in any direction), the
-  D-Speed zones (in 2D) and the break-jump zone (orange), and the buttons (lit while held, with a ring on the frame
-  they're pressed).
+  jump or an air boost, and until the next quick step), the stick with the M-Speed zone (in 3D, on the side of the
+  stick Sonic faces: green where it works, red where it doesn't), the D-Speed zones (in 2D) and the break-jump zone
+  (orange), and the buttons (lit while held, with a ring on the frame they're pressed).
 - As the Werehog: his speed, his state (on the ground or in the air, dashing, attacking, which attack and in how many
   frames it ends on its own, with and without the stick), whether a guard (LB) pressed on the current frame would
   work, his Unleash gauge, the stage time, the stick and the buttons.
 
 The collision view codes (`EnableStageCollisionDebugView`, `EnableEventCollisionDebugView` and
 `EnableObjectCollisionDebugView`) also draw the player's collision that's on: his body (cyan), what touches rings,
-objects and triggers (magenta), and day Sonic's path collision (blue), which most likely touches paths like the grind
-rails. The stage collision view also draws the grind rails' collision (orange). They're
-hidden behind walls; F12 switches to drawing them over everything, walls included, and back. Hiding them needs
-anti-aliasing off: with it on, they're always drawn over everything. Under libTAS, F12 is recorded into the movie.
+objects and triggers (magenta, green while day Sonic attacks, like when he slides), and day Sonic's path collision
+(blue), which most likely touches paths like the grind rails. They draw an arrow at his feet, pointing where he faces,
+and, where the views don't already show them, the enemies' collision (red) and the goal ring's (white). The stage
+collision view also draws the grind rails' collision (orange). These are hidden behind walls; F12 switches to drawing
+them over everything, walls included, and back. Hiding them needs anti-aliasing off: with it on, they're always drawn
+over everything. F11 switches between the views and the level as it normally looks. Under libTAS, F11 and F12 are
+recorded into the movie.
+
+The `RestoreReadyGoSkip` code brings back a glitch the title update fixed: pause during a stage's in-game cutscene
+and restart, and Sonic can move during Ready... GO!
 
 ## Keeping movies in sync
 
