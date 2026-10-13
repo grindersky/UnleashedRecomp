@@ -390,6 +390,20 @@ static std::unique_ptr<RenderTextureView> g_blankTextureViews[TEXTURE_DESCRIPTOR
 
 static TextureDescriptorAllocator g_textureDescriptorAllocator;
 
+// The collision debug views draw with DebugHavokPrimitiveTexNrm (any of its variants), which tints its texture (s0) by
+// each collision's colour. That texture, HavokRenderBlock.dds, a grey 2x2 checker with soft edges, is only in the
+// action stages' archive (ActionCommon.ar), so elsewhere (towns, say) the shader read whatever texture earlier draws
+// had left. Draw with a copy of the checker instead, everywhere, and give the texture that was there back afterwards.
+static constexpr XXH64_hash_t DEBUG_HAVOK_PRIMITIVE_SHADER_HASHES[] =
+{
+    0x5990016B666631DA, 0x8C4DE27769FE5C89, 0x91F8461807AD0626, 0x632295E78DE9CB33,
+    0xE550AE4BCBF42BBE, 0x36AC066D27DC1026, 0xFED92627A5611E78, 0x24E400DB094550BC,
+};
+
+static std::unique_ptr<GuestTexture> g_havokRenderBlockTexture;
+static bool g_havokRenderBlockBound;
+static uint32_t g_havokRenderBlockReplaced;
+
 static std::unique_ptr<RenderPipelineLayout> g_pipelineLayout;
 static xxHashMap<std::unique_ptr<RenderPipeline>> g_pipelines;
 
@@ -1534,6 +1548,78 @@ static void CreateImGuiBackend()
 #endif
 }
 
+// The checker the collision debug views draw with (see g_havokRenderBlockTexture), made to look like HavokRenderBlock.dds:
+// 64-texel squares, dark in the top left, each fading to a slightly darker edge over its outer 12 texels, with mipmaps.
+static void CreateHavokRenderBlockTexture()
+{
+    constexpr uint32_t SIZE = 128;
+    constexpr uint32_t MIP_LEVELS = 8;
+    constexpr uint32_t SQUARE = 64;
+    constexpr float BEVEL = 12.0f;
+    constexpr float DARK[3] = { 139.0f, 142.0f, 148.0f };
+    constexpr float DARK_EDGE[3] = { 131.0f, 134.0f, 139.0f };
+    constexpr float LIGHT[3] = { 160.0f, 164.0f, 172.0f };
+    constexpr float LIGHT_EDGE[3] = { 150.0f, 153.0f, 160.0f };
+
+    std::vector<std::vector<uint8_t>> mips(1, std::vector<uint8_t>(SIZE * SIZE * 4));
+    for (uint32_t y = 0; y < SIZE; y++)
+    {
+        for (uint32_t x = 0; x < SIZE; x++)
+        {
+            bool light = ((x / SQUARE) + (y / SQUARE)) % 2 == 1;
+            uint32_t squareX = x % SQUARE;
+            uint32_t squareY = y % SQUARE;
+            uint32_t edgeDistance = std::min({ squareX, squareY, SQUARE - 1 - squareX, SQUARE - 1 - squareY });
+            float t = std::min(float(edgeDistance) / BEVEL, 1.0f);
+            t = t * t * (3.0f - 2.0f * t);
+
+            uint8_t* pixel = &mips[0][(y * SIZE + x) * 4];
+            for (int i = 0; i < 3; i++)
+            {
+                float edge = light ? LIGHT_EDGE[i] : DARK_EDGE[i];
+                float inside = light ? LIGHT[i] : DARK[i];
+                pixel[i] = uint8_t(std::lround(edge + (inside - edge) * t));
+            }
+
+            pixel[3] = 255;
+        }
+    }
+
+    // Each mipmap averages 2x2 texels of the one above.
+    for (uint32_t level = 1, size = SIZE / 2; level < MIP_LEVELS; level++, size /= 2)
+    {
+        const auto& above = mips.back();
+        std::vector<uint8_t> mip(size * size * 4);
+        for (uint32_t y = 0; y < size; y++)
+        {
+            for (uint32_t x = 0; x < size; x++)
+            {
+                for (uint32_t i = 0; i < 4; i++)
+                {
+                    uint32_t sum = above[((y * 2) * size * 2 + x * 2) * 4 + i] + above[((y * 2) * size * 2 + x * 2 + 1) * 4 + i] +
+                        above[((y * 2 + 1) * size * 2 + x * 2) * 4 + i] + above[((y * 2 + 1) * size * 2 + x * 2 + 1) * 4 + i];
+                    mip[(y * size + x) * 4 + i] = uint8_t((sum + 2) / 4);
+                }
+            }
+        }
+
+        mips.push_back(std::move(mip));
+    }
+
+    ddspp::Header header;
+    ddspp::HeaderDXT10 headerDX10;
+    ddspp::encode_header(ddspp::R8G8B8A8_UNORM, SIZE, SIZE, 1, ddspp::Texture2D, MIP_LEVELS, 1, header, headerDX10);
+
+    std::vector<uint8_t> dds(sizeof(ddspp::DDS_MAGIC) + sizeof(header) + sizeof(headerDX10));
+    memcpy(dds.data(), &ddspp::DDS_MAGIC, sizeof(ddspp::DDS_MAGIC));
+    memcpy(dds.data() + sizeof(ddspp::DDS_MAGIC), &header, sizeof(header));
+    memcpy(dds.data() + sizeof(ddspp::DDS_MAGIC) + sizeof(header), &headerDX10, sizeof(headerDX10));
+    for (const auto& mip : mips)
+        dds.insert(dds.end(), mip.begin(), mip.end());
+
+    g_havokRenderBlockTexture = LoadTexture(dds.data(), dds.size());
+}
+
 static void CheckSwapChain()
 {
     g_swapChain->setVsyncEnabled(Config::VSync);
@@ -2049,6 +2135,7 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     g_enhancedMotionBlurShader->shader = CREATE_SHADER(enhanced_motion_blur_ps);
 
     CreateImGuiBackend();
+    CreateHavokRenderBlockTexture();
 
     auto gammaCorrectionShader = CREATE_SHADER(gamma_correction_ps);
 
@@ -3838,6 +3925,9 @@ static void SetTexture(GuestDevice* device, uint32_t index, GuestTexture* textur
 
 static void SetTextureInRenderThread(uint32_t index, GuestTexture* texture)
 {
+    if (index == 0)
+        g_havokRenderBlockBound = false;
+
     AddBarrier(texture, RenderTextureLayout::SHADER_READ);
 
     auto viewDimension = texture != nullptr ? texture->viewDimension : RenderTextureViewDimension::UNKNOWN;
@@ -3862,6 +3952,9 @@ static void SetTextureInRenderThread(uint32_t index, GuestTexture* texture)
 
 static void SetSurface(uint32_t index, GuestSurface* surface)
 {
+    if (index == 0)
+        g_havokRenderBlockBound = false;
+
     AddBarrier(surface, RenderTextureLayout::SHADER_READ);
 
     SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[index], surface->descriptorIndex);
@@ -4519,8 +4612,40 @@ static void ProcAddPipeline(const RenderCommand& cmd)
 static constexpr int32_t COMMON_DEPTH_BIAS_VALUE = int32_t((1 << 24) * 0.002f);
 static constexpr float COMMON_SLOPE_SCALED_DEPTH_BIAS_VALUE = 1.0f;
 
+static bool IsDebugHavokPrimitiveShader(const GuestShader* shader)
+{
+    if (shader == nullptr || shader->shaderCacheEntry == nullptr)
+        return false;
+
+    auto end = std::end(DEBUG_HAVOK_PRIMITIVE_SHADER_HASHES);
+    return std::find(std::begin(DEBUG_HAVOK_PRIMITIVE_SHADER_HASHES), end, shader->shaderCacheEntry->hash) != end;
+}
+
+// While a collision debug view draws, its texture is the checker (see g_havokRenderBlockTexture).
+static void SetHavokRenderBlockTexture()
+{
+    bool debugHavokPrimitive = g_havokRenderBlockTexture != nullptr && IsDebugHavokPrimitiveShader(g_pipelineState.pixelShader);
+    if (debugHavokPrimitive == g_havokRenderBlockBound)
+        return;
+
+    if (debugHavokPrimitive)
+    {
+        AddBarrier(g_havokRenderBlockTexture.get(), RenderTextureLayout::SHADER_READ);
+        g_havokRenderBlockReplaced = g_sharedConstants.texture2DIndices[0];
+        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[0], g_havokRenderBlockTexture->descriptorIndex);
+    }
+    else
+    {
+        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[0], g_havokRenderBlockReplaced);
+    }
+
+    g_havokRenderBlockBound = debugHavokPrimitive;
+}
+
 static void FlushRenderStateForRenderThread()
 {
+    SetHavokRenderBlockTexture();
+
     auto renderTarget = g_pipelineState.colorWriteEnable ? g_renderTarget : nullptr;
     auto depthStencil = g_pipelineState.zEnable ? g_depthStencil : nullptr;
 
