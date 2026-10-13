@@ -295,22 +295,41 @@ namespace
         // their depth in their texture coordinates.
         bool DepthTested = false;
 
-        // A triangle, left out if it reaches behind the near plane.
+        // A triangle, cut where it goes behind the near plane: the rails' triangles are long, and often reach behind
+        // the camera.
         void Triangle(ImDrawList* drawList, const Vector3& a, const Vector3& b, const Vector3& c, ImU32 colour) const
         {
             Vector3 view[3] = { ToView(a), ToView(b), ToView(c) };
-            if (!IsVisible(view[0]) || !IsVisible(view[1]) || !IsVisible(view[2]))
-                return;
 
+            // What's in front of the near plane: a polygon of up to 4 corners.
+            Vector3 polygon[4];
+            int corners = 0;
+            for (int i = 0; i < 3; i++)
+            {
+                const Vector3& current = view[i];
+                const Vector3& next = view[(i + 1) % 3];
+                if (IsVisible(current))
+                    polygon[corners++] = current;
+
+                if (IsVisible(current) != IsVisible(next))
+                    polygon[corners++] = current + (next - current) * ((-NEAR_PLANE - current.z) / (next.z - current.z));
+            }
+
+            for (int i = 1; i + 1 < corners; i++)
+                ViewTriangle(drawList, polygon[0], polygon[i], polygon[i + 1], colour);
+        }
+
+        void ViewTriangle(ImDrawList* drawList, const Vector3& a, const Vector3& b, const Vector3& c, ImU32 colour) const
+        {
             drawList->PrimReserve(3, 3);
             ImDrawIdx index = ImDrawIdx(drawList->_VtxCurrentIdx);
             for (int i = 0; i < 3; i++)
                 drawList->PrimWriteIdx(ImDrawIdx(index + i));
 
-            for (auto& point : view)
+            for (const Vector3* point : { &a, &b, &c })
             {
                 float depth;
-                ImVec2 position = ToScreen(point, depth);
+                ImVec2 position = ToScreen(*point, depth);
                 drawList->PrimWriteVtx(position, DepthTested ? ImVec2(depth, 0.0f) : drawList->_Data->TexUvWhitePixel, colour);
             }
         }
