@@ -42,8 +42,9 @@ Add `UNLEASHED_TAS_HUD=1` for a HUD, shown in levels. It's drawn into the frames
   work, his Unleash gauge, the stage time, the stick and the buttons.
 
 The collision view codes (`EnableStageCollisionDebugView`, `EnableEventCollisionDebugView` and
-`EnableObjectCollisionDebugView`) also draw the player's collision that's on: his body (cyan) and what touches rings,
-objects and triggers (magenta). The stage collision view also draws the grind rails' collision (orange). They're
+`EnableObjectCollisionDebugView`) also draw the player's collision that's on: his body (cyan), what touches rings,
+objects and triggers (magenta), and day Sonic's path collision (blue), which most likely touches paths like the grind
+rails. The stage collision view also draws the grind rails' collision (orange). They're
 hidden behind walls; F12 switches to drawing them over everything, walls included, and back. Hiding them needs
 anti-aliasing off: with it on, they're always drawn over everything. Under libTAS, F12 is recorded into the movie.
 
