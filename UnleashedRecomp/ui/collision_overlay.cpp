@@ -200,10 +200,10 @@ bool CollisionOverlay::IsEnabled()
     return Config::EnableStageCollisionDebugView || Config::EnableEventCollisionDebugView || Config::EnableObjectCollisionDebugView;
 }
 
-// F12 switches between drawing the overlay over everything and hiding it behind what the game drew, with the game's
-// depth buffer. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is passed on as a key,
-// so it goes into the movie like the game's keys.
-static std::atomic<bool> g_depthTested;
+// The overlay is hidden behind what the game drew, with the game's depth buffer; F12 switches to drawing it over
+// everything and back. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is passed on as a
+// key, so it goes into the movie like the game's keys.
+static std::atomic<bool> g_depthTested{ true };
 
 static class CollisionOverlayListener : public SDLEventListener
 {
