@@ -138,6 +138,7 @@ set(UNLEASHED_RECOMP_PATCHES_CXX_SOURCES
     "patches/CHudPause_patches.cpp"
     "patches/CTitleStateIntro_patches.cpp"
     "patches/CTitleStateMenu_patches.cpp"
+    "patches/collision_view_patches.cpp"
     "patches/fps_patches.cpp"
     "patches/frontend_listener.cpp"
     "patches/input_patches.cpp"
