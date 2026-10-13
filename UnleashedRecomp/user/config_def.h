@@ -90,6 +90,7 @@ CONFIG_DEFINE_HIDDEN("Codes", bool, FixEggmanlandUsingEventGalleryTransition, fa
 CONFIG_DEFINE_HIDDEN("Codes", bool, FixUnleashOutOfControlDrain, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, HomingAttackOnJump, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, HUDToggleKey, false);
+CONFIG_DEFINE_HIDDEN("Codes", bool, RestoreReadyGoSkip, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, SaveScoreAtCheckpoints, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, SkipIntroLogos, false);
 CONFIG_DEFINE_HIDDEN("Codes", bool, UseAlternateTitle, false);
