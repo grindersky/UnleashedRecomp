@@ -32,6 +32,8 @@ struct TasSwapChain : RenderSwapChain
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint32_t m_nextTextureIndex = 0;
+    // Presents in a row whose frame upload failed with an ignored X error (see tas_swap_chain.cpp).
+    uint32_t m_failedUploads = 0;
 
     std::unique_ptr<RenderTexture> m_textures[TextureCount];
     std::unique_ptr<RenderBuffer> m_readbackBuffer;
@@ -58,4 +60,8 @@ struct TasSwapChain : RenderSwapChain
 
 private:
     void GetWindowPixelSize(uint32_t& width, uint32_t& height) const;
+    void CreateRenderer();
+    void CreateFrameTexture();
+    bool presentFrame();
+    void RebuildWindowSurface();
 };

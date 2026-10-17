@@ -1,19 +1,105 @@
 #include "tas_swap_chain.h"
 
+#include <atomic>
+
+#ifdef __linux__
+#include <SDL_syswm.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+static std::atomic<uint32_t> g_uploadErrors;
+static std::atomic<uint32_t> g_presentCount;
+static std::atomic<bool> g_rebuildingSurface;
+
+#ifdef __linux__
+// The frame upload to the X server can fail with BadGC (seen once under VcXsrv, in Empire City Act 2 Day: "X Error
+// of failed request: BadGC, Major opcode 130 (MIT-SHM), Minor opcode 3 (X_ShmPutImage)"), which Xlib's default handler
+// answers by exiting. Why the GC SDL made for the window was gone isn't known yet. Those errors are logged and ignored
+// instead (a frame isn't shown), and if uploads keep failing, the window surface is made again (see present()).
+// Other errors go to the previous handler.
+static constexpr int X_REQUEST_PUT_IMAGE = 72;
+static constexpr int X_REQUEST_FREE_GC = 60;
+static constexpr int X_SHM_DETACH = 2;
+static constexpr int X_SHM_PUT_IMAGE = 3;
+static constexpr int SHM_BAD_SEG = 0;
+
+static XErrorHandler g_previousErrorHandler;
+static int g_shmMajorOpcode = -1;
+static int g_shmFirstError = -1;
+// The GC of the last failed upload, whose XFreeGC fails the same way when the surface is made again.
+static std::atomic<XID> g_staleGC;
+
+static int TasXErrorHandler(Display* display, XErrorEvent* event)
+{
+    bool shmRequest = g_shmMajorOpcode >= 0 && event->request_code == g_shmMajorOpcode;
+    bool badShmSeg = g_shmFirstError >= 0 && event->error_code == g_shmFirstError + SHM_BAD_SEG;
+    bool badGC = event->error_code == BadGC;
+
+    bool upload = (shmRequest && event->minor_code == X_SHM_PUT_IMAGE) || event->request_code == X_REQUEST_PUT_IMAGE;
+    bool uploadError = upload && (badGC || badShmSeg);
+    bool cleanupError = (event->request_code == X_REQUEST_FREE_GC && badGC && event->resourceid == g_staleGC) ||
+        (g_rebuildingSurface && shmRequest && event->minor_code == X_SHM_DETACH && (badShmSeg || event->error_code == BadValue));
+
+    if (!uploadError && !cleanupError)
+        return g_previousErrorHandler != nullptr ? g_previousErrorHandler(display, event) : 0;
+
+    if (uploadError)
+    {
+        g_uploadErrors++;
+        if (badGC)
+            g_staleGC = event->resourceid;
+    }
+
+    // Only the first ones: a stale surface fails on every frame until it's made again.
+    static std::atomic<uint32_t> s_logged;
+    if (s_logged++ < 50)
+    {
+        char text[128] = {};
+        XGetErrorText(display, event->error_code, text, sizeof(text));
+        fprintf(stderr, "TAS mode: ignored X error %s (%d) for request %d.%d, resource 0x%lx, serial %lu, present %u, thread %ld%s\n",
+            text, int(event->error_code), int(event->request_code), int(event->minor_code), event->resourceid, event->serial,
+            g_presentCount.load(), long(syscall(SYS_gettid)), cleanupError ? " (freeing the old window surface)" : "");
+    }
+
+    return 0;
+}
+
+static void InstallXErrorHandler(Display* display)
+{
+    static bool s_installed;
+    if (s_installed || display == nullptr)
+        return;
+
+    int firstEvent;
+    if (!XQueryExtension(display, "MIT-SHM", &g_shmMajorOpcode, &firstEvent, &g_shmFirstError))
+    {
+        g_shmMajorOpcode = -1;
+        g_shmFirstError = -1;
+    }
+
+    g_previousErrorHandler = XSetErrorHandler(TasXErrorHandler);
+    s_installed = true;
+}
+#endif
+
 TasSwapChain::TasSwapChain(RenderDevice* device, RenderCommandQueue* queue, RenderWindow renderWindow, SDL_Window* sdlWindow, RenderFormat format)
     : m_device(device), m_queue(queue), m_renderWindow(renderWindow), m_sdlWindow(sdlWindow), m_format(format)
 {
     // Draw to the window with plain X11 calls instead of letting SDL create its own GPU renderer.
     SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
 
+#ifdef __linux__
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (SDL_GetWindowWMInfo(m_sdlWindow, &info) && info.subsystem == SDL_SYSWM_X11)
+        InstallXErrorHandler(info.info.x11.display);
+#endif
+
     m_commandList = m_queue->createCommandList();
     m_fence = m_device->createCommandFence();
 
-    // A software renderer draws to the window surface too, but libTAS can draw its OSD with it.
-    m_renderer = SDL_CreateRenderer(m_sdlWindow, -1, SDL_RENDERER_SOFTWARE);
-    if (m_renderer == nullptr)
-        fprintf(stderr, "TAS mode: couldn't create an SDL software renderer (%s), presenting without libTAS's OSD.\n", SDL_GetError());
-
+    CreateRenderer();
     resize();
 
     // libTAS picks how to capture the screen on its first frame boundary, which it can also insert
@@ -42,6 +128,43 @@ TasSwapChain::~TasSwapChain()
         SDL_DestroyRenderer(m_renderer);
 }
 
+void TasSwapChain::CreateRenderer()
+{
+    // A software renderer draws to the window surface too, but libTAS can draw its OSD with it.
+    m_renderer = SDL_CreateRenderer(m_sdlWindow, -1, SDL_RENDERER_SOFTWARE);
+    if (m_renderer == nullptr)
+        fprintf(stderr, "TAS mode: couldn't create an SDL software renderer (%s), presenting without libTAS's OSD.\n", SDL_GetError());
+}
+
+// Makes SDL create the window surface again, with a new GC and shared memory segment: the renderer goes first (it keeps
+// the surface), then the surface (SDL_GetWindowSurface only makes a new one when the window is resized otherwise).
+// libTAS lets go of its screen capture with the renderer, and sets it up again on the next frame boundary.
+void TasSwapChain::RebuildWindowSurface()
+{
+    fprintf(stderr, "TAS mode: the frame upload failed on %u presents in a row, making the window surface again.\n", m_failedUploads);
+
+    if (m_frameTexture != nullptr)
+    {
+        SDL_DestroyTexture(m_frameTexture);
+        m_frameTexture = nullptr;
+    }
+
+    if (m_renderer != nullptr)
+    {
+        SDL_DestroyRenderer(m_renderer);
+        m_renderer = nullptr;
+    }
+
+    g_rebuildingSurface = true;
+    SDL_DestroyWindowSurface(m_sdlWindow);
+    g_rebuildingSurface = false;
+
+    // The frames' textures stay: the game's renderer uses them.
+    CreateRenderer();
+    CreateFrameTexture();
+    m_failedUploads = 0;
+}
+
 void TasSwapChain::GetWindowPixelSize(uint32_t& width, uint32_t& height) const
 {
     int w = 0, h = 0;
@@ -68,6 +191,25 @@ bool TasSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore** waitS
     m_queue->executeCommandLists(m_commandList.get(), m_fence.get());
     m_queue->waitForCommandFence(m_fence.get());
 
+    // SDL syncs with the X server after the upload, so its errors arrive before SDL returns.
+    g_presentCount++;
+    uint32_t uploadErrors = g_uploadErrors;
+    bool presented = presentFrame();
+    if (g_uploadErrors != uploadErrors)
+    {
+        if (++m_failedUploads >= 2)
+            RebuildWindowSurface();
+    }
+    else
+    {
+        m_failedUploads = 0;
+    }
+
+    return presented;
+}
+
+bool TasSwapChain::presentFrame()
+{
     if (m_renderer != nullptr)
     {
         if (m_frameTexture != nullptr)
@@ -140,16 +282,20 @@ bool TasSwapChain::resize()
 
     m_readbackBuffer = m_device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(m_width) * m_height * 4));
 
-    if (m_renderer != nullptr)
-    {
-        // B8G8R8A8 in memory is SDL's RGB888 (XRGB8888) on little-endian hosts. It has no alpha, so the
-        // frame's alpha channel isn't blended against what was there before.
-        m_frameTexture = SDL_CreateTexture(m_renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, int(m_width), int(m_height));
-        if (m_frameTexture == nullptr)
-            fprintf(stderr, "TAS mode: couldn't create the frame texture: %s\n", SDL_GetError());
-    }
-
+    CreateFrameTexture();
     return true;
+}
+
+void TasSwapChain::CreateFrameTexture()
+{
+    if (m_renderer == nullptr || isEmpty())
+        return;
+
+    // B8G8R8A8 in memory is SDL's RGB888 (XRGB8888) on little-endian hosts. It has no alpha, so the
+    // frame's alpha channel isn't blended against what was there before.
+    m_frameTexture = SDL_CreateTexture(m_renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, int(m_width), int(m_height));
+    if (m_frameTexture == nullptr)
+        fprintf(stderr, "TAS mode: couldn't create the frame texture: %s\n", SDL_GetError());
 }
 
 bool TasSwapChain::needsResize() const
