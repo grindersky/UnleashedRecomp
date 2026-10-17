@@ -66,8 +66,25 @@ static constexpr float RUN_QUICK_STEP_ACTIONS_FRAME = 8.0f;
 static constexpr int RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES = 1;
 // Out of control (CPlayerSpeedPosturePluginOutOfControl, the context's vfunc 56): the ground actions try nothing.
 static constexpr uint32_t OUT_OF_CONTROL_FLAG = 3;
+// The boost gauge (the chaos energy, sub_82316B70).
+static constexpr uint32_t CHAOS_ENERGY_OFFSET = 0x53C;
+// Boosts: the ground actions call TryBoost (sub_823787B0), the air actions TryAirBoost (sub_82375748). Both refuse
+// while the stomp's blocker is set or Sonic already boosts (flag 14), and need X just pressed and more energy than
+// BoostEnableChaosEnergy (215) or AirBoostEnableChaosEnergy (264). On the ground, flags 15 and 66 also refuse it. In the
+// air, flag 19 is needed and flag 18 refuses it; with parameter 294 on, a set word at +0xF8C makes it a homing attack
+// instead. Not replicated: sub_82308838 (ground) and the ability check sub_82374CE0 (air).
+static constexpr uint32_t BOOSTING_FLAG = 14;
+static constexpr uint32_t BOOST_DISABLED_FLAG = 15;
+static constexpr uint32_t BOOST_DISABLED_FLAG_2 = 66;
+static constexpr uint32_t AIR_BOOST_ENABLED_FLAG = 19;
+static constexpr uint32_t AIR_BOOST_DISABLED_FLAG = 18;
+static constexpr uint32_t AIR_BOOST_HOMING_OFFSET = 0xF8C;
+static constexpr uint32_t BOOST_ENABLE_CHAOS_ENERGY_PARAMETER = 215;
+static constexpr uint32_t AIR_BOOST_ENABLE_CHAOS_ENERGY_PARAMETER = 264;
+static constexpr uint32_t AIR_BOOST_HOMING_PARAMETER = 294;
 // The states whose update starts with the ground actions, which try the jump, then the quick step: entered during a
-// frame's update, they try them on the next. Land skips them only on the update that ends its animation.
+// frame's update, they try them on the next. Land skips them only on the update that ends its animation, and
+// StompingLand (sub_8239C598) also when it has lasted 0.1 s with the stick held past 0.25: then it picks the next state.
 static constexpr uint32_t GROUND_ACTIONS_STATE_VFTABLES[] =
 {
     0x820167F4, // CPlayerSpeedStateStand
@@ -81,6 +98,29 @@ static constexpr uint32_t GROUND_ACTIONS_STATE_VFTABLES[] =
     0x8201C550, // CSonicStateWallRunDamage
     0x82011EF8, // CPlayerSpeedContext::CStateLand
     0x82016A68, // CSonicStateLand
+    0x8201C388, // CSonicStateStompingLand
+};
+// The states whose update calls the air actions (the context's vfunc 37, sub_823795F8: the homing attack, TryStomp, then
+// TryAirBoost), and those that call TryBoost themselves: entered during a frame's update, they try the boost on the next.
+static constexpr uint32_t AIR_ACTIONS_STATE_VFTABLES[] =
+{
+    0x82011E80, // CPlayerSpeedContext::CStateJumpSpring
+    0x820125C8, // CPlayerSpeedStateSpecialJump
+    0x82016A3C, // CSonicStateFall
+    0x82016B74, // CSonicStateFinishExternalControlAir
+    0x8201B8D8, // CSonicStateGrindJumpShort
+    0x8201BAC0, // CSonicStateHomingAttackAfter
+    0x8201698C, // CSonicStateJumpBall
+    0x82016560, // CSonicContext::CStateJumpHurdle
+    0x82016960, // CSonicContext::CStateJumpShort
+    0x8201BEF4, // CSonicStateSelectJumpAfter::CStateUp
+    0x8201BF44, // CSonicStateSelectJumpAfter::CStateFrontAir
+    0x82016B1C, // CSonicStateWallJump
+};
+static constexpr uint32_t BOOST_STATE_VFTABLES[] =
+{
+    0x8201C0AC, // CSonicContext::CStateSliding
+    0x82016BA0, // CSonicStatePushingWall
 };
 // Hedgehog engine states: the context at +8, the time spent in the state, in seconds, at +0x10.
 static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
@@ -185,6 +225,16 @@ static std::string g_sonicPreviousState;
 static uint32_t g_sonicPreviousStateObject;
 static bool g_quickStepDisabled;
 static bool g_quickStepBlocked;
+// The boosts' checks: the frame and state they ran in, and whether everything but the press and the energy allowed
+// the boost then. The energy needed is what the game read last (both are 1 by default, and were 1 in MSPEED_TEST.ltm and
+// RooftopRunAct1.ltm).
+static uint32_t g_boostCheckFrame;
+static uint32_t g_boostCheckState;
+static bool g_boostAllowed;
+static uint32_t g_airBoostCheckFrame;
+static float g_boostEnableEnergy = 1.0f;
+static float g_airBoostEnableEnergy = 1.0f;
+static bool g_airBoostHoming;
 
 // The animation frame a quick step's update compared on the last frame, with the animation and its local time then.
 static bool g_recordQuickStepFrame;
@@ -483,6 +533,63 @@ PPC_FUNC(sub_82386E60)
     __imp__sub_82386E60(ctx, base);
 }
 
+// Whether TryBoost and TryAirBoost would boost on a press, apart from the energy.
+static bool IsBoostAllowed(uint32_t context)
+{
+    return !IsActionBlocked(context) && !GetFlag(context, STATE_FLAGS_OFFSET, BOOSTING_FLAG) &&
+        !GetFlag(context, STATE_FLAGS_OFFSET, BOOST_DISABLED_FLAG) && !GetFlag(context, STATE_FLAGS_OFFSET, BOOST_DISABLED_FLAG_2);
+}
+
+static bool IsAirBoostAllowed(uint32_t context)
+{
+    return !IsActionBlocked(context) && !GetFlag(context, STATE_FLAGS_OFFSET, BOOSTING_FLAG) &&
+        GetFlag(context, STATE_FLAGS_OFFSET, AIR_BOOST_ENABLED_FLAG) && !GetFlag(context, STATE_FLAGS_OFFSET, AIR_BOOST_DISABLED_FLAG) &&
+        !(g_airBoostHoming && LoadU32(context + AIR_BOOST_HOMING_OFFSET) != 0);
+}
+
+// The context's TryBoost, called by the ground actions, sliding and pushing a wall.
+PPC_FUNC_IMPL(__imp__sub_823787B0);
+PPC_FUNC(sub_823787B0)
+{
+    uint32_t context = ctx.r3.u32;
+
+    if (TasHud::IsEnabled() && context == g_speedContext)
+    {
+        g_boostCheckFrame = g_frame;
+        g_boostCheckState = GetCurrentState(context);
+        g_boostAllowed = IsBoostAllowed(context);
+    }
+
+    __imp__sub_823787B0(ctx, base);
+}
+
+// The context's TryAirBoost, called by the air actions after TryStomp.
+PPC_FUNC_IMPL(__imp__sub_82375748);
+PPC_FUNC(sub_82375748)
+{
+    uint32_t context = ctx.r3.u32;
+
+    if (TasHud::IsEnabled() && context == g_speedContext)
+        g_airBoostCheckFrame = g_frame;
+
+    __imp__sub_82375748(ctx, base);
+}
+
+// Reads a bool parameter of the player by ID. Records whether the air boost can turn into a homing attack.
+PPC_FUNC_IMPL(__imp__sub_8245DB18);
+PPC_FUNC(sub_8245DB18)
+{
+    uint32_t reader = ctx.r3.u32;
+    uint32_t parameter = ctx.r4.u32;
+    __imp__sub_8245DB18(ctx, base);
+
+    if (parameter == AIR_BOOST_HOMING_PARAMETER && TasHud::IsEnabled() && g_speedContext != 0 &&
+        reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
+    {
+        g_airBoostHoming = ctx.r3.u8 != 0;
+    }
+}
+
 // The quick steps' updates, which first read the animation frame they compare.
 static void UpdateQuickStep(PPCContext& ctx, uint8_t* base, void (*update)(PPCContext&, uint8_t*))
 {
@@ -565,6 +672,12 @@ PPC_FUNC(sub_8245DB60)
     {
         g_inAirMaxAccelVelocity = float(ctx.f1.f64);
     }
+
+    if ((parameter == BOOST_ENABLE_CHAOS_ENERGY_PARAMETER || parameter == AIR_BOOST_ENABLE_CHAOS_ENERGY_PARAMETER) &&
+        TasHud::IsEnabled() && g_speedContext != 0 && reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
+    {
+        (parameter == BOOST_ENABLE_CHAOS_ENERGY_PARAMETER ? g_boostEnableEnergy : g_airBoostEnableEnergy) = float(ctx.f1.f64);
+    }
 }
 
 // The current state of the player's state machine, or 0. The machine points to the current state's record
@@ -581,11 +694,16 @@ static uint32_t GetCurrentState(uint32_t context)
     return state != 0 && LoadU32(state + STATE_CONTEXT_OFFSET) == context ? state : 0;
 }
 
-static bool StartsWithGroundActions(uint32_t state)
+template<size_t N>
+static bool IsStateIn(uint32_t state, const uint32_t (&vftables)[N])
 {
     uint32_t vftable = state != 0 ? LoadU32(state) : 0;
-    return std::find(std::begin(GROUND_ACTIONS_STATE_VFTABLES), std::end(GROUND_ACTIONS_STATE_VFTABLES), vftable) !=
-        std::end(GROUND_ACTIONS_STATE_VFTABLES);
+    return std::find(std::begin(vftables), std::end(vftables), vftable) != std::end(vftables);
+}
+
+static bool StartsWithGroundActions(uint32_t state)
+{
+    return IsStateIn(state, GROUND_ACTIONS_STATE_VFTABLES);
 }
 
 // The name of the state's class, from the game's RTTI: "CStateJumpShort@CSonicContext@..." becomes "JumpShort".
@@ -804,6 +922,25 @@ static constexpr float BREAK_JUMP_MAX_LENGTH = 0.3f;
 // The raw stick positions the game reads as a given length form a square with rounded corners: the
 // deadzone cross in the middle, then arcs of radius length * (1 - deadzone) around (±deadzone, ±deadzone).
 // The zone is the ring between the two lengths.
+// The zones are filled one quad at a time. ImGui fades each filled shape's edges out over a pixel, so where two quads
+// meet, both faded edges let the background show through as a thin line. While this is alive, fills get hard edges, which
+// meet exactly; the zones' outlines are drawn over their outer edges, smoothed as usual.
+struct HardEdgedFills
+{
+    ImDrawList* DrawList;
+    ImDrawListFlags Flags;
+
+    explicit HardEdgedFills(ImDrawList* drawList) : DrawList(drawList), Flags(drawList->Flags)
+    {
+        drawList->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+    }
+
+    ~HardEdgedFills()
+    {
+        DrawList->Flags = Flags;
+    }
+};
+
 static void DrawLengthZone(ImDrawList* drawList, ImVec2 centre, float scale, float minLength, float maxLength, ImU32 fill, ImU32 outline)
 {
     constexpr int ARC_SEGMENTS = 8;
@@ -830,10 +967,13 @@ static void DrawLengthZone(ImDrawList* drawList, ImVec2 centre, float scale, flo
     }
 
     // The ring isn't convex, so fill it one quad at a time; the gaps between quadrants are the straight sides.
-    for (int i = 0; i < POINTS; i++)
     {
-        int next = (i + 1) % POINTS;
-        drawList->AddQuadFilled(outer[i], outer[next], inner[next], inner[i], fill);
+        HardEdgedFills hardEdges(drawList);
+        for (int i = 0; i < POINTS; i++)
+        {
+            int next = (i + 1) % POINTS;
+            drawList->AddQuadFilled(outer[i], outer[next], inner[next], inner[i], fill);
+        }
     }
 
     drawList->AddPolyline(outer, POINTS, outline, ImDrawFlags_Closed, Scale(1));
@@ -925,6 +1065,7 @@ static void DrawMSpeedZone(ImDrawList* drawList, ImVec2 centre, float scale, con
 
         if (previous != nullptr)
         {
+            HardEdgedFills hardEdges(drawList);
             if (previous->Works || sample.Works)
                 drawList->AddQuadFilled(previous->Middle, sample.Middle, sample.Inner, previous->Inner, works);
 
@@ -1013,8 +1154,11 @@ static void DrawZone(ImDrawList* drawList, ImVec2 centre, float scale, const Tar
     }
 
     // The band isn't convex, so fill it one quad at a time.
-    for (int i = 0; i < SEGMENTS; i++)
-        drawList->AddQuadFilled(outer[i], outer[i + 1], inner[i + 1], inner[i], fill);
+    {
+        HardEdgedFills hardEdges(drawList);
+        for (int i = 0; i < SEGMENTS; i++)
+            drawList->AddQuadFilled(outer[i], outer[i + 1], inner[i + 1], inner[i], fill);
+    }
 
     drawList->AddPolyline(outer, SEGMENTS + 1, outline, 0, Scale(1));
     drawList->AddPolyline(inner, SEGMENTS + 1, outline, 0, Scale(1));
@@ -1035,10 +1179,30 @@ static void DrawController(ImDrawList* drawList, ImFont* font, ImVec2 pos, float
     ImU32 ring = IM_COL32(255, 255, 255, 255);
     ImU32 unlitFill = IM_COL32(20, 20, 20, 200);
 
+    // Centred on the letters themselves: the text's box has room under the baseline and beside the letters, which put
+    // capitals high and to one side. ImGui truncates text positions to whole pixels, so the position is rounded instead.
     auto drawLabel = [&](ImVec2 centre, const char* label, ImU32 colour)
     {
-        ImVec2 textSize = font->CalcTextSizeA(size, FLT_MAX, 0.0f, label);
-        drawList->AddText(font, size, { centre.x - textSize.x / 2, centre.y - textSize.y / 2 }, colour, label);
+        float scale = size / font->FontSize;
+        float penX = 0.0f;
+        ImVec2 min = { FLT_MAX, FLT_MAX };
+        ImVec2 max = { -FLT_MAX, -FLT_MAX };
+        for (const char* c = label; *c != '\0'; c++)
+        {
+            const ImFontGlyph* glyph = font->FindGlyph(ImWchar(*c));
+            if (glyph == nullptr)
+                continue;
+
+            min = { std::min(min.x, penX + glyph->X0 * scale), std::min(min.y, glyph->Y0 * scale) };
+            max = { std::max(max.x, penX + glyph->X1 * scale), std::max(max.y, glyph->Y1 * scale) };
+            penX += glyph->AdvanceX * scale;
+        }
+
+        if (min.x > max.x)
+            return;
+
+        ImVec2 pos = { std::round(centre.x - (min.x + max.x) / 2), std::round(centre.y - (min.y + max.y) / 2) };
+        drawList->AddText(font, size, pos, colour, label);
     };
 
     auto drawBox = [&](ImVec2 min, ImVec2 max, const char* label, uint32_t key, float fill = -1.0f)
@@ -1120,7 +1284,8 @@ void TasHud::Draw()
         3 * (indicatorText + Scale(10)) + 2 * gap + 2 * padding });
     ImVec2 panelMax = { res.x - Scale(40), res.y - Scale(22) };
     ImVec2 centre = { panelMax.x - width / 2, panelMax.y - Scale(58 + CONTROLLER_HEIGHT) - radius };
-    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(122) };
+    // Sonic has a row more, for the boost.
+    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(werehog ? 122 : 142) };
     float left = panelMin.x + padding;
 
     drawList->AddRectFilled(panelMin, panelMax, IM_COL32(0, 0, 0, 140), Scale(6));
@@ -1152,10 +1317,11 @@ void TasHud::Draw()
     // for the jump or stomp button. Both need a new press, holding the button doesn't count.
     float row = panelMin.y + Scale(46);
     float pressRow = row + Scale(20);
-    // Sonic has a second row of presses, for the quick step; the Werehog has a row under his state instead, for when
-    // his attack ends.
+    // Sonic has two more rows of presses, for the quick step and the boost; the Werehog has a row under his state
+    // instead, for when his attack ends.
     float quickStepRow = pressRow + Scale(20);
-    float stateRow = (werehog ? pressRow : quickStepRow) + Scale(20);
+    float boostRow = quickStepRow + Scale(20);
+    float stateRow = (werehog ? pressRow : boostRow) + Scale(20);
     float attackRow = stateRow + Scale(20);
 
     uint32_t state = GetCurrentState(context);
@@ -1366,6 +1532,33 @@ void TasHud::Draw()
 
         if (!canQuickStep && quickStepUpdates > 1)
             DrawText(drawList, font, Scale(11), { column3, quickStepRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", quickStepUpdates - 1));
+
+        // Whether X would boost: on the ground TryBoost, in the air TryAirBoost, with enough energy in the gauge (out of
+        // 100). As for the other presses, a state entered during this frame's update tries it if its update starts with it.
+        float energy = LoadFloat(context + CHAOS_ENERGY_OFFSET);
+        bool boosting = GetFlag(context, STATE_FLAGS_OFFSET, BOOSTING_FLAG);
+        bool canBoost;
+        if (grounded)
+        {
+            bool boostTried = g_boostCheckFrame == g_frame && (!entered || g_boostCheckState == state) && g_boostAllowed;
+            bool boostNext = (groundActionsNext || (entered && IsStateIn(state, BOOST_STATE_VFTABLES))) && IsBoostAllowed(context);
+            canBoost = energy > g_boostEnableEnergy && (boostTried || boostNext);
+        }
+        else
+        {
+            // The air actions do nothing while Sonic is on the ground or out of control (sub_82316118, vfunc 56), so this
+            // goes by the state after this frame's update: a hop that just left the ground, or the end of an
+            // out-of-control (RooftopRunAct1.ltm, frames 1159 and 3037).
+            bool airActions = IsStateIn(state, AIR_ACTIONS_STATE_VFTABLES) || (g_airBoostCheckFrame == g_frame && !entered);
+            canBoost = energy > g_airBoostEnableEnergy && airActions && !outOfControl && IsAirBoostAllowed(context);
+        }
+
+        DrawIndicator(drawList, font, { left, boostRow }, indicatorWidth, "CAN BOOST", IM_COL32(80, 230, 80, 255), canBoost, true);
+        DrawIndicator(drawList, font, { column2, boostRow }, indicatorWidth, "BOOSTING", IM_COL32(90, 170, 255, 230), boosting);
+
+        std::string gauge = fmt::format("Boost {:.2f}", energy);
+        DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), gauge), boostRow + Scale(2) },
+            IM_COL32(220, 220, 220, 255), gauge);
 
         g_sonicPreviousState = stateName;
         g_sonicPreviousStateObject = state;
