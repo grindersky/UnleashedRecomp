@@ -259,11 +259,94 @@ index ac0a598..a9812be 100644
      
 diff --git a/UnleashedRecomp/gpu/tas_swap_chain.cpp b/UnleashedRecomp/gpu/tas_swap_chain.cpp
 new file mode 100644
-index 0000000..49c1a58
+index 0000000..14fbf70
 --- /dev/null
 +++ b/UnleashedRecomp/gpu/tas_swap_chain.cpp
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,362 @@
 +#include "tas_swap_chain.h"
++
++#include <atomic>
++
++#ifdef __linux__
++#include <SDL_syswm.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
++static std::atomic<uint32_t> g_uploadErrors;
++static std::atomic<uint32_t> g_presentCount;
++static std::atomic<bool> g_rebuildingSurface;
++
++#ifdef __linux__
++// The frame upload to the X server can fail with BadGC (seen once under VcXsrv, in Empire City Act 2 Day: "X Error
++// of failed request: BadGC, Major opcode 130 (MIT-SHM), Minor opcode 3 (X_ShmPutImage)"), which Xlib's default handler
++// answers by exiting. Why the GC SDL made for the window was gone isn't known yet. Those errors are logged and ignored
++// instead (a frame isn't shown), and if uploads keep failing, the window surface is made again (see present()).
++// Other errors go to the previous handler.
++static constexpr int X_REQUEST_PUT_IMAGE = 72;
++static constexpr int X_REQUEST_FREE_GC = 60;
++static constexpr int X_SHM_DETACH = 2;
++static constexpr int X_SHM_PUT_IMAGE = 3;
++static constexpr int SHM_BAD_SEG = 0;
++
++static XErrorHandler g_previousErrorHandler;
++static int g_shmMajorOpcode = -1;
++static int g_shmFirstError = -1;
++// The GC of the last failed upload, whose XFreeGC fails the same way when the surface is made again.
++static std::atomic<XID> g_staleGC;
++
++static int TasXErrorHandler(Display* display, XErrorEvent* event)
++{
++    bool shmRequest = g_shmMajorOpcode >= 0 && event->request_code == g_shmMajorOpcode;
++    bool badShmSeg = g_shmFirstError >= 0 && event->error_code == g_shmFirstError + SHM_BAD_SEG;
++    bool badGC = event->error_code == BadGC;
++
++    bool upload = (shmRequest && event->minor_code == X_SHM_PUT_IMAGE) || event->request_code == X_REQUEST_PUT_IMAGE;
++    bool uploadError = upload && (badGC || badShmSeg);
++    bool cleanupError = (event->request_code == X_REQUEST_FREE_GC && badGC && event->resourceid == g_staleGC) ||
++        (g_rebuildingSurface && shmRequest && event->minor_code == X_SHM_DETACH && (badShmSeg || event->error_code == BadValue));
++
++    if (!uploadError && !cleanupError)
++        return g_previousErrorHandler != nullptr ? g_previousErrorHandler(display, event) : 0;
++
++    if (uploadError)
++    {
++        g_uploadErrors++;
++        if (badGC)
++            g_staleGC = event->resourceid;
++    }
++
++    // Only the first ones: a stale surface fails on every frame until it's made again.
++    static std::atomic<uint32_t> s_logged;
++    if (s_logged++ < 50)
++    {
++        char text[128] = {};
++        XGetErrorText(display, event->error_code, text, sizeof(text));
++        fprintf(stderr, "TAS mode: ignored X error %s (%d) for request %d.%d, resource 0x%lx, serial %lu, present %u, thread %ld%s\n",
++            text, int(event->error_code), int(event->request_code), int(event->minor_code), event->resourceid, event->serial,
++            g_presentCount.load(), long(syscall(SYS_gettid)), cleanupError ? " (freeing the old window surface)" : "");
++    }
++
++    return 0;
++}
++
++static void InstallXErrorHandler(Display* display)
++{
++    static bool s_installed;
++    if (s_installed || display == nullptr)
++        return;
++
++    int firstEvent;
++    if (!XQueryExtension(display, "MIT-SHM", &g_shmMajorOpcode, &firstEvent, &g_shmFirstError))
++    {
++        g_shmMajorOpcode = -1;
++        g_shmFirstError = -1;
++    }
++
++    g_previousErrorHandler = XSetErrorHandler(TasXErrorHandler);
++    s_installed = true;
++}
++#endif
 +
 +TasSwapChain::TasSwapChain(RenderDevice* device, RenderCommandQueue* queue, RenderWindow renderWindow, SDL_Window* sdlWindow, RenderFormat format)
 +    : m_device(device), m_queue(queue), m_renderWindow(renderWindow), m_sdlWindow(sdlWindow), m_format(format)
@@ -271,14 +354,17 @@ index 0000000..49c1a58
 +    // Draw to the window with plain X11 calls instead of letting SDL create its own GPU renderer.
 +    SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
 +
++#ifdef __linux__
++    SDL_SysWMinfo info;
++    SDL_VERSION(&info.version);
++    if (SDL_GetWindowWMInfo(m_sdlWindow, &info) && info.subsystem == SDL_SYSWM_X11)
++        InstallXErrorHandler(info.info.x11.display);
++#endif
++
 +    m_commandList = m_queue->createCommandList();
 +    m_fence = m_device->createCommandFence();
 +
-+    // A software renderer draws to the window surface too, but libTAS can draw its OSD with it.
-+    m_renderer = SDL_CreateRenderer(m_sdlWindow, -1, SDL_RENDERER_SOFTWARE);
-+    if (m_renderer == nullptr)
-+        fprintf(stderr, "TAS mode: couldn't create an SDL software renderer (%s), presenting without libTAS's OSD.\n", SDL_GetError());
-+
++    CreateRenderer();
 +    resize();
 +
 +    // libTAS picks how to capture the screen on its first frame boundary, which it can also insert
@@ -307,6 +393,43 @@ index 0000000..49c1a58
 +        SDL_DestroyRenderer(m_renderer);
 +}
 +
++void TasSwapChain::CreateRenderer()
++{
++    // A software renderer draws to the window surface too, but libTAS can draw its OSD with it.
++    m_renderer = SDL_CreateRenderer(m_sdlWindow, -1, SDL_RENDERER_SOFTWARE);
++    if (m_renderer == nullptr)
++        fprintf(stderr, "TAS mode: couldn't create an SDL software renderer (%s), presenting without libTAS's OSD.\n", SDL_GetError());
++}
++
++// Makes SDL create the window surface again, with a new GC and shared memory segment: the renderer goes first (it keeps
++// the surface), then the surface (SDL_GetWindowSurface only makes a new one when the window is resized otherwise).
++// libTAS lets go of its screen capture with the renderer, and sets it up again on the next frame boundary.
++void TasSwapChain::RebuildWindowSurface()
++{
++    fprintf(stderr, "TAS mode: the frame upload failed on %u presents in a row, making the window surface again.\n", m_failedUploads);
++
++    if (m_frameTexture != nullptr)
++    {
++        SDL_DestroyTexture(m_frameTexture);
++        m_frameTexture = nullptr;
++    }
++
++    if (m_renderer != nullptr)
++    {
++        SDL_DestroyRenderer(m_renderer);
++        m_renderer = nullptr;
++    }
++
++    g_rebuildingSurface = true;
++    SDL_DestroyWindowSurface(m_sdlWindow);
++    g_rebuildingSurface = false;
++
++    // The frames' textures stay: the game's renderer uses them.
++    CreateRenderer();
++    CreateFrameTexture();
++    m_failedUploads = 0;
++}
++
 +void TasSwapChain::GetWindowPixelSize(uint32_t& width, uint32_t& height) const
 +{
 +    int w = 0, h = 0;
@@ -333,6 +456,25 @@ index 0000000..49c1a58
 +    m_queue->executeCommandLists(m_commandList.get(), m_fence.get());
 +    m_queue->waitForCommandFence(m_fence.get());
 +
++    // SDL syncs with the X server after the upload, so its errors arrive before SDL returns.
++    g_presentCount++;
++    uint32_t uploadErrors = g_uploadErrors;
++    bool presented = presentFrame();
++    if (g_uploadErrors != uploadErrors)
++    {
++        if (++m_failedUploads >= 2)
++            RebuildWindowSurface();
++    }
++    else
++    {
++        m_failedUploads = 0;
++    }
++
++    return presented;
++}
++
++bool TasSwapChain::presentFrame()
++{
 +    if (m_renderer != nullptr)
 +    {
 +        if (m_frameTexture != nullptr)
@@ -405,16 +547,20 @@ index 0000000..49c1a58
 +
 +    m_readbackBuffer = m_device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(m_width) * m_height * 4));
 +
-+    if (m_renderer != nullptr)
-+    {
-+        // B8G8R8A8 in memory is SDL's RGB888 (XRGB8888) on little-endian hosts. It has no alpha, so the
-+        // frame's alpha channel isn't blended against what was there before.
-+        m_frameTexture = SDL_CreateTexture(m_renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, int(m_width), int(m_height));
-+        if (m_frameTexture == nullptr)
-+            fprintf(stderr, "TAS mode: couldn't create the frame texture: %s\n", SDL_GetError());
-+    }
-+
++    CreateFrameTexture();
 +    return true;
++}
++
++void TasSwapChain::CreateFrameTexture()
++{
++    if (m_renderer == nullptr || isEmpty())
++        return;
++
++    // B8G8R8A8 in memory is SDL's RGB888 (XRGB8888) on little-endian hosts. It has no alpha, so the
++    // frame's alpha channel isn't blended against what was there before.
++    m_frameTexture = SDL_CreateTexture(m_renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, int(m_width), int(m_height));
++    if (m_frameTexture == nullptr)
++        fprintf(stderr, "TAS mode: couldn't create the frame texture: %s\n", SDL_GetError());
 +}
 +
 +bool TasSwapChain::needsResize() const
@@ -481,10 +627,10 @@ index 0000000..49c1a58
 +}
 diff --git a/UnleashedRecomp/gpu/tas_swap_chain.h b/UnleashedRecomp/gpu/tas_swap_chain.h
 new file mode 100644
-index 0000000..956be45
+index 0000000..fab5ea6
 --- /dev/null
 +++ b/UnleashedRecomp/gpu/tas_swap_chain.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,67 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -519,6 +665,8 @@ index 0000000..956be45
 +    uint32_t m_width = 0;
 +    uint32_t m_height = 0;
 +    uint32_t m_nextTextureIndex = 0;
++    // Presents in a row whose frame upload failed with an ignored X error (see tas_swap_chain.cpp).
++    uint32_t m_failedUploads = 0;
 +
 +    std::unique_ptr<RenderTexture> m_textures[TextureCount];
 +    std::unique_ptr<RenderBuffer> m_readbackBuffer;
@@ -545,6 +693,10 @@ index 0000000..956be45
 +
 +private:
 +    void GetWindowPixelSize(uint32_t& width, uint32_t& height) const;
++    void CreateRenderer();
++    void CreateFrameTexture();
++    bool presentFrame();
++    void RebuildWindowSurface();
 +};
 diff --git a/UnleashedRecomp/gpu/video.cpp b/UnleashedRecomp/gpu/video.cpp
 index a9edd0b..1d12ec0 100644
@@ -4451,10 +4603,10 @@ index d15aac6..7112106 100644
          SDL_VideoInit(nullptr);
 diff --git a/UnleashedRecomp/ui/tas_hud.cpp b/UnleashedRecomp/ui/tas_hud.cpp
 new file mode 100644
-index 0000000..400574e
+index 0000000..7fc714d
 --- /dev/null
 +++ b/UnleashedRecomp/ui/tas_hud.cpp
-@@ -0,0 +1,1465 @@
+@@ -0,0 +1,1658 @@
 +#include "tas_hud.h"
 +#include <api/SWA.h>
 +#include <app.h>
@@ -4523,8 +4675,25 @@ index 0000000..400574e
 +static constexpr int RUN_QUICK_STEP_OUT_OF_CONTROL_FRAMES = 1;
 +// Out of control (CPlayerSpeedPosturePluginOutOfControl, the context's vfunc 56): the ground actions try nothing.
 +static constexpr uint32_t OUT_OF_CONTROL_FLAG = 3;
++// The boost gauge (the chaos energy, sub_82316B70).
++static constexpr uint32_t CHAOS_ENERGY_OFFSET = 0x53C;
++// Boosts: the ground actions call TryBoost (sub_823787B0), the air actions TryAirBoost (sub_82375748). Both refuse
++// while the stomp's blocker is set or Sonic already boosts (flag 14), and need X just pressed and more energy than
++// BoostEnableChaosEnergy (215) or AirBoostEnableChaosEnergy (264). On the ground, flags 15 and 66 also refuse it. In the
++// air, flag 19 is needed and flag 18 refuses it; with parameter 294 on, a set word at +0xF8C makes it a homing attack
++// instead. Not replicated: sub_82308838 (ground) and the ability check sub_82374CE0 (air).
++static constexpr uint32_t BOOSTING_FLAG = 14;
++static constexpr uint32_t BOOST_DISABLED_FLAG = 15;
++static constexpr uint32_t BOOST_DISABLED_FLAG_2 = 66;
++static constexpr uint32_t AIR_BOOST_ENABLED_FLAG = 19;
++static constexpr uint32_t AIR_BOOST_DISABLED_FLAG = 18;
++static constexpr uint32_t AIR_BOOST_HOMING_OFFSET = 0xF8C;
++static constexpr uint32_t BOOST_ENABLE_CHAOS_ENERGY_PARAMETER = 215;
++static constexpr uint32_t AIR_BOOST_ENABLE_CHAOS_ENERGY_PARAMETER = 264;
++static constexpr uint32_t AIR_BOOST_HOMING_PARAMETER = 294;
 +// The states whose update starts with the ground actions, which try the jump, then the quick step: entered during a
-+// frame's update, they try them on the next. Land skips them only on the update that ends its animation.
++// frame's update, they try them on the next. Land skips them only on the update that ends its animation, and
++// StompingLand (sub_8239C598) also when it has lasted 0.1 s with the stick held past 0.25: then it picks the next state.
 +static constexpr uint32_t GROUND_ACTIONS_STATE_VFTABLES[] =
 +{
 +    0x820167F4, // CPlayerSpeedStateStand
@@ -4538,6 +4707,29 @@ index 0000000..400574e
 +    0x8201C550, // CSonicStateWallRunDamage
 +    0x82011EF8, // CPlayerSpeedContext::CStateLand
 +    0x82016A68, // CSonicStateLand
++    0x8201C388, // CSonicStateStompingLand
++};
++// The states whose update calls the air actions (the context's vfunc 37, sub_823795F8: the homing attack, TryStomp, then
++// TryAirBoost), and those that call TryBoost themselves: entered during a frame's update, they try the boost on the next.
++static constexpr uint32_t AIR_ACTIONS_STATE_VFTABLES[] =
++{
++    0x82011E80, // CPlayerSpeedContext::CStateJumpSpring
++    0x820125C8, // CPlayerSpeedStateSpecialJump
++    0x82016A3C, // CSonicStateFall
++    0x82016B74, // CSonicStateFinishExternalControlAir
++    0x8201B8D8, // CSonicStateGrindJumpShort
++    0x8201BAC0, // CSonicStateHomingAttackAfter
++    0x8201698C, // CSonicStateJumpBall
++    0x82016560, // CSonicContext::CStateJumpHurdle
++    0x82016960, // CSonicContext::CStateJumpShort
++    0x8201BEF4, // CSonicStateSelectJumpAfter::CStateUp
++    0x8201BF44, // CSonicStateSelectJumpAfter::CStateFrontAir
++    0x82016B1C, // CSonicStateWallJump
++};
++static constexpr uint32_t BOOST_STATE_VFTABLES[] =
++{
++    0x8201C0AC, // CSonicContext::CStateSliding
++    0x82016BA0, // CSonicStatePushingWall
 +};
 +// Hedgehog engine states: the context at +8, the time spent in the state, in seconds, at +0x10.
 +static constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
@@ -4642,6 +4834,16 @@ index 0000000..400574e
 +static uint32_t g_sonicPreviousStateObject;
 +static bool g_quickStepDisabled;
 +static bool g_quickStepBlocked;
++// The boosts' checks: the frame and state they ran in, and whether everything but the press and the energy allowed
++// the boost then. The energy needed is what the game read last (both are 1 by default, and were 1 in MSPEED_TEST.ltm and
++// RooftopRunAct1.ltm).
++static uint32_t g_boostCheckFrame;
++static uint32_t g_boostCheckState;
++static bool g_boostAllowed;
++static uint32_t g_airBoostCheckFrame;
++static float g_boostEnableEnergy = 1.0f;
++static float g_airBoostEnableEnergy = 1.0f;
++static bool g_airBoostHoming;
 +
 +// The animation frame a quick step's update compared on the last frame, with the animation and its local time then.
 +static bool g_recordQuickStepFrame;
@@ -4940,6 +5142,63 @@ index 0000000..400574e
 +    __imp__sub_82386E60(ctx, base);
 +}
 +
++// Whether TryBoost and TryAirBoost would boost on a press, apart from the energy.
++static bool IsBoostAllowed(uint32_t context)
++{
++    return !IsActionBlocked(context) && !GetFlag(context, STATE_FLAGS_OFFSET, BOOSTING_FLAG) &&
++        !GetFlag(context, STATE_FLAGS_OFFSET, BOOST_DISABLED_FLAG) && !GetFlag(context, STATE_FLAGS_OFFSET, BOOST_DISABLED_FLAG_2);
++}
++
++static bool IsAirBoostAllowed(uint32_t context)
++{
++    return !IsActionBlocked(context) && !GetFlag(context, STATE_FLAGS_OFFSET, BOOSTING_FLAG) &&
++        GetFlag(context, STATE_FLAGS_OFFSET, AIR_BOOST_ENABLED_FLAG) && !GetFlag(context, STATE_FLAGS_OFFSET, AIR_BOOST_DISABLED_FLAG) &&
++        !(g_airBoostHoming && LoadU32(context + AIR_BOOST_HOMING_OFFSET) != 0);
++}
++
++// The context's TryBoost, called by the ground actions, sliding and pushing a wall.
++PPC_FUNC_IMPL(__imp__sub_823787B0);
++PPC_FUNC(sub_823787B0)
++{
++    uint32_t context = ctx.r3.u32;
++
++    if (TasHud::IsEnabled() && context == g_speedContext)
++    {
++        g_boostCheckFrame = g_frame;
++        g_boostCheckState = GetCurrentState(context);
++        g_boostAllowed = IsBoostAllowed(context);
++    }
++
++    __imp__sub_823787B0(ctx, base);
++}
++
++// The context's TryAirBoost, called by the air actions after TryStomp.
++PPC_FUNC_IMPL(__imp__sub_82375748);
++PPC_FUNC(sub_82375748)
++{
++    uint32_t context = ctx.r3.u32;
++
++    if (TasHud::IsEnabled() && context == g_speedContext)
++        g_airBoostCheckFrame = g_frame;
++
++    __imp__sub_82375748(ctx, base);
++}
++
++// Reads a bool parameter of the player by ID. Records whether the air boost can turn into a homing attack.
++PPC_FUNC_IMPL(__imp__sub_8245DB18);
++PPC_FUNC(sub_8245DB18)
++{
++    uint32_t reader = ctx.r3.u32;
++    uint32_t parameter = ctx.r4.u32;
++    __imp__sub_8245DB18(ctx, base);
++
++    if (parameter == AIR_BOOST_HOMING_PARAMETER && TasHud::IsEnabled() && g_speedContext != 0 &&
++        reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
++    {
++        g_airBoostHoming = ctx.r3.u8 != 0;
++    }
++}
++
 +// The quick steps' updates, which first read the animation frame they compare.
 +static void UpdateQuickStep(PPCContext& ctx, uint8_t* base, void (*update)(PPCContext&, uint8_t*))
 +{
@@ -5022,6 +5281,12 @@ index 0000000..400574e
 +    {
 +        g_inAirMaxAccelVelocity = float(ctx.f1.f64);
 +    }
++
++    if ((parameter == BOOST_ENABLE_CHAOS_ENERGY_PARAMETER || parameter == AIR_BOOST_ENABLE_CHAOS_ENERGY_PARAMETER) &&
++        TasHud::IsEnabled() && g_speedContext != 0 && reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
++    {
++        (parameter == BOOST_ENABLE_CHAOS_ENERGY_PARAMETER ? g_boostEnableEnergy : g_airBoostEnableEnergy) = float(ctx.f1.f64);
++    }
 +}
 +
 +// The current state of the player's state machine, or 0. The machine points to the current state's record
@@ -5038,11 +5303,16 @@ index 0000000..400574e
 +    return state != 0 && LoadU32(state + STATE_CONTEXT_OFFSET) == context ? state : 0;
 +}
 +
-+static bool StartsWithGroundActions(uint32_t state)
++template<size_t N>
++static bool IsStateIn(uint32_t state, const uint32_t (&vftables)[N])
 +{
 +    uint32_t vftable = state != 0 ? LoadU32(state) : 0;
-+    return std::find(std::begin(GROUND_ACTIONS_STATE_VFTABLES), std::end(GROUND_ACTIONS_STATE_VFTABLES), vftable) !=
-+        std::end(GROUND_ACTIONS_STATE_VFTABLES);
++    return std::find(std::begin(vftables), std::end(vftables), vftable) != std::end(vftables);
++}
++
++static bool StartsWithGroundActions(uint32_t state)
++{
++    return IsStateIn(state, GROUND_ACTIONS_STATE_VFTABLES);
 +}
 +
 +// The name of the state's class, from the game's RTTI: "CStateJumpShort@CSonicContext@..." becomes "JumpShort".
@@ -5261,6 +5531,25 @@ index 0000000..400574e
 +// The raw stick positions the game reads as a given length form a square with rounded corners: the
 +// deadzone cross in the middle, then arcs of radius length * (1 - deadzone) around (±deadzone, ±deadzone).
 +// The zone is the ring between the two lengths.
++// The zones are filled one quad at a time. ImGui fades each filled shape's edges out over a pixel, so where two quads
++// meet, both faded edges let the background show through as a thin line. While this is alive, fills get hard edges, which
++// meet exactly; the zones' outlines are drawn over their outer edges, smoothed as usual.
++struct HardEdgedFills
++{
++    ImDrawList* DrawList;
++    ImDrawListFlags Flags;
++
++    explicit HardEdgedFills(ImDrawList* drawList) : DrawList(drawList), Flags(drawList->Flags)
++    {
++        drawList->Flags &= ~ImDrawListFlags_AntiAliasedFill;
++    }
++
++    ~HardEdgedFills()
++    {
++        DrawList->Flags = Flags;
++    }
++};
++
 +static void DrawLengthZone(ImDrawList* drawList, ImVec2 centre, float scale, float minLength, float maxLength, ImU32 fill, ImU32 outline)
 +{
 +    constexpr int ARC_SEGMENTS = 8;
@@ -5287,10 +5576,13 @@ index 0000000..400574e
 +    }
 +
 +    // The ring isn't convex, so fill it one quad at a time; the gaps between quadrants are the straight sides.
-+    for (int i = 0; i < POINTS; i++)
 +    {
-+        int next = (i + 1) % POINTS;
-+        drawList->AddQuadFilled(outer[i], outer[next], inner[next], inner[i], fill);
++        HardEdgedFills hardEdges(drawList);
++        for (int i = 0; i < POINTS; i++)
++        {
++            int next = (i + 1) % POINTS;
++            drawList->AddQuadFilled(outer[i], outer[next], inner[next], inner[i], fill);
++        }
 +    }
 +
 +    drawList->AddPolyline(outer, POINTS, outline, ImDrawFlags_Closed, Scale(1));
@@ -5382,6 +5674,7 @@ index 0000000..400574e
 +
 +        if (previous != nullptr)
 +        {
++            HardEdgedFills hardEdges(drawList);
 +            if (previous->Works || sample.Works)
 +                drawList->AddQuadFilled(previous->Middle, sample.Middle, sample.Inner, previous->Inner, works);
 +
@@ -5470,8 +5763,11 @@ index 0000000..400574e
 +    }
 +
 +    // The band isn't convex, so fill it one quad at a time.
-+    for (int i = 0; i < SEGMENTS; i++)
-+        drawList->AddQuadFilled(outer[i], outer[i + 1], inner[i + 1], inner[i], fill);
++    {
++        HardEdgedFills hardEdges(drawList);
++        for (int i = 0; i < SEGMENTS; i++)
++            drawList->AddQuadFilled(outer[i], outer[i + 1], inner[i + 1], inner[i], fill);
++    }
 +
 +    drawList->AddPolyline(outer, SEGMENTS + 1, outline, 0, Scale(1));
 +    drawList->AddPolyline(inner, SEGMENTS + 1, outline, 0, Scale(1));
@@ -5492,10 +5788,30 @@ index 0000000..400574e
 +    ImU32 ring = IM_COL32(255, 255, 255, 255);
 +    ImU32 unlitFill = IM_COL32(20, 20, 20, 200);
 +
++    // Centred on the letters themselves: the text's box has room under the baseline and beside the letters, which put
++    // capitals high and to one side. ImGui truncates text positions to whole pixels, so the position is rounded instead.
 +    auto drawLabel = [&](ImVec2 centre, const char* label, ImU32 colour)
 +    {
-+        ImVec2 textSize = font->CalcTextSizeA(size, FLT_MAX, 0.0f, label);
-+        drawList->AddText(font, size, { centre.x - textSize.x / 2, centre.y - textSize.y / 2 }, colour, label);
++        float scale = size / font->FontSize;
++        float penX = 0.0f;
++        ImVec2 min = { FLT_MAX, FLT_MAX };
++        ImVec2 max = { -FLT_MAX, -FLT_MAX };
++        for (const char* c = label; *c != '\0'; c++)
++        {
++            const ImFontGlyph* glyph = font->FindGlyph(ImWchar(*c));
++            if (glyph == nullptr)
++                continue;
++
++            min = { std::min(min.x, penX + glyph->X0 * scale), std::min(min.y, glyph->Y0 * scale) };
++            max = { std::max(max.x, penX + glyph->X1 * scale), std::max(max.y, glyph->Y1 * scale) };
++            penX += glyph->AdvanceX * scale;
++        }
++
++        if (min.x > max.x)
++            return;
++
++        ImVec2 pos = { std::round(centre.x - (min.x + max.x) / 2), std::round(centre.y - (min.y + max.y) / 2) };
++        drawList->AddText(font, size, pos, colour, label);
 +    };
 +
 +    auto drawBox = [&](ImVec2 min, ImVec2 max, const char* label, uint32_t key, float fill = -1.0f)
@@ -5577,7 +5893,8 @@ index 0000000..400574e
 +        3 * (indicatorText + Scale(10)) + 2 * gap + 2 * padding });
 +    ImVec2 panelMax = { res.x - Scale(40), res.y - Scale(22) };
 +    ImVec2 centre = { panelMax.x - width / 2, panelMax.y - Scale(58 + CONTROLLER_HEIGHT) - radius };
-+    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(122) };
++    // Sonic has a row more, for the boost.
++    ImVec2 panelMin = { panelMax.x - width, centre.y - radius - Scale(werehog ? 122 : 142) };
 +    float left = panelMin.x + padding;
 +
 +    drawList->AddRectFilled(panelMin, panelMax, IM_COL32(0, 0, 0, 140), Scale(6));
@@ -5609,10 +5926,11 @@ index 0000000..400574e
 +    // for the jump or stomp button. Both need a new press, holding the button doesn't count.
 +    float row = panelMin.y + Scale(46);
 +    float pressRow = row + Scale(20);
-+    // Sonic has a second row of presses, for the quick step; the Werehog has a row under his state instead, for when
-+    // his attack ends.
++    // Sonic has two more rows of presses, for the quick step and the boost; the Werehog has a row under his state
++    // instead, for when his attack ends.
 +    float quickStepRow = pressRow + Scale(20);
-+    float stateRow = (werehog ? pressRow : quickStepRow) + Scale(20);
++    float boostRow = quickStepRow + Scale(20);
++    float stateRow = (werehog ? pressRow : boostRow) + Scale(20);
 +    float attackRow = stateRow + Scale(20);
 +
 +    uint32_t state = GetCurrentState(context);
@@ -5823,6 +6141,33 @@ index 0000000..400574e
 +
 +        if (!canQuickStep && quickStepUpdates > 1)
 +            DrawText(drawList, font, Scale(11), { column3, quickStepRow + Scale(2) }, IM_COL32(255, 200, 60, 255), fmt::format("in {}f", quickStepUpdates - 1));
++
++        // Whether X would boost: on the ground TryBoost, in the air TryAirBoost, with enough energy in the gauge (out of
++        // 100). As for the other presses, a state entered during this frame's update tries it if its update starts with it.
++        float energy = LoadFloat(context + CHAOS_ENERGY_OFFSET);
++        bool boosting = GetFlag(context, STATE_FLAGS_OFFSET, BOOSTING_FLAG);
++        bool canBoost;
++        if (grounded)
++        {
++            bool boostTried = g_boostCheckFrame == g_frame && (!entered || g_boostCheckState == state) && g_boostAllowed;
++            bool boostNext = (groundActionsNext || (entered && IsStateIn(state, BOOST_STATE_VFTABLES))) && IsBoostAllowed(context);
++            canBoost = energy > g_boostEnableEnergy && (boostTried || boostNext);
++        }
++        else
++        {
++            // The air actions do nothing while Sonic is on the ground or out of control (sub_82316118, vfunc 56), so this
++            // goes by the state after this frame's update: a hop that just left the ground, or the end of an
++            // out-of-control (RooftopRunAct1.ltm, frames 1159 and 3037).
++            bool airActions = IsStateIn(state, AIR_ACTIONS_STATE_VFTABLES) || (g_airBoostCheckFrame == g_frame && !entered);
++            canBoost = energy > g_airBoostEnableEnergy && airActions && !outOfControl && IsAirBoostAllowed(context);
++        }
++
++        DrawIndicator(drawList, font, { left, boostRow }, indicatorWidth, "CAN BOOST", IM_COL32(80, 230, 80, 255), canBoost, true);
++        DrawIndicator(drawList, font, { column2, boostRow }, indicatorWidth, "BOOSTING", IM_COL32(90, 170, 255, 230), boosting);
++
++        std::string gauge = fmt::format("Boost {:.2f}", energy);
++        DrawText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), gauge), boostRow + Scale(2) },
++            IM_COL32(220, 220, 220, 255), gauge);
 +
 +        g_sonicPreviousState = stateName;
 +        g_sonicPreviousStateObject = state;
