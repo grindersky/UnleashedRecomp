@@ -2894,6 +2894,127 @@ void Video::WaitOnSwapChain()
     }
 }
 
+// In fast-forward, libTAS skips drawing most frames: its vkCmdDraw* wrappers (handed out by vkGetDeviceProcAddr) do nothing
+// until the frame boundary that decides otherwise (Global::skipping_draw, set at the end of each boundary for the next
+// frame). Clears and hardware resolves still ran then, so a skipped frame left render targets cleared without the draws
+// that fill them. (The white/black world in fast-forward came from the eye adaptation instead: see g_tasSnapAdaptation.)
+// TAS mode finds out after each frame boundary whether the next frame's draws are skipped: it clears a 1x1 target, draws a
+// white texel into it through the same wrappers and reads it back. While they are, clears and resolves are skipped too, so
+// skipped frames leave the GPU's images as the last drawn frame left them.
+static std::atomic<bool> g_tasSkippingDraws;
+
+struct TasDrawSkipProbe
+{
+    std::unique_ptr<RenderTexture> source;
+    uint32_t sourceDescriptorIndex = 0;
+    std::unique_ptr<RenderTexture> target;
+    std::unique_ptr<RenderFramebuffer> framebuffer;
+    std::unique_ptr<RenderPipeline> pipeline;
+    std::unique_ptr<RenderBuffer> uploadBuffer;
+    std::unique_ptr<RenderBuffer> readbackBuffer;
+    std::unique_ptr<RenderCommandList> commandList;
+    std::unique_ptr<RenderCommandFence> fence;
+    bool sourceUploaded = false;
+};
+
+static TasDrawSkipProbe g_tasDrawSkipProbe;
+
+static bool AreDrawsSkipped()
+{
+    auto& probe = g_tasDrawSkipProbe;
+    constexpr RenderFormat FORMAT = RenderFormat::R8G8B8A8_UNORM;
+
+    if (probe.commandList == nullptr)
+    {
+        probe.source = g_device->createTexture(RenderTextureDesc::Texture2D(1, 1, 1, FORMAT));
+        probe.target = g_device->createTexture(RenderTextureDesc::Texture2D(1, 1, 1, FORMAT, RenderTextureFlag::RENDER_TARGET));
+
+        RenderFramebufferDesc framebufferDesc;
+        const RenderTexture* attachment = probe.target.get();
+        framebufferDesc.colorAttachments = &attachment;
+        framebufferDesc.colorAttachmentsCount = 1;
+        probe.framebuffer = g_device->createFramebuffer(framebufferDesc);
+
+        RenderGraphicsPipelineDesc pipelineDesc;
+        pipelineDesc.pipelineLayout = g_pipelineLayout.get();
+        pipelineDesc.vertexShader = g_copyShader.get();
+        pipelineDesc.pixelShader = g_copyColorShader.get();
+        pipelineDesc.renderTargetFormat[0] = FORMAT;
+        pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+        pipelineDesc.renderTargetCount = 1;
+        probe.pipeline = g_device->createGraphicsPipeline(pipelineDesc);
+
+        probe.uploadBuffer = g_device->createBuffer(RenderBufferDesc::UploadBuffer(256));
+        memset(probe.uploadBuffer->map(), 0xFF, 4);
+        probe.uploadBuffer->unmap();
+
+        probe.readbackBuffer = g_device->createBuffer(RenderBufferDesc::ReadbackBuffer(256));
+        probe.commandList = g_queue->createCommandList();
+        probe.fence = g_device->createCommandFence();
+
+        probe.sourceDescriptorIndex = g_textureDescriptorAllocator.allocate();
+        g_textureDescriptorSet->setTexture(probe.sourceDescriptorIndex, probe.source.get(), RenderTextureLayout::SHADER_READ);
+    }
+
+    auto& commandList = probe.commandList;
+    commandList->begin();
+
+    if (!probe.sourceUploaded)
+    {
+        commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(probe.source.get(), RenderTextureLayout::COPY_DEST));
+        commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(probe.source.get()),
+            RenderTextureCopyLocation::PlacedFootprint(probe.uploadBuffer.get(), FORMAT, 1, 1, 1, 1));
+        commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(probe.source.get(), RenderTextureLayout::SHADER_READ));
+        probe.sourceUploaded = true;
+    }
+
+    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(probe.target.get(), RenderTextureLayout::COLOR_WRITE));
+    commandList->setFramebuffer(probe.framebuffer.get());
+    commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 0.0f));
+    commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+    commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+    commandList->setPipeline(probe.pipeline.get());
+    commandList->setViewports(RenderViewport(0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f));
+    commandList->setScissors(RenderRect(0, 0, 1, 1));
+    commandList->setGraphicsPushConstants(0, &probe.sourceDescriptorIndex, 0, sizeof(uint32_t));
+    commandList->drawInstanced(6, 1, 0, 0);
+    commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(probe.target.get(), RenderTextureLayout::COPY_SOURCE));
+    commandList->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(probe.readbackBuffer.get(), FORMAT, 1, 1, 1, 1),
+        RenderTextureCopyLocation::Subresource(probe.target.get()));
+    commandList->end();
+
+    g_queue->executeCommandLists(commandList.get(), probe.fence.get());
+    g_queue->waitForCommandFence(probe.fence.get());
+
+    uint8_t red = *reinterpret_cast<const uint8_t*>(probe.readbackBuffer->map());
+    probe.readbackBuffer->unmap();
+    return red == 0;
+}
+
+// The tone mapping's eye adaptation (ToneMap_CalculateAdaptedLuminance) moves the adapted luminance toward the measured one
+// by 1 - 2^(-2.62 * g_TimeParam.x) per frame, reading the previous frame's result from one of two textures the game swaps
+// every frame. libTAS's fast-forward draws every 4th/8th/16th frame, so every drawn frame read the texture only skipped frames
+// write: the exposure stayed where it was when fast-forward began (white after a dark loading screen, black after a bright
+// scene) until the end of it. A drawn frame after skipped ones adapts fully instead (a huge time step), so the exposure
+// matches what is on screen. Normal speed and frame advance draw every frame and are unchanged.
+static constexpr XXH64_hash_t TAS_ADAPTED_LUMINANCE_SHADER_HASH = 0x94A71CC9B94E3101;
+static constexpr uint32_t TAS_TIME_PARAM_INDEX = 68 * 4; // g_TimeParam is c68.
+static std::atomic<bool> g_tasSnapAdaptation; // The next frame follows skipped frames.
+static bool g_tasTimeParamReplaced;
+
+static void UpdateTasSnapAdaptation(bool skippingNextFrame)
+{
+    static bool skippedLastFrame;
+
+    if (!skippingNextFrame)
+        g_tasSnapAdaptation = skippedLastFrame;
+
+    skippedLastFrame = skippingNextFrame;
+}
+
 static bool g_shouldPrecompilePipelines;
 static std::atomic<bool> g_executedCommandList;
 static std::atomic<bool> g_begunCommandList; // Only waited for in TAS mode.
@@ -2945,9 +3066,14 @@ void Video::Present()
         g_swapChainValid = g_swapChain->present(g_backBufferIndex, signalSemaphores, std::size(signalSemaphores));
     }
 
-    // The frame boundary has passed: sleeping threads and audio may run again.
+    // The frame boundary has passed: sleeping threads and audio may run again. The render thread is idle until the next
+    // command list begins, and libTAS has decided whether it skips the next frame's draws.
     if (IsTasMode())
+    {
+        g_tasSkippingDraws = AreDrawsSkipped();
+        UpdateTasSnapAdaptation(g_tasSkippingDraws);
         TasScheduler::AdvanceFrame();
+    }
 
     g_pendingWaitOnSwapChain = true;
 
@@ -3578,10 +3704,15 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
 
                     if (surface->format != RenderFormat::D32_FLOAT || hardwareDepthResolveAvailable)
                     {
-                        if (surface->format == RenderFormat::D32_FLOAT)
-                            commandList->resolveTextureRegion(texture->texture, 0, 0, surface->texture, nullptr, RenderResolveMode::MIN);
-                        else
-                            commandList->resolveTexture(texture->texture, surface->texture);
+                        // Shader resolves below are draws, which libTAS skips along with the frame's others; skip these
+                        // too then (see g_tasSkippingDraws).
+                        if (!g_tasSkippingDraws)
+                        {
+                            if (surface->format == RenderFormat::D32_FLOAT)
+                                commandList->resolveTextureRegion(texture->texture, 0, 0, surface->texture, nullptr, RenderResolveMode::MIN);
+                            else
+                                commandList->resolveTexture(texture->texture, surface->texture);
+                        }
 
                         shaderResolve = false;
                     }
@@ -3846,6 +3977,10 @@ static void ProcClear(const RenderCommand& cmd)
         SetFramebuffer(g_renderTarget, g_depthStencil, true);
 
     auto& commandList = g_commandLists[g_frame];
+
+    // libTAS skips this frame's draws: keep what the targets hold (see g_tasSkippingDraws).
+    if (g_tasSkippingDraws)
+        return;
 
     if (g_renderTarget != nullptr && (args.flags & D3DCLEAR_TARGET) != 0)
     {
@@ -4719,10 +4854,29 @@ static void FlushRenderStateForRenderThread()
         SetRootDescriptor(vertexShaderConstants, 0);
     }
 
+    // TAS fast-forward: a drawn frame after skipped ones adapts the exposure fully (see g_tasSnapAdaptation).
+    const bool tasReplaceTimeParam = g_tasSnapAdaptation && g_pipelineState.pixelShader != nullptr &&
+        g_pipelineState.pixelShader->shaderCacheEntry != nullptr &&
+        g_pipelineState.pixelShader->shaderCacheEntry->hash == TAS_ADAPTED_LUMINANCE_SHADER_HASH;
+
+    if (tasReplaceTimeParam || g_tasTimeParamReplaced)
+        g_dirtyStates.pixelShaderConstants = true;
+
+    g_tasTimeParamReplaced = tasReplaceTimeParam;
+
     if (g_dirtyStates.pixelShaderConstants)
     {
+        // The constants are kept big-endian.
+        uint32_t& timeParam = g_pixelShaderConstants[TAS_TIME_PARAM_INDEX];
+        const uint32_t originalTimeParam = timeParam;
+
+        if (tasReplaceTimeParam)
+            timeParam = ByteSwap(std::bit_cast<uint32_t>(100.0f)); // 1 - 2^(-262): the measured luminance.
+
         auto pixelShaderConstants = g_uploadAllocators[g_frame].allocate<true>(g_pixelShaderConstants, sizeof(g_pixelShaderConstants), 0x100);
         SetRootDescriptor(pixelShaderConstants, 1);
+
+        timeParam = originalTimeParam;
     }
 
     if (g_dirtyStates.sharedConstants)
