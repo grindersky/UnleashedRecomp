@@ -58,6 +58,7 @@
 #include "shader/gaussian_blur_5x5.hlsl.dxil.h"
 #include "shader/gaussian_blur_7x7.hlsl.dxil.h"
 #include "shader/gaussian_blur_9x9.hlsl.dxil.h"
+#include "shader/imgui_multisampled_ps.hlsl.dxil.h"
 #include "shader/imgui_ps.hlsl.dxil.h"
 #include "shader/imgui_vs.hlsl.dxil.h"
 #include "shader/movie_ps.hlsl.dxil.h"
@@ -83,6 +84,7 @@
 #include "shader/gaussian_blur_5x5.hlsl.spirv.h"
 #include "shader/gaussian_blur_7x7.hlsl.spirv.h"
 #include "shader/gaussian_blur_9x9.hlsl.spirv.h"
+#include "shader/imgui_multisampled_ps.hlsl.spirv.h"
 #include "shader/imgui_ps.hlsl.spirv.h"
 #include "shader/imgui_vs.hlsl.spirv.h"
 #include "shader/movie_ps.hlsl.spirv.h"
@@ -601,6 +603,31 @@ static IntermediaryUploadAllocator g_intermediaryUploadAllocator;
 static std::vector<GuestResource*> g_tempResources[NUM_FRAMES];
 static std::vector<std::unique_ptr<RenderBuffer>> g_tempBuffers[NUM_FRAMES];
 
+// What the collision overlay draws into with the game's multisampling (ImGuiCallback::SetMultisampled): as many samples
+// as the scene, the backbuffer's size.
+struct ImMultisampledTarget
+{
+    std::unique_ptr<RenderTexture> texture;
+    std::unique_ptr<RenderTextureView> textureView;
+    std::unique_ptr<RenderFramebuffer> framebuffer;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    RenderSampleCounts sampleCount = RenderSampleCount::COUNT_1;
+    uint32_t descriptorIndex = 0;
+    RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
+
+    ~ImMultisampledTarget()
+    {
+        if (descriptorIndex != 0)
+            g_textureDescriptorAllocator.free(descriptorIndex);
+    }
+};
+
+static std::unique_ptr<ImMultisampledTarget> g_imMultisampledTarget;
+
+// Replaced targets, kept until the frames that drew with them are done (like g_tempBuffers).
+static std::vector<std::unique_ptr<ImMultisampledTarget>> g_tempImMultisampledTargets[NUM_FRAMES];
+
 template<GuestPrimitiveType PrimitiveType>
 struct PrimitiveIndexData
 {
@@ -755,6 +782,7 @@ static void DestructTempResources()
 
     g_tempResources[g_frame].clear();
     g_tempBuffers[g_frame].clear();
+    g_tempImMultisampledTargets[g_frame].clear();
 }
 
 static std::thread::id g_presentThreadId = std::this_thread::get_id();
@@ -1347,6 +1375,13 @@ static std::unique_ptr<RenderPipelineLayout> g_imPipelineLayout;
 static std::unique_ptr<RenderPipeline> g_imPipeline;
 static std::unique_ptr<RenderPipeline> g_imAdditivePipeline;
 
+// imgui_multisampled_ps: drawing into g_imMultisampledTarget (one pipeline per sample count, 2x, 4x and 8x, made when
+// first used), and averaging it onto the backbuffer.
+static std::unique_ptr<RenderShader> g_imVertexShader;
+static std::unique_ptr<RenderShader> g_imMultisampledPixelShader;
+static std::unique_ptr<RenderPipeline> g_imMultisampledPipelines[3];
+static std::unique_ptr<RenderPipeline> g_imMultisampledResolvePipeline;
+
 template<typename T>
 static void ExecuteCopyCommandList(const T& function)
 {
@@ -1378,9 +1413,34 @@ struct ImGuiPushConstants
     ImVec2 scale{ 1.0f, 1.0f };
     ImVec2 proceduralOrigin{ 0.0f, 0.0f };
     float outline{};
+    uint32_t sampleCount{};
 };
 
 extern ImFontBuilderIO g_fontBuilderIO;
+
+static std::unique_ptr<RenderPipeline> CreateImMultisampledPipeline(RenderSampleCounts sampleCount, const RenderBlendDesc& blend)
+{
+    RenderInputElement inputElements[3];
+    inputElements[0] = RenderInputElement("POSITION", 0, 0, RenderFormat::R32G32_FLOAT, 0, offsetof(ImDrawVert, pos));
+    inputElements[1] = RenderInputElement("TEXCOORD", 0, 1, RenderFormat::R32G32_FLOAT, 0, offsetof(ImDrawVert, uv));
+    inputElements[2] = RenderInputElement("COLOR", 0, 2, RenderFormat::R8G8B8A8_UNORM, 0, offsetof(ImDrawVert, col));
+
+    RenderInputSlot inputSlot(0, sizeof(ImDrawVert));
+
+    RenderGraphicsPipelineDesc pipelineDesc;
+    pipelineDesc.pipelineLayout = g_imPipelineLayout.get();
+    pipelineDesc.vertexShader = g_imVertexShader.get();
+    pipelineDesc.pixelShader = g_imMultisampledPixelShader.get();
+    pipelineDesc.renderTargetFormat[0] = BACKBUFFER_FORMAT;
+    pipelineDesc.renderTargetBlend[0] = blend;
+    pipelineDesc.renderTargetCount = 1;
+    pipelineDesc.multisampling.sampleCount = sampleCount;
+    pipelineDesc.inputElements = inputElements;
+    pipelineDesc.inputElementsCount = std::size(inputElements);
+    pipelineDesc.inputSlots = &inputSlot;
+    pipelineDesc.inputSlotsCount = 1;
+    return g_device->createGraphicsPipeline(pipelineDesc);
+}
 
 static void CreateImGuiBackend()
 {
@@ -1520,6 +1580,13 @@ static void CreateImGuiBackend()
 
     pipelineDesc.renderTargetBlend[0].dstBlend = RenderBlend::ONE;
     g_imAdditivePipeline = g_device->createGraphicsPipeline(pipelineDesc);
+
+    // Blended onto a cleared target, the multisampled target's colours are already multiplied by their alpha.
+    g_imVertexShader = std::move(vertexShader);
+    g_imMultisampledPixelShader = CREATE_SHADER(imgui_multisampled_ps);
+    RenderBlendDesc premultipliedBlend = RenderBlendDesc::AlphaBlend();
+    premultipliedBlend.srcBlend = RenderBlend::ONE;
+    g_imMultisampledResolvePipeline = CreateImMultisampledPipeline(RenderSampleCount::COUNT_1, premultipliedBlend);
 
 #ifndef ENABLE_IM_FONT_ATLAS_SNAPSHOT
     ImFontAtlasSnapshot snapshot;
@@ -2247,13 +2314,18 @@ static uint32_t CreateDevice(uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
     return 0;
 }
 
-// The depth buffer the game drew its scene with, for the collision overlay (SetDepthStencilSurface).
+// The depth buffers the game drew its scene with, for the collision overlay (SetDepthStencilSurface): with anti-aliasing
+// on, it draws the scene with a multisampled one and also sets a single-sampled one of the same size after.
 static GuestSurface* g_sceneDepthStencil;
+static GuestSurface* g_sceneMultisampledDepthStencil;
 
-static void DestructResource(GuestResource* resource) 
+static void DestructResource(GuestResource* resource)
 {
     if (resource == reinterpret_cast<GuestResource*>(g_sceneDepthStencil))
         g_sceneDepthStencil = nullptr;
+
+    if (resource == reinterpret_cast<GuestResource*>(g_sceneMultisampledDepthStencil))
+        g_sceneMultisampledDepthStencil = nullptr;
 
     RenderCommand cmd;
     cmd.type = RenderCommandType::DestructResource;
@@ -2768,6 +2840,119 @@ static void ProcDrawImGui(const RenderCommand& cmd)
 
     ImRect clipRect{};
 
+    // The collision overlay's drawing into g_imMultisampledTarget (ImGuiCallback::SetMultisampled), while this isn't 0.
+    uint32_t multisampledCount = 0;
+
+    auto beginMultisampled = [&](uint32_t sampleCount, uint32_t pipelineIndex)
+        {
+            uint32_t width = uint32_t(drawData.DisplaySize.x);
+            uint32_t height = uint32_t(drawData.DisplaySize.y);
+
+            auto& target = g_imMultisampledTarget;
+            if (target == nullptr || target->width != width || target->height != height || target->sampleCount != sampleCount)
+            {
+                if (target != nullptr)
+                    g_tempImMultisampledTargets[g_frame].push_back(std::move(target));
+
+                target = std::make_unique<ImMultisampledTarget>();
+                target->texture = g_device->createTexture(RenderTextureDesc::ColorTarget(width, height, BACKBUFFER_FORMAT, RenderMultisampling(sampleCount)));
+
+                RenderTextureViewDesc viewDesc;
+                viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
+                viewDesc.format = BACKBUFFER_FORMAT;
+                viewDesc.mipLevels = 1;
+                target->textureView = target->texture->createTextureView(viewDesc);
+                target->descriptorIndex = g_textureDescriptorAllocator.allocate();
+                g_textureDescriptorSet->setTexture(target->descriptorIndex, target->texture.get(), RenderTextureLayout::SHADER_READ, target->textureView.get());
+
+                const RenderTexture* attachment = target->texture.get();
+                RenderFramebufferDesc framebufferDesc;
+                framebufferDesc.colorAttachments = &attachment;
+                framebufferDesc.colorAttachmentsCount = 1;
+                target->framebuffer = g_device->createFramebuffer(framebufferDesc);
+
+                target->width = width;
+                target->height = height;
+                target->sampleCount = sampleCount;
+            }
+
+            if (target->layout != RenderTextureLayout::COLOR_WRITE)
+            {
+                commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(target->texture.get(), RenderTextureLayout::COLOR_WRITE));
+                target->layout = RenderTextureLayout::COLOR_WRITE;
+            }
+
+            commandList->setFramebuffer(target->framebuffer.get());
+            g_framebuffer = target->framebuffer.get();
+            g_dirtyStates.renderTargetAndDepthStencil = true;
+            commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 0.0f));
+            commandList->setViewports(RenderViewport(drawData.DisplayPos.x, drawData.DisplayPos.y, drawData.DisplaySize.x, drawData.DisplaySize.y));
+            clipRect = {};
+
+            auto& multisampledPipeline = g_imMultisampledPipelines[pipelineIndex];
+            if (multisampledPipeline == nullptr)
+                multisampledPipeline = CreateImMultisampledPipeline(sampleCount, RenderBlendDesc::AlphaBlend());
+
+            commandList->setPipeline(multisampledPipeline.get());
+            pipeline = multisampledPipeline.get();
+            multisampledCount = sampleCount;
+        };
+
+    // Averages the target's samples onto the backbuffer, which is then the target again.
+    auto endMultisampled = [&]()
+        {
+            auto& target = g_imMultisampledTarget;
+            commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(target->texture.get(), RenderTextureLayout::SHADER_READ));
+            target->layout = RenderTextureLayout::SHADER_READ;
+
+            g_dirtyStates.renderTargetAndDepthStencil = true;
+            SetFramebuffer(g_backBuffer, nullptr, false);
+            commandList->setViewports(RenderViewport(drawData.DisplayPos.x, drawData.DisplayPos.y, drawData.DisplaySize.x, drawData.DisplaySize.y));
+            commandList->setScissors(RenderRect(0, 0, int32_t(target->width), int32_t(target->height)));
+            clipRect = {};
+            commandList->setPipeline(g_imMultisampledResolvePipeline.get());
+            pipeline = g_imMultisampledResolvePipeline.get();
+
+            ImVec2 min = drawData.DisplayPos;
+            ImVec2 max = { drawData.DisplayPos.x + drawData.DisplaySize.x, drawData.DisplayPos.y + drawData.DisplaySize.y };
+            ImDrawVert vertices[4] =
+            {
+                { min, {}, IM_COL32_WHITE },
+                { { max.x, min.y }, {}, IM_COL32_WHITE },
+                { max, {}, IM_COL32_WHITE },
+                { { min.x, max.y }, {}, IM_COL32_WHITE }
+            };
+
+            uint16_t indices[6] = { 0, 1, 2, 0, 2, 3 };
+
+            auto vertexAllocation = g_uploadAllocators[g_frame].allocate<false>(vertices, sizeof(vertices), alignof(ImDrawVert));
+            auto indexAllocation = g_uploadAllocators[g_frame].allocate<false>(indices, sizeof(indices), alignof(uint16_t));
+
+            const RenderVertexBufferView vertexView(vertexAllocation.buffer->at(vertexAllocation.offset), sizeof(vertices));
+            const RenderInputSlot inputSlot(0, sizeof(ImDrawVert));
+            commandList->setVertexBuffers(0, &vertexView, 1, &inputSlot);
+
+            const RenderIndexBufferView indexView(indexAllocation.buffer->at(indexAllocation.offset), sizeof(indices), RenderFormat::R16_UINT);
+            commandList->setIndexBuffer(&indexView);
+
+            ImGuiPushConstants resolvePushConstants = pushConstants;
+            resolvePushConstants.shaderModifier = IMGUI_SHADER_MODIFIER_MULTISAMPLED_RESOLVE;
+            resolvePushConstants.texture2DDescriptorIndex = target->descriptorIndex;
+            resolvePushConstants.sampleCount = target->sampleCount;
+            resolvePushConstants.origin = { 0.0f, 0.0f };
+            resolvePushConstants.scale = { 1.0f, 1.0f };
+            commandList->setGraphicsPushConstants(0, &resolvePushConstants);
+            commandList->drawIndexedInstanced(6, 1, 0, 0, 0);
+
+            // Back to the draw list's own state.
+            uint32_t shaderModifier = IMGUI_SHADER_MODIFIER_NONE;
+            memcpy(&pushConstants.shaderModifier, &shaderModifier, sizeof(shaderModifier));
+            commandList->setGraphicsPushConstants(0, &pushConstants);
+            commandList->setPipeline(g_imPipeline.get());
+            pipeline = g_imPipeline.get();
+            multisampledCount = 0;
+        };
+
     for (int i = 0; i < drawData.CmdListsCount; i++)
     {
         auto& drawList = drawData.CmdLists[i];
@@ -2812,6 +2997,24 @@ static void ProcDrawImGui(const RenderCommand& cmd)
                 case ImGuiCallback::SetProceduralOrigin:
                     setPushConstants(&pushConstants.proceduralOrigin, &callbackData->setProceduralOrigin, sizeof(callbackData->setProceduralOrigin));
                     break;
+                case ImGuiCallback::SetMultisampled:
+                {
+                    uint32_t sampleCount = callbackData->setMultisampled.sampleCount;
+                    uint32_t pipelineIndex = sampleCount == 2 ? 0 : sampleCount == 4 ? 1 : sampleCount == 8 ? 2 : ~0u;
+                    if (multisampledCount == 0 && pipelineIndex != ~0u)
+                    {
+                        beginMultisampled(sampleCount, pipelineIndex);
+                        setPushConstants(&pushConstants.shaderModifier, &callbackData->setMultisampled.shaderModifier, sizeof(uint32_t));
+                        setPushConstants(&pushConstants.sampleCount, &sampleCount, sizeof(uint32_t));
+                    }
+                    else if (multisampledCount != 0 && sampleCount == 0)
+                    {
+                        endMultisampled();
+                        commandList->setVertexBuffers(0, &vertexBufferView, 1, &inputSlot);
+                        commandList->setIndexBuffer(&indexBufferView);
+                    }
+                    break;
+                }
                 case ImGuiCallback::SetAdditive:
                 {
                     auto pipelineToSet = callbackData->setAdditive.enabled ? g_imAdditivePipeline.get() : g_imPipeline.get();
@@ -2869,6 +3072,9 @@ static void ProcDrawImGui(const RenderCommand& cmd)
             }
         }
     }
+
+    if (multisampledCount != 0)
+        endMultisampled();
 }
 
 // We have to check for this to properly handle the following situation:
@@ -3610,17 +3816,20 @@ static void ProcSetRenderTarget(const RenderCommand& cmd)
 
 GuestSurface* Video::GetSceneDepthStencil()
 {
-    return g_sceneDepthStencil;
+    return g_sceneMultisampledDepthStencil != nullptr ? g_sceneMultisampledDepthStencil : g_sceneDepthStencil;
 }
 
 static void SetDepthStencilSurface(GuestDevice* device, GuestSurface* depthStencil) 
 {
     // The scene's depth buffer is at the game's render resolution (SetResolution); shadow maps and such aren't.
-    if (depthStencil != nullptr && depthStencil->sampleCount == RenderSampleCount::COUNT_1 &&
+    if (depthStencil != nullptr &&
         depthStencil->width == uint32_t(round(Video::s_viewportWidth * Config::ResolutionScale)) &&
         depthStencil->height == uint32_t(round(Video::s_viewportHeight * Config::ResolutionScale)))
     {
-        g_sceneDepthStencil = depthStencil;
+        if (depthStencil->sampleCount != RenderSampleCount::COUNT_1)
+            g_sceneMultisampledDepthStencil = depthStencil;
+        else
+            g_sceneDepthStencil = depthStencil;
     }
 
     RenderCommand cmd;

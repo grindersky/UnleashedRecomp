@@ -15,6 +15,12 @@
 // The vertices' depth (as the game's depth buffer has it: reversed, 1 at the near plane) in the texture coordinates' x,
 // and the texture is the game's depth buffer: pixels behind what the game drew are left out.
 #define IMGUI_SHADER_MODIFIER_DEPTH_TEST               12
+// Drawn by imgui_multisampled_ps into a multisampled target like the game's scene (ImGuiCallback::SetMultisampled), so
+// the edges are smoothed like the scene's; the depth test one does DEPTH_TEST's test per sample, with the game's
+// multisampled depth buffer as the texture. RESOLVE averages that target's samples onto the backbuffer.
+#define IMGUI_SHADER_MODIFIER_MULTISAMPLED             13
+#define IMGUI_SHADER_MODIFIER_MULTISAMPLED_DEPTH_TEST  14
+#define IMGUI_SHADER_MODIFIER_MULTISAMPLED_RESOLVE     15
 
 #ifdef __cplusplus
 
@@ -28,7 +34,8 @@ enum class ImGuiCallback : int32_t
     SetOutline = -6,
     SetProceduralOrigin = -7,
     // -8 is ImDrawCallback_ResetRenderState, don't use!
-    SetAdditive = -9
+    SetAdditive = -9,
+    SetMultisampled = -10
 };
 
 union ImGuiCallbackData
@@ -78,6 +85,14 @@ union ImGuiCallbackData
     {
         bool enabled;
     } setAdditive;
+
+    // A sample count starts drawing into the multisampled target with that shader modifier; 0 puts what it holds onto
+    // the backbuffer.
+    struct
+    {
+        uint32_t sampleCount;
+        uint32_t shaderModifier;
+    } setMultisampled;
 };
 
 extern ImGuiCallbackData* AddImGuiCallback(ImGuiCallback callback);

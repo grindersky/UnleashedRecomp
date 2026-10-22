@@ -27,8 +27,8 @@ struct Video
     static void WaitForGPU();
     static void ComputeViewportDimensions();
 
-    // The depth buffer the game drew its scene with: the last depth stencil it set at its render resolution, without
-    // multisampling, or null.
+    // The depth buffer the game drew its scene with: the last multisampled depth stencil it set at its render resolution
+    // (anti-aliasing on), else the last single-sampled one, or null.
     static GuestSurface* GetSceneDepthStencil();
 };
 

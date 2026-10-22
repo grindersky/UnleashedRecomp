@@ -1070,12 +1070,26 @@ void CollisionOverlay::Draw()
     ImDrawListFlags flags = drawList->Flags;
     drawList->Flags &= ~ImDrawListFlags_AntiAliasedFill;
 
-    // Behind walls: the game's depth buffer as the texture. Without it (with multisampling, say), over everything.
-    GuestSurface* depthStencil = g_depthTested ? Video::GetSceneDepthStencil() : nullptr;
+    // With the game's anti-aliasing, into a target with as many samples as its scene, so the edges are smoothed like
+    // the scene's (and the faces' shared edges still don't overlap); it's put onto the screen after.
+    GuestSurface* sceneDepthStencil = Video::GetSceneDepthStencil();
+    uint32_t sampleCount = sceneDepthStencil != nullptr ? uint32_t(sceneDepthStencil->sampleCount) : 1;
+    bool multisampled = sampleCount == 2 || sampleCount == 4 || sampleCount == 8;
+
+    // Behind walls: the game's depth buffer as the texture (multisampled: tested per sample). Without it, over everything.
+    GuestSurface* depthStencil = g_depthTested ? sceneDepthStencil : nullptr;
     projector.DepthTested = depthStencil != nullptr;
     if (projector.DepthTested)
-    {
         drawList->PushTextureID(ImTextureID(depthStencil));
+
+    if (multisampled)
+    {
+        auto callbackData = AddImGuiCallback(ImGuiCallback::SetMultisampled);
+        callbackData->setMultisampled.sampleCount = sampleCount;
+        callbackData->setMultisampled.shaderModifier = projector.DepthTested ? IMGUI_SHADER_MODIFIER_MULTISAMPLED_DEPTH_TEST : IMGUI_SHADER_MODIFIER_MULTISAMPLED;
+    }
+    else if (projector.DepthTested)
+    {
         SetShaderModifier(IMGUI_SHADER_MODIFIER_DEPTH_TEST);
     }
 
@@ -1101,11 +1115,19 @@ void CollisionOverlay::Draw()
     DrawPlayerCollision(drawList, projector, context, werehog);
     DrawFacingArrow(drawList, projector, context);
 
-    if (projector.DepthTested)
+    if (multisampled)
+    {
+        auto callbackData = AddImGuiCallback(ImGuiCallback::SetMultisampled);
+        callbackData->setMultisampled.sampleCount = 0;
+        callbackData->setMultisampled.shaderModifier = IMGUI_SHADER_MODIFIER_NONE;
+    }
+    else if (projector.DepthTested)
     {
         SetShaderModifier(IMGUI_SHADER_MODIFIER_NONE);
-        drawList->PopTextureID();
     }
+
+    if (projector.DepthTested)
+        drawList->PopTextureID();
 
     drawList->Flags = flags;
 }

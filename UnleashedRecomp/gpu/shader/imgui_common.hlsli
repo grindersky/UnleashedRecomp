@@ -18,9 +18,13 @@ struct PushConstants
     float2 Scale;
     float2 ProceduralOrigin;
     float Outline;
+    uint SampleCount;
 };
 
+// imgui_multisampled_ps has multisampled textures there instead.
+#ifndef IMGUI_MULTISAMPLED
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+#endif
 SamplerState g_SamplerDescriptorHeap[] : register(s0, space1);
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants : register(b0, space2);
 
