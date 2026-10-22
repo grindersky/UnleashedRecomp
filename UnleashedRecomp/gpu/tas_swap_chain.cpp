@@ -10,14 +10,16 @@
 
 static std::atomic<uint32_t> g_uploadErrors;
 static std::atomic<uint32_t> g_presentCount;
-static std::atomic<bool> g_rebuildingSurface;
 
 #ifdef __linux__
 // The frame upload to the X server can fail with BadGC (seen once under VcXsrv, in Empire City Act 2 Day: "X Error
 // of failed request: BadGC, Major opcode 130 (MIT-SHM), Minor opcode 3 (X_ShmPutImage)"), which Xlib's default handler
 // answers by exiting. Why the GC SDL made for the window was gone isn't known yet. Those errors are logged and ignored
 // instead (a frame isn't shown), and if uploads keep failing, the window surface is made again (see present()).
-// Other errors go to the previous handler.
+// Freeing the old surface then fails too: XFreeGC on the stale GC, and X_ShmDetach of its shared memory segment with
+// BadShmSeg (seen 10-21: it went to the default handler and the game exited). The detach can come from destroying the
+// software renderer as well as the surface, and its error can arrive later, so a failed detach is ignored whenever it
+// happens: the segment is gone either way. Other errors go to the previous handler.
 static constexpr int X_REQUEST_PUT_IMAGE = 72;
 static constexpr int X_REQUEST_FREE_GC = 60;
 static constexpr int X_SHM_DETACH = 2;
@@ -25,6 +27,7 @@ static constexpr int X_SHM_PUT_IMAGE = 3;
 static constexpr int SHM_BAD_SEG = 0;
 
 static XErrorHandler g_previousErrorHandler;
+static Display* g_display;
 static int g_shmMajorOpcode = -1;
 static int g_shmFirstError = -1;
 // The GC of the last failed upload, whose XFreeGC fails the same way when the surface is made again.
@@ -39,7 +42,7 @@ static int TasXErrorHandler(Display* display, XErrorEvent* event)
     bool upload = (shmRequest && event->minor_code == X_SHM_PUT_IMAGE) || event->request_code == X_REQUEST_PUT_IMAGE;
     bool uploadError = upload && (badGC || badShmSeg);
     bool cleanupError = (event->request_code == X_REQUEST_FREE_GC && badGC && event->resourceid == g_staleGC) ||
-        (g_rebuildingSurface && shmRequest && event->minor_code == X_SHM_DETACH && (badShmSeg || event->error_code == BadValue));
+        (shmRequest && event->minor_code == X_SHM_DETACH && (badShmSeg || event->error_code == BadValue));
 
     if (!uploadError && !cleanupError)
         return g_previousErrorHandler != nullptr ? g_previousErrorHandler(display, event) : 0;
@@ -51,9 +54,10 @@ static int TasXErrorHandler(Display* display, XErrorEvent* event)
             g_staleGC = event->resourceid;
     }
 
-    // Only the first ones: a stale surface fails on every frame until it's made again.
-    static std::atomic<uint32_t> s_logged;
-    if (s_logged++ < 50)
+    // Only the first ones of each: a stale surface fails on every frame until it's made again.
+    static std::atomic<uint32_t> s_loggedUploads;
+    static std::atomic<uint32_t> s_loggedCleanups;
+    if ((cleanupError ? s_loggedCleanups : s_loggedUploads)++ < 50)
     {
         char text[128] = {};
         XGetErrorText(display, event->error_code, text, sizeof(text));
@@ -79,6 +83,7 @@ static void InstallXErrorHandler(Display* display)
     }
 
     g_previousErrorHandler = XSetErrorHandler(TasXErrorHandler);
+    g_display = display;
     s_installed = true;
 }
 #endif
@@ -155,9 +160,13 @@ void TasSwapChain::RebuildWindowSurface()
         m_renderer = nullptr;
     }
 
-    g_rebuildingSurface = true;
     SDL_DestroyWindowSurface(m_sdlWindow);
-    g_rebuildingSurface = false;
+
+#ifdef __linux__
+    // Errors from freeing the old surface arrive now, not in the middle of making the new one.
+    if (g_display != nullptr)
+        XSync(g_display, False);
+#endif
 
     // The frames' textures stay: the game's renderer uses them.
     CreateRenderer();
