@@ -1,5 +1,6 @@
 #include "collision_overlay.h"
 #include <api/SWA.h>
+#include <gpu/imgui/imgui_snapshot.h>
 #include <kernel/function.h>
 #include <kernel/memory.h>
 #include <patches/collision_view_patches.h>
@@ -110,6 +111,9 @@ static constexpr uint32_t LIST_SHAPE_VFTABLE = 0x82130428;
 // the axes as rows, then the position: his facing is its third row (sub_8230A4E0), and his position is at his feet.
 static constexpr uint32_t CONTEXT_MATRIX_NODE_OFFSET = 16;
 static constexpr uint32_t MATRIX_NODE_MATRIX_OFFSET = 128;
+
+// Day Sonic's velocity, in world space (the HUD's "Total").
+static constexpr uint32_t SONIC_VELOCITY_OFFSET = 0x210;
 
 // The arrow along his facing: a flat arrow given some thickness, a little above his feet.
 static constexpr float ARROW_HEIGHT = 0.05f;
@@ -273,18 +277,35 @@ bool CollisionOverlay::IsEnabled()
     return Config::EnableStageCollisionDebugView || Config::EnableEventCollisionDebugView || Config::EnableObjectCollisionDebugView;
 }
 
+// The camera and the objects are also followed for the HUD's radar.
+static bool IsTracking()
+{
+    return CollisionOverlay::IsEnabled() || TasHud::IsEnabled();
+}
+
 // The overlay is hidden behind what the game drew, with the game's depth buffer; F12 switches to drawing it over
 // everything and back. Under libTAS, F1 to F10 are savestate hotkeys, which the game doesn't get; F12 is passed on as a
 // key, so it goes into the movie like the game's keys.
 static std::atomic<bool> g_depthTested{ true };
+
+// How far the HUD's radar reaches from Sonic, to each side; Home goes to the next size, then hides it, then starts
+// over. Like F12, it reaches the game as a key the game doesn't use.
+static constexpr float RADAR_HALF_WIDTHS[] = { 4.0f, 12.0f };
+static std::atomic<int> g_radarSize{ 0 };
 
 static class CollisionOverlayListener : public SDLEventListener
 {
 public:
     bool OnSDLEvent(SDL_Event* event) override
     {
-        if (CollisionOverlay::IsEnabled() && event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_F12 && !event->key.repeat)
+        if (event->type != SDL_KEYDOWN || event->key.repeat)
+            return false;
+
+        if (CollisionOverlay::IsEnabled() && event->key.keysym.sym == SDLK_F12)
             g_depthTested = !g_depthTested;
+
+        if (TasHud::IsEnabled() && event->key.keysym.sym == SDLK_HOME)
+            g_radarSize = (g_radarSize + 1) % int(std::size(RADAR_HALF_WIDTHS) + 1);
 
         return false;
     }
@@ -293,7 +314,7 @@ g_collisionOverlayListener;
 
 void CollisionOverlay::OnCameraUpdate(uint32_t camera)
 {
-    if (IsEnabled())
+    if (IsTracking())
     {
         g_camera = camera;
         g_cameraVftable = LoadU32(camera);
@@ -331,17 +352,28 @@ PPC_FUNC(sub_822E4290)
 // like SWA::CSonicEnemyBase, the CEnemy* classes, their shots and weapons, and SWA::EvilEnemy::IEvilEnemy) and the goal
 // ring (SWA::CObjGoalRing). Only what the game's views don't draw: they decide as it's added, the event collision view
 // (ms_IsTriggerRender, read by the event collision helpers) for event collisions, the object collision view
-// (ms_IsObjectCollisionRender, read by sub_825146A8) for rigid bodies.
+// (ms_IsObjectCollisionRender, read by sub_825146A8) for rigid bodies. The rings (SWA::CObjRing, whose set-up,
+// sub_825EA530, adds a sphere through sub_825169F8 -> sub_82516528, and SWA::CObjSuperRing) are only on the radar.
 enum class ObjectKind
 {
     None,
     Enemy,
-    GoalRing
+    GoalRing,
+    Ring
 };
 
-// The physics units those objects added, until they're destroyed. The game adds them on its own threads.
+struct TrackedUnit
+{
+    ObjectKind Kind;
+    // Whether the game's view drew it.
+    bool DrawnByView;
+    uint32_t Object;
+};
+
+// The physics units objects added, until they're destroyed: those of every object, as the HUD's homing estimate looks
+// for any target. The game adds them on its own threads.
 static std::mutex g_unitsMutex;
-static std::unordered_map<uint32_t, ObjectKind> g_units;
+static std::unordered_map<uint32_t, TrackedUnit> g_units;
 static std::unordered_map<uint32_t, ObjectKind> g_objectKinds;
 
 // The object adding an event collision.
@@ -377,6 +409,12 @@ static ObjectKind GetObjectKind(uint32_t object)
                 break;
             }
 
+            if (i == 0 && (name == ".?AVCObjRing@SWA@@" || name == ".?AVCObjSuperRing@SWA@@"))
+            {
+                kind = ObjectKind::Ring;
+                break;
+            }
+
             if (name.find("Enemy") != std::string_view::npos)
             {
                 kind = ObjectKind::Enemy;
@@ -389,15 +427,13 @@ static ObjectKind GetObjectKind(uint32_t object)
     return kind;
 }
 
-static void TrackUnit(uint32_t object, uint32_t unit)
+static void TrackUnit(uint32_t object, uint32_t unit, bool drawnByView)
 {
-    if (!CollisionOverlay::IsEnabled() || !IsReadable(object) || !IsReadable(unit))
+    if (!IsTracking() || !IsReadable(object) || !IsReadable(unit))
         return;
 
     std::lock_guard lock(g_unitsMutex);
-    ObjectKind kind = GetObjectKind(object);
-    if (kind != ObjectKind::None)
-        g_units[unit] = kind;
+    g_units[unit] = { GetObjectKind(object), drawnByView, object };
 }
 
 static bool IsViewOn(const bool* view)
@@ -407,7 +443,7 @@ static bool IsViewOn(const bool* view)
 
 static void ForgetUnit(uint32_t unit)
 {
-    if (!CollisionOverlay::IsEnabled())
+    if (!IsTracking())
         return;
 
     std::lock_guard lock(g_unitsMutex);
@@ -446,17 +482,15 @@ PPC_FUNC(sub_8248F210)
     uint32_t collision = ctx.r3.u32;
     __imp__sub_8248F210(ctx, base);
 
-    if (g_eventCollisionOwner != 0 && !IsViewOn(SWA::SGlobals::ms_IsTriggerRender))
-        TrackUnit(g_eventCollisionOwner, LoadU32(collision));
+    if (g_eventCollisionOwner != 0)
+        TrackUnit(g_eventCollisionOwner, LoadU32(collision), IsViewOn(SWA::SGlobals::ms_IsTriggerRender));
 }
 
 // An object (r3) adds a SWA::CRigidBody (the shared_ptr at r4).
 PPC_FUNC_IMPL(__imp__sub_825146A8);
 PPC_FUNC(sub_825146A8)
 {
-    if (!IsViewOn(SWA::SGlobals::ms_IsObjectCollisionRender))
-        TrackUnit(ctx.r3.u32, LoadU32(ctx.r4.u32));
-
+    TrackUnit(ctx.r3.u32, LoadU32(ctx.r4.u32), IsViewOn(SWA::SGlobals::ms_IsObjectCollisionRender));
     __imp__sub_825146A8(ctx, base);
 }
 
@@ -721,8 +755,9 @@ static void DrawSurface(ImDrawList* drawList, const Projector& projector, const 
     }
 }
 
-static void DrawShape(ImDrawList* drawList, const Projector& projector, const Transform& transform, uint32_t shape, ImU32 colour,
-    int depth = 0)
+// Calls visit(transform, shape) for each of the shapes a shape is made of, with where it is.
+template<typename Visit>
+static void ForEachLeafShape(const Transform& transform, uint32_t shape, const Visit& visit, int depth = 0)
 {
     if (depth > 4 || !IsReadable(shape))
         return;
@@ -732,19 +767,19 @@ static void DrawShape(ImDrawList* drawList, const Projector& projector, const Tr
     {
         Transform translation;
         translation.translation = LoadVector(shape + 0x20);
-        DrawShape(drawList, projector, transform * translation, LoadU32(shape + 0x18), colour, depth + 1);
+        ForEachLeafShape(transform * translation, LoadU32(shape + 0x18), visit, depth + 1);
         return;
     }
 
     if (vftable == CONVEX_TRANSFORM_SHAPE_VFTABLE)
     {
-        DrawShape(drawList, projector, transform * Transform::At(shape + 0x20), LoadU32(shape + 0x18), colour, depth + 1);
+        ForEachLeafShape(transform * Transform::At(shape + 0x20), LoadU32(shape + 0x18), visit, depth + 1);
         return;
     }
 
     if (vftable == TRANSFORM_SHAPE_VFTABLE)
     {
-        DrawShape(drawList, projector, transform * Transform::At(shape + 0x30), LoadU32(shape + 0x14), colour, depth + 1);
+        ForEachLeafShape(transform * Transform::At(shape + 0x30), LoadU32(shape + 0x14), visit, depth + 1);
         return;
     }
 
@@ -753,14 +788,22 @@ static void DrawShape(ImDrawList* drawList, const Projector& projector, const Tr
         uint32_t children = LoadU32(shape + 0x18);
         uint32_t count = std::min(LoadU32(shape + 0x1C), 64u);
         for (uint32_t i = 0; i < count; i++)
-            DrawShape(drawList, projector, transform, LoadU32(children + i * 16), colour, depth + 1);
+            ForEachLeafShape(transform, LoadU32(children + i * 16), visit, depth + 1);
 
         return;
     }
 
-    Surface surface;
-    if (BuildShape(surface, shape))
-        DrawSurface(drawList, projector, transform, surface, colour);
+    visit(transform, shape);
+}
+
+static void DrawShape(ImDrawList* drawList, const Projector& projector, const Transform& transform, uint32_t shape, ImU32 colour)
+{
+    ForEachLeafShape(transform, shape, [&](const Transform& leafTransform, uint32_t leaf)
+    {
+        Surface surface;
+        if (BuildShape(surface, leaf))
+            DrawSurface(drawList, projector, leafTransform, surface, colour);
+    });
 }
 
 static bool IsAttacking(uint32_t context)
@@ -837,18 +880,18 @@ static void DrawFacingArrow(ImDrawList* drawList, const Projector& projector, ui
     }
 }
 
-// The player's collision that's on: the body, day Sonic's path collision, and what touches rings, objects and triggers.
-static void DrawPlayerCollision(ImDrawList* drawList, const Projector& projector, uint32_t context, bool werehog)
+// The player's collision that's on, by ID, with its rigid body.
+static std::vector<std::pair<uint32_t, uint32_t>> GetPlayerBodies(uint32_t context)
 {
+    std::vector<std::pair<uint32_t, uint32_t>> bodies;
     uint32_t player = LoadU32(context + PLAYER_OFFSET);
     uint32_t container = player != 0 ? LoadU32(player + PLAYER_COLLISIONS_OFFSET) : 0;
     uint32_t head = container != 0 ? LoadU32(container + COLLISIONS_HEAD_OFFSET) : 0;
     if (head == 0)
-        return;
+        return bodies;
 
     // The tree's nodes: left at +0, right at +8, the ID at +12 and the shared_ptr at +16, the head's flag at +25.
     std::vector<uint32_t> nodes{ LoadU32(head + 4) };
-    std::vector<std::pair<uint32_t, uint32_t>> bodies;
     for (size_t i = 0; i < nodes.size() && i < 64; i++)
     {
         uint32_t node = nodes[i];
@@ -866,6 +909,14 @@ static void DrawPlayerCollision(ImDrawList* drawList, const Projector& projector
         if (LoadU32(body) == RIGID_BODY_VFTABLE && LoadU32(body + RIGID_BODY_WORLD_OFFSET) != 0)
             bodies.emplace_back(LoadU32(node + 12), body);
     }
+
+    return bodies;
+}
+
+// The player's collision that's on: the body, day Sonic's path collision, and what touches rings, objects and triggers.
+static void DrawPlayerCollision(ImDrawList* drawList, const Projector& projector, uint32_t context, bool werehog)
+{
+    auto bodies = GetPlayerBodies(context);
 
     // While day Sonic attacks (a slide, say), the collision around his body is what reaches enemies first.
     bool attacking = !werehog && IsAttacking(context);
@@ -886,14 +937,18 @@ static constexpr float OBJECT_DRAW_DISTANCE = 150.0f;
 // The collision of the enemies and of the goal ring that's on.
 static void DrawObjectCollision(ImDrawList* drawList, const Projector& projector)
 {
-    std::vector<std::pair<uint32_t, ObjectKind>> units;
+    std::vector<std::pair<uint32_t, TrackedUnit>> units;
     {
         std::lock_guard lock(g_unitsMutex);
         units.assign(g_units.begin(), g_units.end());
     }
 
-    for (auto& [unit, kind] : units)
+    for (auto& [unit, tracked] : units)
     {
+        ObjectKind kind = tracked.Kind;
+        if (kind == ObjectKind::None || kind == ObjectKind::Ring || tracked.DrawnByView)
+            continue;
+
         uint32_t unitVftable = LoadU32(unit);
         if (unitVftable != EVENT_COLLISION_VFTABLE && unitVftable != RIGID_BODY_UNIT_VFTABLE)
             continue;
@@ -1130,4 +1185,493 @@ void CollisionOverlay::Draw()
         drawList->PopTextureID();
 
     drawList->Flags = flags;
+}
+
+// A shape seen from above: the points a segment between two ends and a radius around it covers (a capsule's, a
+// cylinder's, a sphere's with both ends at its centre, a box's roughly), in world space.
+struct Footprint
+{
+    Vector3 A;
+    Vector3 B;
+    float Radius;
+
+    Vector3 Centre() const
+    {
+        return (A + B) * 0.5f;
+    }
+};
+
+static void GetFootprints(const Transform& transform, uint32_t shape, std::vector<Footprint>& footprints)
+{
+    ForEachLeafShape(transform, shape, [&](const Transform& leafTransform, uint32_t leaf)
+    {
+        uint32_t vftable = LoadU32(leaf);
+        float convexRadius = LoadFloat(leaf + 0x10);
+        if (vftable == CYLINDER_SHAPE_VFTABLE || vftable == CAPSULE_SHAPE_VFTABLE)
+        {
+            float radius = convexRadius + (vftable == CYLINDER_SHAPE_VFTABLE ? LoadFloat(leaf + 0x14) : 0.0f);
+            if (radius > 0.0f && radius < 100.0f)
+                footprints.push_back({ leafTransform(LoadVector(leaf + 0x20)), leafTransform(LoadVector(leaf + 0x30)), radius });
+        }
+        else if (vftable == SPHERE_SHAPE_VFTABLE)
+        {
+            if (convexRadius > 0.0f && convexRadius < 100.0f)
+                footprints.push_back({ leafTransform.translation, leafTransform.translation, convexRadius });
+        }
+        else if (vftable == BOX_SHAPE_VFTABLE)
+        {
+            Vector3 half = LoadVector(leaf + 0x20);
+            float radius = std::max(half.x, half.z) + convexRadius;
+            if (radius > 0.0f && radius < 100.0f)
+                footprints.push_back({ leafTransform.translation, leafTransform.translation, radius });
+        }
+    });
+}
+
+// How far a point is from a segment, seen from above.
+static float HorizontalDistance(const Vector3& point, const Vector3& a, const Vector3& b)
+{
+    float abX = b.x - a.x;
+    float abZ = b.z - a.z;
+    float apX = point.x - a.x;
+    float apZ = point.z - a.z;
+    float lengthSquared = abX * abX + abZ * abZ;
+    float t = lengthSquared > 0.0f ? std::clamp((apX * abX + apZ * abZ) / lengthSquared, 0.0f, 1.0f) : 0.0f;
+    return std::hypot(apX - abX * t, apZ - abZ * t);
+}
+
+static const ImU32 RADAR_RING_COLOUR = IM_COL32(255, 210, 40, 255);
+static const ImU32 RADAR_TOUCH_COLOUR = IM_COL32(80, 255, 80, 255);
+static const ImU32 RADAR_ITEM_COLOUR = IM_COL32(255, 80, 255, 230);
+
+// What the radar keeps from the last frame it was drawn on, to tell how fast Sonic's fall speeds up.
+static uint32_t g_radarContext;
+static uint32_t g_radarFrame;
+static float g_radarVelocityY;
+static bool g_radarAirborne;
+
+static void DrawRadarText(ImDrawList* drawList, ImFont* font, float size, ImVec2 pos, ImU32 colour, const std::string& text)
+{
+    drawList->AddText(font, size, { pos.x + Scale(1), pos.y + Scale(1) }, IM_COL32(0, 0, 0, 200), text.c_str());
+    drawList->AddText(font, size, pos, colour, text.c_str());
+}
+
+// A footprint's outline (filled if a fill is given), with the radar's mapping.
+template<typename ToRadar>
+static void DrawFootprint(ImDrawList* drawList, const ToRadar& toRadar, float scale, const Footprint& footprint, const Vector3& offset,
+    ImU32 outline, ImU32 fill = 0)
+{
+    constexpr int HALF_SEGMENTS = 12;
+
+    ImVec2 a = toRadar(footprint.A + offset);
+    ImVec2 b = toRadar(footprint.B + offset);
+    float radius = std::max(footprint.Radius * scale, Scale(1.5f));
+    float dx = b.x - a.x;
+    float dy = b.y - a.y;
+    float length = std::hypot(dx, dy);
+    if (length < 0.5f)
+    {
+        ImVec2 centre = { (a.x + b.x) / 2, (a.y + b.y) / 2 };
+        if (fill != 0)
+            drawList->AddCircleFilled(centre, radius, fill, 24);
+
+        drawList->AddCircle(centre, radius, outline, 24, Scale(1.2f));
+        return;
+    }
+
+    // Half a circle around each end, joined by the sides: convex.
+    std::array<ImVec2, 2 * (HALF_SEGMENTS + 1)> points;
+    float angle = std::atan2(dy, dx);
+    for (int i = 0; i <= HALF_SEGMENTS; i++)
+    {
+        float around = angle - PI / 2 + PI * i / HALF_SEGMENTS;
+        points[i] = { b.x + std::cos(around) * radius, b.y + std::sin(around) * radius };
+        points[HALF_SEGMENTS + 1 + i] = { a.x + std::cos(around + PI) * radius, a.y + std::sin(around + PI) * radius };
+    }
+
+    if (fill != 0)
+        drawList->AddConvexPolyFilled(points.data(), int(points.size()), fill);
+
+    drawList->AddPolyline(points.data(), int(points.size()), outline, ImDrawFlags_Closed, Scale(1.2f));
+}
+
+void CollisionOverlay::DrawRadar(float x, float y, float size, uint32_t context, bool grounded, bool diving, uint32_t frame, float deltaTime)
+{
+    int radarSize = g_radarSize;
+    if (radarSize >= int(std::size(RADAR_HALF_WIDTHS)))
+        return;
+
+    uint32_t node = LoadU32(context + CONTEXT_MATRIX_NODE_OFFSET);
+    if (!IsReadable(node))
+        return;
+
+    uint32_t matrix = node + MATRIX_NODE_MATRIX_OFFSET;
+    Vector3 front = LoadVector(matrix + 32);
+    Vector3 position = LoadVector(matrix + 48);
+    Vector3 velocity = LoadVector(context + SONIC_VELOCITY_OFFSET);
+    if (!std::isfinite(Length(position)) || !std::isfinite(Length(velocity)))
+        return;
+
+    // How much Sonic's vertical speed changed during the last update: gravity, or 0 at the fall's top speed (like
+    // diving's DivingDiveMaxVelocityDown). Never upwards: what pushed him up (a spring, say) isn't expected to go on.
+    float fallStep = NAN;
+    if (!grounded && g_radarAirborne && g_radarContext == context && g_radarFrame + 1 == frame)
+        fallStep = std::min(velocity.y - g_radarVelocityY, 0.0f);
+
+    g_radarContext = context;
+    g_radarFrame = frame;
+    g_radarVelocityY = velocity.y;
+    g_radarAirborne = !grounded;
+
+    // Turned like the camera: up on the radar is where the camera looks, along the ground (the 3D stick goes by the
+    // camera too). The camera's right is the view matrix's first column. Without the camera, Sonic's facing is up.
+    const Vector3 up{ 0.0f, 1.0f, 0.0f };
+    Vector3 right{};
+    if (g_camera != 0 && LoadU32(g_camera) == g_cameraVftable)
+        right = { LoadFloat(g_camera + CAMERA_VIEW_OFFSET), 0.0f, LoadFloat(g_camera + CAMERA_VIEW_OFFSET + 32) };
+
+    if (!(Length(right) > 0.1f))
+    {
+        Vector3 facing{ front.x, 0.0f, front.z };
+        right = Length(facing) > 0.1f ? Cross(facing, up) : Vector3{ 1.0f, 0.0f, 0.0f };
+    }
+
+    right = Normalised(right);
+    Vector3 forward = Cross(up, right);
+
+    float halfWidth = RADAR_HALF_WIDTHS[radarSize];
+    ImVec2 min = { x, y };
+    ImVec2 max = { x + size, y + size };
+    ImVec2 centre = { x + size / 2, y + size / 2 };
+    float scale = size / 2 / halfWidth;
+    auto toRadar = [&](const Vector3& p)
+    {
+        Vector3 d = p - position;
+        return ImVec2{ centre.x + Dot(d, right) * scale, centre.y - Dot(d, forward) * scale };
+    };
+
+    auto isInside = [&](const Vector3& p, float margin)
+    {
+        Vector3 d = p - position;
+        return std::abs(Dot(d, right)) < halfWidth + margin && std::abs(Dot(d, forward)) < halfWidth + margin;
+    };
+
+    // Sonic's collision as it is now: his body, and what collects rings (all but the body and the path collision).
+    std::vector<Footprint> body;
+    std::vector<Footprint> items;
+    for (auto& [id, rigidBody] : GetPlayerBodies(context))
+    {
+        if (id != SONIC_PATH_COLLISION_ID)
+            GetFootprints(Transform(rigidBody), LoadU32(rigidBody + RIGID_BODY_SHAPE_OFFSET), id == BODY_COLLISION_ID ? body : items);
+    }
+
+    const std::vector<Footprint>& collectors = items.empty() ? body : items;
+
+    // The heights are compared at the middle of the widest collector.
+    Vector3 reference = position + up * 0.5f;
+    float widest = 0.0f;
+    for (auto& footprint : collectors)
+    {
+        if (footprint.Radius > widest)
+        {
+            widest = footprint.Radius;
+            reference = footprint.Centre();
+        }
+    }
+
+    // The rings, enemies and goal ring around him.
+    struct RadarObject
+    {
+        Vector3 Centre;
+        float Radius;
+        ObjectKind Kind;
+    };
+
+    std::vector<RadarObject> objects;
+    {
+        std::lock_guard lock(g_unitsMutex);
+        for (auto& [unit, tracked] : g_units)
+        {
+            uint32_t unitVftable = LoadU32(unit);
+            if (tracked.Kind == ObjectKind::None || (unitVftable != EVENT_COLLISION_VFTABLE && unitVftable != RIGID_BODY_UNIT_VFTABLE))
+                continue;
+
+            Transform transform;
+            uint32_t shape;
+            if (!GetCollidable(LoadU32(unit + PHYSICS_UNIT_BODY_OFFSET), transform, shape) || !isInside(transform.translation, 5.0f))
+                continue;
+
+            std::vector<Footprint> footprints;
+            GetFootprints(transform, shape, footprints);
+            if (!footprints.empty())
+                objects.push_back({ footprints[0].Centre(), footprints[0].Radius, tracked.Kind });
+            else
+                objects.push_back({ transform.translation, 0.3f, tracked.Kind });
+        }
+    }
+
+    // Where he'll be when he gets down to each ring's height on the radar: his velocity along the ground kept, his fall
+    // sped up by the same amount every frame. Only an estimate: the stick and the game's own steering (diving's) change
+    // it, and nothing in between (the ground, walls) is checked.
+    struct Crossing
+    {
+        size_t Object;
+        int Frames;
+        Vector3 Offset;
+        float Gap;
+    };
+
+    std::vector<Crossing> crossings;
+    std::vector<Vector3> path;
+    bool predicted = !grounded && std::isfinite(fallStep) && deltaTime > 0.0f;
+    if (predicted)
+    {
+        float lowest = INFINITY;
+        for (auto& object : objects)
+        {
+            if (object.Kind == ObjectKind::Ring && object.Centre.y < reference.y && isInside(object.Centre, 0.0f))
+                lowest = std::min(lowest, object.Centre.y - reference.y);
+        }
+
+        std::vector<bool> crossed(objects.size());
+        Vector3 offset{};
+        float velocityY = velocity.y;
+        path.push_back(offset);
+        int frames = std::isfinite(lowest) ? 600 : 60;
+        for (int f = 1; f <= frames; f++)
+        {
+            velocityY += fallStep;
+            Vector3 next = offset + Vector3{ velocity.x, velocityY, velocity.z } * deltaTime;
+            for (size_t i = 0; i < objects.size(); i++)
+            {
+                const RadarObject& object = objects[i];
+                float height = object.Centre.y - reference.y;
+                if (object.Kind != ObjectKind::Ring || crossed[i] || !isInside(object.Centre, 0.0f) || !(offset.y > height && next.y <= height))
+                    continue;
+
+                crossed[i] = true;
+                Vector3 at = offset + (next - offset) * ((offset.y - height) / (offset.y - next.y));
+                float gap = INFINITY;
+                for (auto& footprint : collectors)
+                    gap = std::min(gap, HorizontalDistance(object.Centre, footprint.A + at, footprint.B + at) - footprint.Radius - object.Radius);
+
+                crossings.push_back({ i, f, at, gap });
+            }
+
+            offset = next;
+            path.push_back(offset);
+            if (offset.y < lowest - 1.0f || !isInside(position + offset, halfWidth))
+                break;
+        }
+    }
+
+    auto drawList = ImGui::GetBackgroundDrawList();
+    auto font = ImFontAtlasSnapshot::GetFont("FOT-SeuratPro-M.otf");
+
+    drawList->AddRectFilled(min, max, IM_COL32(0, 0, 0, 140), Scale(6));
+    drawList->PushClipRect(min, max, true);
+    drawList->AddLine({ centre.x, min.y }, { centre.x, max.y }, IM_COL32(255, 255, 255, 40), Scale(1));
+    drawList->AddLine({ min.x, centre.y }, { max.x, centre.y }, IM_COL32(255, 255, 255, 40), Scale(1));
+
+    // The enemies and the goal ring, then the rings: green where the estimate has his collectors touch them, with the
+    // height of their middle over his feet. Rings above each other (a vertical line of them) share one label: the
+    // nearest one below him (or above, if none is), and how many there are.
+    std::vector<bool> touched(objects.size());
+    for (auto& crossing : crossings)
+        touched[crossing.Object] = crossing.Gap <= 0.0f;
+
+    for (auto& object : objects)
+    {
+        ImVec2 point = toRadar(object.Centre);
+        float radius = std::max(object.Radius * scale, Scale(2.5f));
+        if (object.Kind == ObjectKind::Enemy)
+            drawList->AddRectFilled({ point.x - radius, point.y - radius }, { point.x + radius, point.y + radius }, ENEMY_COLOUR);
+        else if (object.Kind == ObjectKind::GoalRing)
+            drawList->AddCircle(point, radius, IM_COL32_WHITE, 24, Scale(2));
+    }
+
+    std::vector<bool> labelled(objects.size());
+    for (size_t i = 0; i < objects.size(); i++)
+    {
+        const RadarObject& object = objects[i];
+        if (object.Kind != ObjectKind::Ring)
+            continue;
+
+        ImVec2 point = toRadar(object.Centre);
+        float radius = std::max(object.Radius * scale, Scale(2.5f));
+        ImU32 colour = touched[i] ? RADAR_TOUCH_COLOUR : RADAR_RING_COLOUR;
+        drawList->AddCircleFilled(point, radius, (colour & ~IM_COL32_A_MASK) | IM_COL32(0, 0, 0, 70), 24);
+        drawList->AddCircle(point, radius, colour, 24, Scale(1.5f));
+
+        if (labelled[i])
+            continue;
+
+        int count = 0;
+        float shown = NAN;
+        for (size_t k = i; k < objects.size(); k++)
+        {
+            const RadarObject& other = objects[k];
+            if (other.Kind != ObjectKind::Ring || labelled[k] || HorizontalDistance(other.Centre, object.Centre, object.Centre) > 0.25f)
+                continue;
+
+            labelled[k] = true;
+            count++;
+            float height = other.Centre.y - position.y;
+            bool below = height < 0.0f;
+            if (std::isnan(shown) || (below && (shown >= 0.0f || height > shown)) || (!below && shown >= 0.0f && height < shown))
+                shown = height;
+        }
+
+        std::string label = count > 1 ? fmt::format("{:+.1f} x{}", shown, count) : fmt::format("{:+.1f}", shown);
+        DrawRadarText(drawList, font, Scale(10), { point.x + radius + Scale(2), point.y - Scale(5) }, colour, label);
+    }
+
+    // The estimated path, and where he reaches the first ring's height, with his collectors drawn there.
+    const Crossing* next = crossings.empty() ? nullptr : &crossings[0];
+    if (path.size() >= 2)
+    {
+        std::vector<ImVec2> points;
+        for (auto& offset : path)
+            points.push_back(toRadar(position + offset));
+
+        drawList->AddPolyline(points.data(), int(points.size()), IM_COL32(255, 255, 255, 150), 0, Scale(1.5f));
+    }
+
+    if (next != nullptr)
+    {
+        ImU32 colour = next->Gap <= 0.0f ? RADAR_TOUCH_COLOUR : IM_COL32(255, 160, 40, 255);
+        for (auto& footprint : collectors)
+            DrawFootprint(drawList, toRadar, scale, footprint, next->Offset, (colour & ~IM_COL32_A_MASK) | IM_COL32(0, 0, 0, 140));
+
+        ImVec2 point = toRadar(position + next->Offset);
+        float arm = Scale(5);
+        drawList->AddLine({ point.x - arm, point.y - arm }, { point.x + arm, point.y + arm }, colour, Scale(2));
+        drawList->AddLine({ point.x - arm, point.y + arm }, { point.x + arm, point.y - arm }, colour, Scale(2));
+    }
+
+    // Sonic: what collects rings, his body, and his facing.
+    for (auto& footprint : items)
+        DrawFootprint(drawList, toRadar, scale, footprint, {}, RADAR_ITEM_COLOUR);
+
+    for (auto& footprint : body)
+        DrawFootprint(drawList, toRadar, scale, footprint, {}, BODY_COLOUR, (BODY_COLOUR & ~IM_COL32_A_MASK) | IM_COL32(0, 0, 0, 120));
+
+    Vector3 facing{ front.x, 0.0f, front.z };
+    if (Length(facing) > 0.2f)
+    {
+        ImVec2 tip = toRadar(position + Normalised(facing) * (Scale(18) / scale));
+        drawList->AddLine(centre, tip, ARROW_COLOUR, Scale(2));
+        drawList->AddCircleFilled(tip, Scale(2.5f), ARROW_COLOUR);
+    }
+
+    drawList->PopClipRect();
+
+    // The title, the scale, and what the estimate says about the next ring.
+    float padding = Scale(6);
+    float textSize = Scale(10);
+    DrawRadarText(drawList, font, textSize, { min.x + padding, min.y + padding }, IM_COL32(220, 220, 220, 255), "TOP VIEW (Home)");
+
+    float bar = 0.5f;
+    for (float length : { 1.0f, 2.0f, 5.0f, 10.0f })
+    {
+        if (length <= halfWidth / 2)
+            bar = length;
+    }
+
+    std::string barText = fmt::format("{:g} m", bar);
+    float barRight = max.x - padding;
+    float barY = min.y + padding + Scale(12);
+    drawList->AddLine({ barRight - bar * scale, barY }, { barRight, barY }, IM_COL32_WHITE, Scale(2));
+    drawList->AddLine({ barRight - bar * scale, barY - Scale(3) }, { barRight - bar * scale, barY + Scale(3) }, IM_COL32_WHITE, Scale(1.5f));
+    drawList->AddLine({ barRight, barY - Scale(3) }, { barRight, barY + Scale(3) }, IM_COL32_WHITE, Scale(1.5f));
+    DrawRadarText(drawList, font, textSize, { barRight - font->CalcTextSizeA(textSize, FLT_MAX, 0.0f, barText.c_str()).x, min.y + padding },
+        IM_COL32(220, 220, 220, 255), barText);
+
+    if (predicted)
+    {
+        std::string text = "No ring below on the radar";
+        ImU32 colour = IM_COL32(200, 200, 200, 255);
+        if (next != nullptr)
+        {
+            text = next->Gap <= 0.0f ? fmt::format("Ring height in {}f: TOUCH", next->Frames) :
+                fmt::format("Ring height in {}f: {:.2f} m off", next->Frames, next->Gap);
+            colour = next->Gap <= 0.0f ? RADAR_TOUCH_COLOUR : IM_COL32(255, 160, 40, 255);
+        }
+
+        DrawRadarText(drawList, font, textSize, { min.x + padding, max.y - padding - Scale(24) }, colour, text);
+        DrawRadarText(drawList, font, textSize, { min.x + padding, max.y - padding - Scale(11) }, IM_COL32(170, 170, 170, 255),
+            diving ? "Estimate: diving steers with the stick" : "Estimate: no stick, no walls");
+    }
+}
+
+// Where an object's collision is, by its unit with the smallest footprint (an enemy's body rather than the sphere it
+// notices Sonic with).
+static bool GetUnitCentre(uint32_t unit, Vector3& centre, float& radius)
+{
+    uint32_t unitVftable = LoadU32(unit);
+    if (unitVftable != EVENT_COLLISION_VFTABLE && unitVftable != RIGID_BODY_UNIT_VFTABLE)
+        return false;
+
+    Transform transform;
+    uint32_t shape;
+    if (!GetCollidable(LoadU32(unit + PHYSICS_UNIT_BODY_OFFSET), transform, shape))
+        return false;
+
+    std::vector<Footprint> footprints;
+    GetFootprints(transform, shape, footprints);
+    centre = footprints.empty() ? transform.translation : footprints[0].Centre();
+    radius = footprints.empty() ? 0.3f : footprints[0].Radius;
+    return true;
+}
+
+void CollisionOverlay::GetObjectCentres(float x, float y, float z, float range, std::vector<ObjectCentre>& centres)
+{
+    centres.clear();
+    Vector3 from{ x, y, z };
+    std::unordered_map<uint32_t, size_t> indices;
+
+    std::lock_guard lock(g_unitsMutex);
+    for (auto& [unit, tracked] : g_units)
+    {
+        Vector3 centre;
+        float radius;
+        if (tracked.Kind == ObjectKind::Ring || !GetUnitCentre(unit, centre, radius) || Length(centre - from) > range)
+            continue;
+
+        auto [it, added] = indices.emplace(tracked.Object, centres.size());
+        if (added)
+            centres.push_back({ tracked.Object, LoadU32(tracked.Object), 0.0f, 0.0f, 0.0f, INFINITY, tracked.Kind == ObjectKind::Enemy });
+
+        auto& object = centres[it->second];
+        if (radius < object.Radius)
+        {
+            object.X = centre.x;
+            object.Y = centre.y;
+            object.Z = centre.z;
+            object.Radius = radius;
+        }
+    }
+}
+
+bool CollisionOverlay::GetObjectCentre(uint32_t object, float& x, float& y, float& z)
+{
+    bool found = false;
+    float smallest = INFINITY;
+
+    std::lock_guard lock(g_unitsMutex);
+    for (auto& [unit, tracked] : g_units)
+    {
+        Vector3 centre;
+        float radius;
+        if (tracked.Object != object || !GetUnitCentre(unit, centre, radius) || radius >= smallest)
+            continue;
+
+        x = centre.x;
+        y = centre.y;
+        z = centre.z;
+        smallest = radius;
+        found = true;
+    }
+
+    return found;
 }
