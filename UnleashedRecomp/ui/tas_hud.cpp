@@ -25,6 +25,8 @@ static constexpr uint32_t SONIC_CONTEXT_VFTABLE = 0x820182C4;
 static constexpr uint32_t VELOCITY_OFFSET = 0x210;
 static constexpr uint32_t HORIZONTAL_VELOCITY_OFFSET = 0x220;
 static constexpr uint32_t VERTICAL_VELOCITY_OFFSET = 0x230;
+// Sonic's up vector.
+static constexpr uint32_t UP_OFFSET = 0x2F0;
 
 // More of the context, found in the game's code:
 // - the player object, whose state machine is at +0xCC (the context's ChangeState, sub_82307E18);
@@ -50,6 +52,7 @@ static constexpr uint32_t PARAMETER_READER_OFFSET = 0x1FC;
 // The player's matrix node (SWA::CMatrixNodeTransform), whose matrix at +128 has the axes as rows: his facing is the
 // third (sub_8230A4E0).
 static constexpr uint32_t MATRIX_NODE_OFFSET = 16;
+static constexpr uint32_t MATRIX_NODE_ROTATION_OFFSET = 128;
 static constexpr uint32_t MATRIX_NODE_FACING_OFFSET = 128 + 32;
 // The basis the 3D input turns the stick into the world with (sub_82316128): the stick's X along the first row, its Y
 // against the third.
@@ -195,7 +198,7 @@ static constexpr MovementMode MOVEMENT_MODES[] =
     { 0x83364728, "WALL RUN" },
     { 0x83362FCC, "ON ICE" },
     { 0x83362FD4, "ON ICE 2D", true },
-    { 0x83364760, "SPECIAL 0" },
+    { 0x83364760, "INTERCEPTOR" }, // Special 0: the interceptor chase (Savannah Citadel)
     { 0x83364768, "SPECIAL 1" },
     { 0x83364770, "SPECIAL 2" },
     { 0x83364778, "SPECIAL 3" },
@@ -289,13 +292,10 @@ static thread_local int g_recordingLockonFrustum = -1;
 static thread_local bool g_inHomingSearch;
 static uint32_t g_homingSearchFrame;
 static float g_homingSearchPosition[3];
+// Sonic's rotation then (his axes, as rows).
+static float g_homingSearchRotation[3][3];
 static float g_homingSearchPoses[2][16];
 static int g_homingSearchPoseCount;
-// What the searches learnt: which classes of objects answer as targets (a priority of 0 or more), and where an object's
-// target position is from its collision's centre.
-static std::mutex g_homingTargetsMutex;
-static std::unordered_map<uint32_t, bool> g_homingClasses;
-static std::unordered_map<uint32_t, std::array<float, 3>> g_homingTargetOffsets;
 
 // The animation frame a quick step's update compared on the last frame, with the animation and its local time then.
 static bool g_recordQuickStepFrame;
@@ -582,7 +582,11 @@ PPC_FUNC(sub_82375FE0)
     {
         uint32_t node = LoadU32(context + MATRIX_NODE_OFFSET);
         for (int i = 0; i < 3; i++)
+        {
             g_homingSearchPosition[i] = LoadFloat(node + MATRIX_NODE_POSITION_OFFSET + i * 4);
+            for (int row = 0; row < 3; row++)
+                g_homingSearchRotation[row][i] = LoadFloat(node + MATRIX_NODE_ROTATION_OFFSET + row * 16 + i * 4);
+        }
 
         g_homingSearchPoseCount = 0;
         g_inHomingSearch = true;
@@ -610,37 +614,6 @@ PPC_FUNC(sub_82494318)
     }
 
     __imp__sub_82494318(ctx, base);
-}
-
-// Asks an object (r5) for its homing priority (into r4). Records whether its class answers as a target.
-PPC_FUNC_IMPL(__imp__sub_823751A8);
-PPC_FUNC(sub_823751A8)
-{
-    uint32_t priority = ctx.r4.u32;
-    uint32_t object = ctx.r5.u32;
-    __imp__sub_823751A8(ctx, base);
-
-    if (g_inHomingSearch)
-    {
-        std::lock_guard lock(g_homingTargetsMutex);
-        g_homingClasses[LoadU32(object)] = ctx.r3.u8 != 0 && int32_t(LoadU32(priority)) >= 0;
-    }
-}
-
-// Asks an object (r5) for its target position (into r4). Records it from the object's collision.
-PPC_FUNC_IMPL(__imp__sub_82375258);
-PPC_FUNC(sub_82375258)
-{
-    uint32_t position = ctx.r4.u32;
-    uint32_t object = ctx.r5.u32;
-    __imp__sub_82375258(ctx, base);
-
-    float x, y, z;
-    if (g_inHomingSearch && ctx.r3.u8 != 0 && CollisionOverlay::GetObjectCentre(object, x, y, z))
-    {
-        std::lock_guard lock(g_homingTargetsMutex);
-        g_homingTargetOffsets[object] = { LoadFloat(position) - x, LoadFloat(position + 4) - y, LoadFloat(position + 8) - z };
-    }
 }
 
 // Makes a lock-on phantom (r6) for the context (r3). Records its frustum's parameters, which it reads in order.
@@ -919,14 +892,30 @@ static bool StartsWithGroundActions(uint32_t state)
 // direction searched.
 static bool g_homingPoseRows = true;
 
-// An estimate of whether the next search finds a target when this frame's didn't: with the phantom placed as this frame's
-// search did, moved with Sonic since, and the objects whose class answered as a target (and enemies, until theirs has)
-// at their smallest collision's centre, moved to the position they last answered with. Not replicated: the direction
-// the next stick input picks, the collisions' shapes (taken as a sphere of the footprint's radius), the raycast and
-// priorities, and what moves during the next update before its search.
+// An estimate of whether the next search finds a target when this frame's didn't: the phantom placed as the last search
+// did, moved with Sonic since (that matched the next search's placement within 2 cm on every frame of
+// DragonRoadAct1.ltm), against the objects with a collision the search meets (CollisionOverlay: by collision category;
+// their boxes, capsules and spheres against the frustum's planes), the 75 degree cone against their smallest collision's
+// centre, and the search's line of sight raycast against the stage's collision. When there was no search this frame
+// (the game skips it in some states, and the first frame a press becomes possible has none yet), the facing's phantom
+// is placed on Sonic as it sat on him at the last search (learnt from each search, in his frame).
+// Not replicated: the direction the next stick input picks, other shapes (taken as 1 m around them), the line of sight
+// against anything but the stage, the priorities (every object asked answered 10), and what moves during the next update
+// before its search. DragonRoadAct1.ltm: lit on all 9 frames before a target appeared, and on 15 where none did (two
+// E-Fighter missiles and an E-Spanner the game never took, cause not found). HomingAttackTest.ltm (the user's, X =
+// homing): lit before every X press that homed (4), dark before every one that didn't (7); misses a wide spring right
+// below Sonic after he bounces off it (the game's collision test takes it about 1 m outside the frustum; not found why).
+static constexpr float HOMING_SIGHT_HEIGHT = 0.5f;
+
+// How the facing's phantom sits on Sonic (learnt from the searches): its axes and its position from his, in his frame.
+static bool g_homingRelationValid;
+static float g_homingRelationAxes[3][3];
+static float g_homingRelationOrigin[3];
+
 static bool EstimateNextHomingTarget(uint32_t context)
 {
-    if (g_homingSearchFrame != g_frame || g_homingSearchPoseCount == 0)
+    bool fresh = g_homingSearchFrame == g_frame && g_homingSearchPoseCount > 0;
+    if (!fresh && !g_homingRelationValid)
         return false;
 
     const float* frustum = g_lockonFrustums[LoadU8(context + SIDE_VIEW_OFFSET) != 0 ? 1 : 0];
@@ -935,8 +924,6 @@ static bool EstimateNextHomingTarget(uint32_t context)
 
     float tanY = std::tan(frustum[1] * std::numbers::pi_v<float> / 360.0f);
     float tanX = tanY * frustum[0];
-    float slopeX = std::sqrt(1.0f + tanX * tanX);
-    float slopeY = std::sqrt(1.0f + tanY * tanY);
     float coneCos = std::cos(HOMING_CONE_ANGLE);
 
     uint32_t node = LoadU32(context + MATRIX_NODE_OFFSET);
@@ -952,65 +939,130 @@ static bool EstimateNextHomingTarget(uint32_t context)
     auto dot = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
 
     // The phantoms' axes and positions, as the next search would place them.
-    int poseCount = g_homingSearchPoseCount;
+    int poseCount = fresh ? g_homingSearchPoseCount : 1;
     float axes[2][3][3], origins[2][3];
-    if (poseCount == 2)
+    if (fresh)
     {
-        const float* pose = g_homingSearchPoses[1];
-        float row[3] = { pose[8], pose[9], pose[10] };
-        float column[3] = { pose[2], pose[6], pose[10] };
-        g_homingPoseRows = dot(row, facing) >= dot(column, facing);
-    }
-
-    for (int k = 0; k < poseCount; k++)
-    {
-        const float* pose = g_homingSearchPoses[k];
-        for (int axis = 0; axis < 3; axis++)
+        if (poseCount == 2)
         {
-            for (int i = 0; i < 3; i++)
-                axes[k][axis][i] = g_homingPoseRows ? pose[axis * 4 + i] : pose[i * 4 + axis];
+            const float* pose = g_homingSearchPoses[1];
+            float row[3] = { pose[8], pose[9], pose[10] };
+            float column[3] = { pose[2], pose[6], pose[10] };
+            g_homingPoseRows = dot(row, facing) >= dot(column, facing);
         }
-
-        for (int i = 0; i < 3; i++)
-            origins[k][i] = pose[12 + i] + delta[i];
-    }
-
-    std::vector<CollisionOverlay::ObjectCentre> objects;
-    CollisionOverlay::GetObjectCentres(position[0], position[1], position[2], frustum[3] + 5.0f, objects);
-
-    std::lock_guard lock(g_homingTargetsMutex);
-    for (auto& object : objects)
-    {
-        auto known = g_homingClasses.find(object.Vftable);
-        if (known != g_homingClasses.end() ? !known->second : !object.Enemy)
-            continue;
-
-        float target[3] = { object.X, object.Y, object.Z };
-        auto offset = g_homingTargetOffsets.find(object.Object);
-        if (offset != g_homingTargetOffsets.end())
-        {
-            for (int i = 0; i < 3; i++)
-                target[i] += offset->second[i];
-        }
-
-        float toTarget[3] = { target[0] - position[0], target[1] - position[1], target[2] - position[2] };
-        float distance = std::sqrt(dot(toTarget, toTarget));
 
         for (int k = 0; k < poseCount; k++)
         {
-            float d[3] = { target[0] - origins[k][0], target[1] - origins[k][1], target[2] - origins[k][2] };
-            float x = dot(d, axes[k][0]) - eye[0];
-            float y = dot(d, axes[k][1]) - eye[1];
-            float z = dot(d, axes[k][2]) - eye[2];
-            float r = object.Radius;
-            bool inFrustum = z >= frustum[2] - r && z <= frustum[3] + r && std::abs(x) <= z * tanX + r * slopeX &&
-                std::abs(y) <= z * tanY + r * slopeY;
+            const float* pose = g_homingSearchPoses[k];
+            for (int axis = 0; axis < 3; axis++)
+            {
+                for (int i = 0; i < 3; i++)
+                    axes[k][axis][i] = g_homingPoseRows ? pose[axis * 4 + i] : pose[i * 4 + axis];
+            }
 
+            for (int i = 0; i < 3; i++)
+                origins[k][i] = pose[12 + i] + delta[i];
+        }
+
+        // How the last direction (the facing, when there are two) sits on Sonic: its axes and position in his frame.
+        const float* pose = g_homingSearchPoses[poseCount - 1];
+        float offset[3] = { pose[12] - g_homingSearchPosition[0], pose[13] - g_homingSearchPosition[1], pose[14] - g_homingSearchPosition[2] };
+        for (int j = 0; j < 3; j++)
+        {
+            for (int axis = 0; axis < 3; axis++)
+                g_homingRelationAxes[axis][j] = dot(axes[poseCount - 1][axis], g_homingSearchRotation[j]);
+
+            g_homingRelationOrigin[j] = dot(offset, g_homingSearchRotation[j]);
+        }
+
+        g_homingRelationValid = true;
+    }
+    else
+    {
+        // No search this frame (the game didn't run it, or not yet in this state): the facing's phantom, placed on
+        // Sonic as it sat on him at the last search.
+        float rotation[3][3];
+        for (int row = 0; row < 3; row++)
+        {
+            for (int i = 0; i < 3; i++)
+                rotation[row][i] = LoadFloat(node + MATRIX_NODE_ROTATION_OFFSET + row * 16 + i * 4);
+        }
+
+        for (int i = 0; i < 3; i++)
+        {
+            origins[0][i] = position[i];
+            for (int j = 0; j < 3; j++)
+                origins[0][i] += g_homingRelationOrigin[j] * rotation[j][i];
+
+            for (int axis = 0; axis < 3; axis++)
+            {
+                axes[0][axis][i] = 0.0f;
+                for (int j = 0; j < 3; j++)
+                    axes[0][axis][i] += g_homingRelationAxes[axis][j] * rotation[j][i];
+            }
+        }
+    }
+
+    // The frustum's far corners are further than its far plane (27 m for 85 degrees and 20 m), and objects' collisions
+    // reach out from their centres.
+    std::vector<CollisionOverlay::ObjectCentre> objects;
+    CollisionOverlay::GetObjectCentres(position[0], position[1], position[2], frustum[3] * 1.5f + 10.0f, objects);
+    CollisionOverlay::UpdateStage();
+
+    for (auto& object : objects)
+    {
+        if (!object.HomingCandidate)
+            continue;
+
+        float toTarget[3] = { object.X - position[0], object.Y - position[1], object.Z - position[2] };
+        float distance = std::sqrt(dot(toTarget, toTarget));
+        for (int k = 0; k < poseCount; k++)
+        {
             float forwardLength = std::sqrt(dot(axes[k][2], axes[k][2]));
             bool inCone = distance > 0.0f && forwardLength > 0.0f && dot(toTarget, axes[k][2]) / (distance * forwardLength) >= coneCos;
+            if (!inCone)
+                continue;
 
-            if (inFrustum && inCone)
+            // Each of its shapes against the frustum's six planes (in the phantom's frame: near z, far z, and the four
+            // sides |x| = z tan, |y| = z tan): outside one if its centre is further out than the shape reaches towards it.
+            bool inFrustum = false;
+            for (auto& volume : object.HomingVolumes)
+            {
+                float d[3] = { volume.Centre[0] - origins[k][0], volume.Centre[1] - origins[k][1], volume.Centre[2] - origins[k][2] };
+                float c[3] = { dot(d, axes[k][0]) - eye[0], dot(d, axes[k][1]) - eye[1], dot(d, axes[k][2]) - eye[2] };
+                float a[3][3];
+                for (int i = 0; i < volume.AxisCount; i++)
+                {
+                    for (int j = 0; j < 3; j++)
+                        a[i][j] = dot(volume.Axes[i], axes[k][j]);
+                }
+
+                auto reach = [&](float nx, float ny, float nz)
+                {
+                    float e = volume.Radius * std::sqrt(nx * nx + ny * ny + nz * nz);
+                    for (int i = 0; i < volume.AxisCount; i++)
+                        e += std::abs(a[i][0] * nx + a[i][1] * ny + a[i][2] * nz);
+
+                    return e;
+                };
+
+                bool outside = frustum[2] - c[2] > reach(0.0f, 0.0f, 1.0f) || c[2] - frustum[3] > reach(0.0f, 0.0f, 1.0f) ||
+                    c[0] - c[2] * tanX > reach(1.0f, 0.0f, -tanX) || -c[0] - c[2] * tanX > reach(-1.0f, 0.0f, -tanX) ||
+                    c[1] - c[2] * tanY > reach(0.0f, 1.0f, -tanY) || -c[1] - c[2] * tanY > reach(0.0f, -1.0f, -tanY);
+                if (!outside)
+                {
+                    inFrustum = true;
+                    break;
+                }
+            }
+
+            // Then the line of sight, as the search casts it: from Sonic to the target, both 0.5 higher, against the
+            // stage's collision.
+            if (inFrustum &&
+                !CollisionOverlay::IsSightBlocked(position[0], position[1] + HOMING_SIGHT_HEIGHT, position[2], object.X, object.Y + HOMING_SIGHT_HEIGHT, object.Z))
+            {
                 return true;
+            }
         }
     }
 
@@ -1717,12 +1769,26 @@ void TasHud::Draw()
     }
     else
     {
+        // Split from the full velocity along Sonic's up vector: the game's own horizontal velocity (+0x220) stops at
+        // the max speed (param 253, 145), while he can move faster than that (the break-jump, M-Speed).
         float y;
-        speed = VectorLength(context + HORIZONTAL_VELOCITY_OFFSET, y);
         total = VectorLength(context + VELOCITY_OFFSET, y);
-        vertical = VectorLength(context + VERTICAL_VELOCITY_OFFSET, y);
-        if (y < 0)
-            vertical = -vertical;
+        float upX = LoadFloat(context + UP_OFFSET);
+        float upY = LoadFloat(context + UP_OFFSET + 4);
+        float upZ = LoadFloat(context + UP_OFFSET + 8);
+        float upLength = std::sqrt(upX * upX + upY * upY + upZ * upZ);
+        if (upLength > 0.5f && std::isfinite(upLength))
+        {
+            vertical = (LoadFloat(context + VELOCITY_OFFSET) * upX + y * upY + LoadFloat(context + VELOCITY_OFFSET + 8) * upZ) / upLength;
+            speed = std::sqrt(std::max(total * total - vertical * vertical, 0.0f));
+        }
+        else
+        {
+            speed = VectorLength(context + HORIZONTAL_VELOCITY_OFFSET, y);
+            vertical = VectorLength(context + VERTICAL_VELOCITY_OFFSET, y);
+            if (y < 0)
+                vertical = -vertical;
+        }
     }
 
     DrawText(drawList, font, Scale(18), { left, panelMin.y + Scale(6) }, IM_COL32_WHITE, fmt::format("Speed {:.2f}", speed));

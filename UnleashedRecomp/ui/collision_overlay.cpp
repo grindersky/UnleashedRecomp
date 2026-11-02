@@ -40,6 +40,8 @@ static constexpr uint32_t RIGID_BODY_TRANSFORM_OFFSET = 0xE0;
 static constexpr uint32_t MOPP_SHAPE_VFTABLE = 0x8212CF68;
 static constexpr uint32_t MOPP_SHAPE_CHILD_OFFSET = 0x34;
 static constexpr uint32_t EXTENDED_MESH_SHAPE_VFTABLE = 0x8212D064;
+// The one loaded from files (the stage's collision), with the same layout (they share the destructor sub_82F20340).
+static constexpr uint32_t STORAGE_EXTENDED_MESH_SHAPE_VFTABLE = 0x82130554;
 // Its triangle subparts (+0x50, how many at +0x54): the triangle count at +0x10, then the vertices (base, stride and
 // count at +0x14/+0x18/+0x1C) and the indices (base, stride and type at +0x30/+0x34/+0x38: 1 = 16-bit, 2 = 32-bit).
 static constexpr uint32_t EXTENDED_MESH_SUBPARTS_OFFSET = 0x50;
@@ -288,10 +290,11 @@ static bool IsTracking()
 // key, so it goes into the movie like the game's keys.
 static std::atomic<bool> g_depthTested{ true };
 
-// How far the HUD's radar reaches from Sonic, to each side; Home goes to the next size, then hides it, then starts
-// over. Like F12, it reaches the game as a key the game doesn't use.
-static constexpr float RADAR_HALF_WIDTHS[] = { 4.0f, 12.0f };
+// How far the HUD's radar reaches from Sonic, to each side; Home goes to the next size (back to the first after the
+// last), M hides and shows it. Like F12, they reach the game as keys the game doesn't use.
+static constexpr float RADAR_HALF_WIDTHS[] = { 4.0f, 12.0f, 30.0f, 60.0f };
 static std::atomic<int> g_radarSize{ 0 };
+static std::atomic<bool> g_radarShown{ true };
 
 static class CollisionOverlayListener : public SDLEventListener
 {
@@ -305,7 +308,10 @@ public:
             g_depthTested = !g_depthTested;
 
         if (TasHud::IsEnabled() && event->key.keysym.sym == SDLK_HOME)
-            g_radarSize = (g_radarSize + 1) % int(std::size(RADAR_HALF_WIDTHS) + 1);
+            g_radarSize = (g_radarSize + 1) % int(std::size(RADAR_HALF_WIDTHS));
+
+        if (TasHud::IsEnabled() && event->key.keysym.sym == SDLK_m)
+            g_radarShown = !g_radarShown;
 
         return false;
     }
@@ -350,23 +356,23 @@ PPC_FUNC(sub_822E4290)
 
 // The objects whose collision is drawn: the enemies (any class with "Enemy" in its name among the object's classes,
 // like SWA::CSonicEnemyBase, the CEnemy* classes, their shots and weapons, and SWA::EvilEnemy::IEvilEnemy) and the goal
-// ring (SWA::CObjGoalRing). Only what the game's views don't draw: they decide as it's added, the event collision view
-// (ms_IsTriggerRender, read by the event collision helpers) for event collisions, the object collision view
-// (ms_IsObjectCollisionRender, read by sub_825146A8) for rigid bodies. The rings (SWA::CObjRing, whose set-up,
-// sub_825EA530, adds a sphere through sub_825169F8 -> sub_82516528, and SWA::CObjSuperRing) are only on the radar.
+// ring (SWA::CObjGoalRing), always: the event and object collision views (ms_IsTriggerRender, ms_IsObjectCollisionRender)
+// were meant to draw them, but don't (user, 2026-10-23: two enemies left to the views, none drawn). The rings (SWA::CObjRing, whose set-up,
+// sub_825EA530, adds a sphere through sub_825169F8 -> sub_82516528, and SWA::CObjSuperRing) are only on the radar, and
+// so is the stage's own collision (SWA::CGameObjectTerrain's rigid bodies, added by its set-up sub_82518620 through
+// sub_825146A8).
 enum class ObjectKind
 {
     None,
     Enemy,
     GoalRing,
-    Ring
+    Ring,
+    Terrain
 };
 
 struct TrackedUnit
 {
     ObjectKind Kind;
-    // Whether the game's view drew it.
-    bool DrawnByView;
     uint32_t Object;
 };
 
@@ -379,9 +385,34 @@ static std::unordered_map<uint32_t, ObjectKind> g_objectKinds;
 // The object adding an event collision.
 static thread_local uint32_t g_eventCollisionOwner;
 
-// An object's kind, from its classes in the game's RTTI: its vtable is preceded by its complete object locator, whose
-// class hierarchy (+16) lists its classes (+12, how many at +8), each with its type descriptor first, whose mangled name
-// is at +8. Called with g_unitsMutex held.
+// Calls visit(index, mangled name) for a vtable's classes in the game's RTTI, the class itself first, until it returns
+// true: the vtable is preceded by its complete object locator, whose class hierarchy (+16) lists its classes (+12, how
+// many at +8), each with its type descriptor first, whose mangled name is at +8.
+template<typename Visit>
+static void ForEachClassName(uint32_t vftable, const Visit& visit)
+{
+    if (vftable < PPC_IMAGE_BASE || vftable >= PPC_IMAGE_BASE + PPC_IMAGE_SIZE)
+        return;
+
+    uint32_t hierarchy = LoadU32(LoadU32(vftable - 4) + 16);
+    uint32_t count = LoadU32(hierarchy + 8);
+    uint32_t classes = LoadU32(hierarchy + 12);
+    if (count >= 64)
+        return;
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        uint32_t descriptor = LoadU32(LoadU32(classes + i * 4));
+        if (descriptor < PPC_IMAGE_BASE || descriptor >= PPC_IMAGE_BASE + PPC_IMAGE_SIZE)
+            break;
+
+        auto text = reinterpret_cast<const char*>(g_memory.Translate(descriptor + 8));
+        if (visit(i, std::string_view(text, strnlen(text, 128))))
+            break;
+    }
+}
+
+// An object's kind, from its classes. Called with g_unitsMutex held.
 static ObjectKind GetObjectKind(uint32_t object)
 {
     uint32_t vftable = LoadU32(object);
@@ -390,55 +421,32 @@ static ObjectKind GetObjectKind(uint32_t object)
         return it->second;
 
     ObjectKind kind = ObjectKind::None;
-    uint32_t hierarchy = LoadU32(LoadU32(vftable - 4) + 16);
-    uint32_t count = LoadU32(hierarchy + 8);
-    uint32_t classes = LoadU32(hierarchy + 12);
-    if (vftable >= PPC_IMAGE_BASE && vftable < PPC_IMAGE_BASE + PPC_IMAGE_SIZE && count < 64)
+    ForEachClassName(vftable, [&](uint32_t i, std::string_view name)
     {
-        for (uint32_t i = 0; i < count; i++)
-        {
-            uint32_t descriptor = LoadU32(LoadU32(classes + i * 4));
-            if (descriptor < PPC_IMAGE_BASE || descriptor >= PPC_IMAGE_BASE + PPC_IMAGE_SIZE)
-                break;
+        if (i == 0 && name == ".?AVCObjGoalRing@SWA@@")
+            kind = ObjectKind::GoalRing;
+        else if (i == 0 && (name == ".?AVCObjRing@SWA@@" || name == ".?AVCObjSuperRing@SWA@@"))
+            kind = ObjectKind::Ring;
+        else if (i == 0 && name == ".?AVCGameObjectTerrain@SWA@@")
+            kind = ObjectKind::Terrain;
+        else if (name.find("Enemy") != std::string_view::npos)
+            kind = ObjectKind::Enemy;
 
-            auto text = reinterpret_cast<const char*>(g_memory.Translate(descriptor + 8));
-            std::string_view name(text, strnlen(text, 128));
-            if (i == 0 && name == ".?AVCObjGoalRing@SWA@@")
-            {
-                kind = ObjectKind::GoalRing;
-                break;
-            }
-
-            if (i == 0 && (name == ".?AVCObjRing@SWA@@" || name == ".?AVCObjSuperRing@SWA@@"))
-            {
-                kind = ObjectKind::Ring;
-                break;
-            }
-
-            if (name.find("Enemy") != std::string_view::npos)
-            {
-                kind = ObjectKind::Enemy;
-                break;
-            }
-        }
-    }
+        return kind != ObjectKind::None;
+    });
 
     g_objectKinds.emplace(vftable, kind);
     return kind;
 }
 
-static void TrackUnit(uint32_t object, uint32_t unit, bool drawnByView)
+
+static void TrackUnit(uint32_t object, uint32_t unit)
 {
     if (!IsTracking() || !IsReadable(object) || !IsReadable(unit))
         return;
 
     std::lock_guard lock(g_unitsMutex);
-    g_units[unit] = { GetObjectKind(object), drawnByView, object };
-}
-
-static bool IsViewOn(const bool* view)
-{
-    return view != nullptr && *view;
+    g_units[unit] = { GetObjectKind(object), object };
 }
 
 static void ForgetUnit(uint32_t unit)
@@ -483,14 +491,14 @@ PPC_FUNC(sub_8248F210)
     __imp__sub_8248F210(ctx, base);
 
     if (g_eventCollisionOwner != 0)
-        TrackUnit(g_eventCollisionOwner, LoadU32(collision), IsViewOn(SWA::SGlobals::ms_IsTriggerRender));
+        TrackUnit(g_eventCollisionOwner, LoadU32(collision));
 }
 
 // An object (r3) adds a SWA::CRigidBody (the shared_ptr at r4).
 PPC_FUNC_IMPL(__imp__sub_825146A8);
 PPC_FUNC(sub_825146A8)
 {
-    TrackUnit(ctx.r3.u32, LoadU32(ctx.r4.u32), IsViewOn(SWA::SGlobals::ms_IsObjectCollisionRender));
+    TrackUnit(ctx.r3.u32, LoadU32(ctx.r4.u32));
     __imp__sub_825146A8(ctx, base);
 }
 
@@ -946,7 +954,7 @@ static void DrawObjectCollision(ImDrawList* drawList, const Projector& projector
     for (auto& [unit, tracked] : units)
     {
         ObjectKind kind = tracked.Kind;
-        if (kind == ObjectKind::None || kind == ObjectKind::Ring || tracked.DrawnByView)
+        if (kind == ObjectKind::None || kind == ObjectKind::Ring || kind == ObjectKind::Terrain)
             continue;
 
         uint32_t unitVftable = LoadU32(unit);
@@ -1240,6 +1248,376 @@ static float HorizontalDistance(const Vector3& point, const Vector3& a, const Ve
     return std::hypot(apX - abX * t, apZ - abZ * t);
 }
 
+// The game's collision categories. A collision's filter info (hkpCollidable's, at +0x2C of the Havok object) is an index
+// into the game's table of category sets (sub_8248EAF0 adds them: a vector at *0x83366F54, begin +4, end +8, 20 bytes
+// each: its own categories (a 64-bit set, bits 0-31 in the first word), those it collides with, flags).
+// The homing attack's target search (sub_8230E990) uses two of them, both with no categories of their own, so they meet
+// a collision whose own set has theirs (the category numbers are read at run time):
+// - its phantom (sub_82379718) collides with the one at 0x83367180 (58): the targets. Answering the priority message
+//   isn't it: the E-Fighter's missiles answer nothing and are targets. In DragonRoadAct1.ltm, filter infos 0x30 and 0x2F
+//   had it (enemies, E-Fighter missiles, springs, rockets, up reels); Sonic's 0x14, camera volumes' 8, point markers' 7,
+//   physics objects' 0x3E5 and CEnemyObjEFMissile's 0x3E9 didn't;
+// - its line of sight raycast (sub_822EC588 -> hkpWorld::castRay, from Sonic to the target, both 0.5 higher; any hit
+//   drops the target) the one at 0x83367060.
+static constexpr uint32_t COLLIDABLE_FILTER_INFO_OFFSET = 0x2C;
+static constexpr uint32_t COLLISION_CATEGORY_TABLE = 0x83366F54;
+static constexpr uint32_t COLLISION_CATEGORY_ENTRY_SIZE = 20;
+static constexpr uint32_t HOMING_TARGET_CATEGORY = 0x83367180;
+static constexpr uint32_t HOMING_SIGHT_CATEGORY = 0x83367060;
+
+static bool HasCollisionCategory(uint32_t body, uint32_t categoryAddress)
+{
+    uint32_t category = LoadU32(categoryAddress);
+    uint32_t table = LoadU32(COLLISION_CATEGORY_TABLE);
+    if (category >= 64 || !IsReadable(table) || !IsReadable(body))
+        return false;
+
+    uint32_t begin = LoadU32(table + 4);
+    uint32_t end = LoadU32(table + 8);
+    uint32_t info = LoadU32(body + COLLIDABLE_FILTER_INFO_OFFSET);
+    if (!IsReadable(begin) || end < begin || info >= (end - begin) / COLLISION_CATEGORY_ENTRY_SIZE)
+        return false;
+
+    uint32_t categories = LoadU32(begin + info * COLLISION_CATEGORY_ENTRY_SIZE + (category / 32) * 4);
+    return (categories >> (category % 32)) & 1;
+}
+
+static bool IsHomingTargetCollision(uint32_t body)
+{
+    return HasCollisionCategory(body, HOMING_TARGET_CATEGORY);
+}
+
+// The stage's collision on the radar: its walls (triangles steeper than 60 degrees), and the edges of its floors where
+// no other floor goes on (ledges, the sides of pits and platforms). Read once per rigid body of the stage's terrain
+// object (a MOPP tree over an extended mesh, like the rails), in world space; the floors' edges are matched by their
+// corners (rounded to 1 cm), also between bodies, so where two pieces of floor meet isn't drawn.
+static constexpr float TERRAIN_FLOOR_NORMAL_Y = 0.5f;
+// Triangle subparts are 64 bytes each (the mesh's destructor frees count * 64).
+static constexpr uint32_t TRIANGLES_SUBPART_SIZE = 64;
+static constexpr uint32_t TERRAIN_MAX_TRIANGLES = 4 * 1024 * 1024;
+
+struct TerrainSegment
+{
+    Vector3 A;
+    Vector3 B;
+    float Low;
+    float High;
+};
+
+struct EdgeKey
+{
+    std::array<int32_t, 6> Corners;
+
+    auto operator<=>(const EdgeKey&) const = default;
+};
+
+static EdgeKey GetEdgeKey(const Vector3& a, const Vector3& b)
+{
+    auto round = [](float value) { return int32_t(std::clamp(std::lround(value * 100.0f), -2000000000l, 2000000000l)); };
+    std::array<int32_t, 3> first{ round(a.x), round(a.y), round(a.z) };
+    std::array<int32_t, 3> second{ round(b.x), round(b.y), round(b.z) };
+    if (second < first)
+        std::swap(first, second);
+
+    return { { first[0], first[1], first[2], second[0], second[1], second[2] } };
+}
+
+struct TerrainBody
+{
+    uint32_t Shape = 0;
+    Transform Placement;
+    std::vector<TerrainSegment> Walls;
+    // The floors' edges that only one of this body's floor triangles has.
+    std::vector<std::pair<EdgeKey, TerrainSegment>> Edges;
+    // All its triangles, and whether the homing attack's line of sight raycast hits it.
+    std::vector<std::array<Vector3, 3>> Triangles;
+    bool BlocksSight = false;
+    bool Used = false;
+};
+
+// The triangles that block the homing attack's line of sight, by 8 m square of the ground (each in every square its
+// bounds touch, up to 64 of them).
+static constexpr float SIGHT_GRID_CELL = 8.0f;
+static std::vector<std::array<Vector3, 3>> g_sightTriangles;
+static std::unordered_map<uint64_t, std::vector<uint32_t>> g_sightGrid;
+
+static uint64_t GetSightCell(int32_t x, int32_t z)
+{
+    return (uint64_t(uint32_t(x)) << 32) | uint32_t(z);
+}
+
+static std::unordered_map<uint32_t, TerrainBody> g_terrainBodies;
+static std::vector<TerrainSegment> g_terrainLedges;
+
+static bool IsSamePlacement(const Transform& a, const Transform& b)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        if (Length(a.columns[i] - b.columns[i]) > 0.001f)
+            return false;
+    }
+
+    return Length(a.translation - b.translation) <= 0.001f;
+}
+
+// One extended mesh's triangles.
+static void ReadTerrainMesh(const Transform& transform, uint32_t mesh, TerrainBody& body)
+{
+    uint32_t subparts = LoadU32(mesh + EXTENDED_MESH_SUBPARTS_OFFSET);
+    uint32_t subpartCount = std::min(LoadU32(mesh + EXTENDED_MESH_SUBPARTS_OFFSET + 4), 4096u);
+    std::vector<std::pair<EdgeKey, TerrainSegment>> floorEdges;
+
+    for (uint32_t s = 0; s < subpartCount; s++)
+    {
+        uint32_t subpart = subparts + s * TRIANGLES_SUBPART_SIZE;
+        if (!IsReadable(subpart))
+            break;
+
+        uint32_t triangles = LoadU32(subpart + 0x10);
+        uint32_t vertices = LoadU32(subpart + 0x14);
+        uint32_t vertexStride = LoadU32(subpart + 0x18);
+        uint32_t vertexCount = LoadU32(subpart + 0x1C);
+        uint32_t indices = LoadU32(subpart + 0x30);
+        uint32_t indexStride = LoadU32(subpart + 0x34);
+        uint8_t indexType = LoadU8(subpart + 0x38);
+        if (triangles == 0 || triangles > TERRAIN_MAX_TRIANGLES || vertexCount == 0 || vertexCount > TERRAIN_MAX_TRIANGLES ||
+            vertexStride < 12 || vertexStride > 256 || (indexType != 1 && indexType != 2) || !IsReadable(vertices) || !IsReadable(indices))
+        {
+            continue;
+        }
+
+        bool indices32 = indexType == 2;
+        std::vector<Vector3> points(vertexCount);
+        for (uint32_t v = 0; v < vertexCount; v++)
+            points[v] = transform(LoadVector(vertices + v * vertexStride));
+
+        for (uint32_t t = 0; t < triangles; t++)
+        {
+            std::array<Vector3, 3> corners;
+            for (uint32_t k = 0; k < 3; k++)
+            {
+                uint32_t address = indices + t * indexStride + k * (indices32 ? 4 : 2);
+                corners[k] = points[std::min(indices32 ? LoadU32(address) : uint32_t(LoadU16(address)), vertexCount - 1)];
+            }
+
+            Vector3 normal = Cross(corners[1] - corners[0], corners[2] - corners[0]);
+            float area = Length(normal);
+            if (!(area > 1e-6f) || !std::isfinite(area))
+                continue;
+
+            if (body.BlocksSight)
+                body.Triangles.push_back(corners);
+
+            float low = std::min({ corners[0].y, corners[1].y, corners[2].y });
+            float high = std::max({ corners[0].y, corners[1].y, corners[2].y });
+            if (std::abs(normal.y) / area >= TERRAIN_FLOOR_NORMAL_Y)
+            {
+                for (uint32_t k = 0; k < 3; k++)
+                {
+                    const Vector3& a = corners[k];
+                    const Vector3& b = corners[(k + 1) % 3];
+                    floorEdges.push_back({ GetEdgeKey(a, b), { a, b, std::min(a.y, b.y), std::max(a.y, b.y) } });
+                }
+
+                continue;
+            }
+
+            // A wall seen from above is about a line: between its two corners furthest apart along the ground.
+            float longest = 0.0f;
+            int first = 0;
+            int second = 1;
+            for (int k = 0; k < 3; k++)
+            {
+                const Vector3& a = corners[k];
+                const Vector3& b = corners[(k + 1) % 3];
+                float distance = std::hypot(b.x - a.x, b.z - a.z);
+                if (distance > longest)
+                {
+                    longest = distance;
+                    first = k;
+                    second = (k + 1) % 3;
+                }
+            }
+
+            if (longest >= 0.02f)
+                body.Walls.push_back({ corners[first], corners[second], low, high });
+        }
+    }
+
+    std::sort(floorEdges.begin(), floorEdges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (size_t i = 0; i < floorEdges.size();)
+    {
+        size_t end = i + 1;
+        while (end < floorEdges.size() && floorEdges[end].first == floorEdges[i].first)
+            end++;
+
+        if (end - i == 1)
+            body.Edges.push_back(floorEdges[i]);
+
+        i = end;
+    }
+}
+
+// Brings the bodies up to date with the terrain bodies in the world; called with g_unitsMutex not held.
+static void UpdateTerrain()
+{
+    std::vector<uint32_t> bodies;
+    {
+        std::lock_guard lock(g_unitsMutex);
+        for (auto& [unit, tracked] : g_units)
+        {
+            if (tracked.Kind == ObjectKind::Terrain && LoadU32(unit) == RIGID_BODY_UNIT_VFTABLE)
+                bodies.push_back(LoadU32(unit + PHYSICS_UNIT_BODY_OFFSET));
+        }
+    }
+
+    bool changed = false;
+    for (auto& [address, body] : g_terrainBodies)
+        body.Used = false;
+
+    for (uint32_t address : bodies)
+    {
+        Transform transform;
+        uint32_t shape;
+        if (!GetCollidable(address, transform, shape) || LoadU32(address) != RIGID_BODY_VFTABLE)
+            continue;
+
+        auto& body = g_terrainBodies[address];
+        body.Used = true;
+        if (body.Shape == shape && IsSamePlacement(body.Placement, transform))
+            continue;
+
+        body = { shape, transform };
+        body.Used = true;
+        body.BlocksSight = HasCollisionCategory(address, HOMING_SIGHT_CATEGORY);
+        changed = true;
+        ForEachLeafShape(transform, shape, [&](const Transform& leafTransform, uint32_t leaf)
+        {
+            uint32_t vftable = LoadU32(leaf);
+            if (vftable == MOPP_SHAPE_VFTABLE)
+            {
+                leaf = LoadU32(leaf + MOPP_SHAPE_CHILD_OFFSET);
+                vftable = LoadU32(leaf);
+            }
+
+            if (vftable == EXTENDED_MESH_SHAPE_VFTABLE || vftable == STORAGE_EXTENDED_MESH_SHAPE_VFTABLE)
+                ReadTerrainMesh(leafTransform, leaf, body);
+        });
+    }
+
+    changed |= std::erase_if(g_terrainBodies, [](const auto& entry) { return !entry.second.Used; }) != 0;
+    if (!changed)
+        return;
+
+
+    // The floors' edges no other body has either.
+    std::vector<const std::pair<EdgeKey, TerrainSegment>*> edges;
+    for (auto& [address, body] : g_terrainBodies)
+    {
+        for (auto& edge : body.Edges)
+            edges.push_back(&edge);
+    }
+
+    std::sort(edges.begin(), edges.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
+    g_terrainLedges.clear();
+    for (size_t i = 0; i < edges.size();)
+    {
+        size_t end = i + 1;
+        while (end < edges.size() && edges[end]->first == edges[i]->first)
+            end++;
+
+        if (end - i == 1)
+            g_terrainLedges.push_back(edges[i]->second);
+
+        i = end;
+    }
+
+    // The line of sight's triangles, by square.
+    g_sightTriangles.clear();
+    g_sightGrid.clear();
+    for (auto& [address, body] : g_terrainBodies)
+    {
+        for (auto& triangle : body.Triangles)
+        {
+            float minX = std::min({ triangle[0].x, triangle[1].x, triangle[2].x });
+            float maxX = std::max({ triangle[0].x, triangle[1].x, triangle[2].x });
+            float minZ = std::min({ triangle[0].z, triangle[1].z, triangle[2].z });
+            float maxZ = std::max({ triangle[0].z, triangle[1].z, triangle[2].z });
+            int32_t x0 = int32_t(std::floor(minX / SIGHT_GRID_CELL)), x1 = int32_t(std::floor(maxX / SIGHT_GRID_CELL));
+            int32_t z0 = int32_t(std::floor(minZ / SIGHT_GRID_CELL)), z1 = int32_t(std::floor(maxZ / SIGHT_GRID_CELL));
+            if (int64_t(x1 - x0 + 1) * (z1 - z0 + 1) > 64)
+                continue;
+
+            uint32_t index = uint32_t(g_sightTriangles.size());
+            g_sightTriangles.push_back(triangle);
+            for (int32_t x = x0; x <= x1; x++)
+            {
+                for (int32_t z = z0; z <= z1; z++)
+                    g_sightGrid[GetSightCell(x, z)].push_back(index);
+            }
+        }
+    }
+}
+
+// Whether the segment from a to b goes through the triangle (either side; Moller-Trumbore).
+static bool SegmentHitsTriangle(const Vector3& a, const Vector3& b, const std::array<Vector3, 3>& triangle)
+{
+    Vector3 direction = b - a;
+    Vector3 edge1 = triangle[1] - triangle[0];
+    Vector3 edge2 = triangle[2] - triangle[0];
+    Vector3 p = Cross(direction, edge2);
+    float determinant = Dot(edge1, p);
+    if (std::abs(determinant) < 1e-8f)
+        return false;
+
+    float inverse = 1.0f / determinant;
+    Vector3 s = a - triangle[0];
+    float u = Dot(s, p) * inverse;
+    if (u < 0.0f || u > 1.0f)
+        return false;
+
+    Vector3 q = Cross(s, edge1);
+    float v = Dot(direction, q) * inverse;
+    if (v < 0.0f || u + v > 1.0f)
+        return false;
+
+    float t = Dot(edge2, q) * inverse;
+    return t >= 0.0f && t <= 1.0f;
+}
+
+void CollisionOverlay::UpdateStage()
+{
+    UpdateTerrain();
+}
+
+bool CollisionOverlay::IsSightBlocked(float ax, float ay, float az, float bx, float by, float bz)
+{
+    Vector3 a{ ax, ay, az };
+    Vector3 b{ bx, by, bz };
+    int32_t x0 = int32_t(std::floor(std::min(ax, bx) / SIGHT_GRID_CELL)), x1 = int32_t(std::floor(std::max(ax, bx) / SIGHT_GRID_CELL));
+    int32_t z0 = int32_t(std::floor(std::min(az, bz) / SIGHT_GRID_CELL)), z1 = int32_t(std::floor(std::max(az, bz) / SIGHT_GRID_CELL));
+    if (int64_t(x1 - x0 + 1) * (z1 - z0 + 1) > 256)
+        return false;
+
+    for (int32_t x = x0; x <= x1; x++)
+    {
+        for (int32_t z = z0; z <= z1; z++)
+        {
+            auto it = g_sightGrid.find(GetSightCell(x, z));
+            if (it == g_sightGrid.end())
+                continue;
+
+            for (uint32_t index : it->second)
+            {
+                if (SegmentHitsTriangle(a, b, g_sightTriangles[index]))
+                    return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 static const ImU32 RADAR_RING_COLOUR = IM_COL32(255, 210, 40, 255);
 static const ImU32 RADAR_TOUCH_COLOUR = IM_COL32(80, 255, 80, 255);
 static const ImU32 RADAR_ITEM_COLOUR = IM_COL32(255, 80, 255, 230);
@@ -1298,7 +1676,7 @@ static void DrawFootprint(ImDrawList* drawList, const ToRadar& toRadar, float sc
 void CollisionOverlay::DrawRadar(float x, float y, float size, uint32_t context, bool grounded, bool diving, uint32_t frame, float deltaTime)
 {
     int radarSize = g_radarSize;
-    if (radarSize >= int(std::size(RADAR_HALF_WIDTHS)))
+    if (!g_radarShown || radarSize >= int(std::size(RADAR_HALF_WIDTHS)))
         return;
 
     uint32_t node = LoadU32(context + CONTEXT_MATRIX_NODE_OFFSET);
@@ -1393,7 +1771,8 @@ void CollisionOverlay::DrawRadar(float x, float y, float size, uint32_t context,
         for (auto& [unit, tracked] : g_units)
         {
             uint32_t unitVftable = LoadU32(unit);
-            if (tracked.Kind == ObjectKind::None || (unitVftable != EVENT_COLLISION_VFTABLE && unitVftable != RIGID_BODY_UNIT_VFTABLE))
+            if (tracked.Kind == ObjectKind::None || tracked.Kind == ObjectKind::Terrain ||
+                (unitVftable != EVENT_COLLISION_VFTABLE && unitVftable != RIGID_BODY_UNIT_VFTABLE))
                 continue;
 
             Transform transform;
@@ -1472,6 +1851,39 @@ void CollisionOverlay::DrawRadar(float x, float y, float size, uint32_t context,
     drawList->PushClipRect(min, max, true);
     drawList->AddLine({ centre.x, min.y }, { centre.x, max.y }, IM_COL32(255, 255, 255, 40), Scale(1));
     drawList->AddLine({ min.x, centre.y }, { max.x, centre.y }, IM_COL32(255, 255, 255, 40), Scale(1));
+
+    // The stage around his height: the floors' edges from 8 m below his feet to 1.5 m above (fainter the further down),
+    // then the walls reaching between 1.5 m below his feet and 4 m above.
+    UpdateTerrain();
+    auto isNear = [&](const TerrainSegment& segment)
+    {
+        Vector3 a = segment.A - position;
+        Vector3 b = segment.B - position;
+        float ar = Dot(a, right), br = Dot(b, right), af = Dot(a, forward), bf = Dot(b, forward);
+        return !((ar > halfWidth && br > halfWidth) || (ar < -halfWidth && br < -halfWidth) ||
+            (af > halfWidth && bf > halfWidth) || (af < -halfWidth && bf < -halfWidth));
+    };
+
+    float feet = position.y;
+    for (auto& ledge : g_terrainLedges)
+    {
+        if (ledge.High < feet - 8.0f || ledge.Low > feet + 1.5f || !isNear(ledge))
+            continue;
+
+        float below = std::clamp((feet - ledge.High) / 8.0f, 0.0f, 1.0f);
+        drawList->AddLine(toRadar(ledge.A), toRadar(ledge.B), IM_COL32(110, 170, 255, int(200 - 130 * below)), Scale(1));
+    }
+
+    for (auto& [address, body] : g_terrainBodies)
+    {
+        for (auto& wall : body.Walls)
+        {
+            if (wall.High < feet - 1.5f || wall.Low > feet + 4.0f || !isNear(wall))
+                continue;
+
+            drawList->AddLine(toRadar(wall.A), toRadar(wall.B), IM_COL32(235, 235, 235, 210), Scale(1.5f));
+        }
+    }
 
     // The enemies and the goal ring, then the rings: green where the estimate has his collectors touch them, with the
     // height of their middle over his feet. Rings above each other (a vertical line of them) share one label: the
@@ -1569,10 +1981,10 @@ void CollisionOverlay::DrawRadar(float x, float y, float size, uint32_t context,
     // The title, the scale, and what the estimate says about the next ring.
     float padding = Scale(6);
     float textSize = Scale(10);
-    DrawRadarText(drawList, font, textSize, { min.x + padding, min.y + padding }, IM_COL32(220, 220, 220, 255), "TOP VIEW (Home)");
+    DrawRadarText(drawList, font, textSize, { min.x + padding, min.y + padding }, IM_COL32(220, 220, 220, 255), "TOP VIEW (M, Home)");
 
     float bar = 0.5f;
-    for (float length : { 1.0f, 2.0f, 5.0f, 10.0f })
+    for (float length : { 1.0f, 2.0f, 5.0f, 10.0f, 20.0f, 50.0f })
     {
         if (length <= halfWidth / 2)
             bar = length;
@@ -1624,6 +2036,61 @@ static bool GetUnitCentre(uint32_t unit, Vector3& centre, float& radius)
     return true;
 }
 
+// A shape's pieces as the homing estimate tests them against the search's frustum: a capsule or cylinder as its half
+// segment and radius, a sphere as its radius, a box as its three half extents and convex radius, anything else as 1 m
+// around where it is. Plus 0.05, as Havok's convex shapes collide a little outside themselves.
+static void GetHomingVolumes(const Transform& transform, uint32_t shape, std::vector<CollisionOverlay::ObjectCentre::Volume>& volumes)
+{
+    ForEachLeafShape(transform, shape, [&](const Transform& leafTransform, uint32_t leaf)
+    {
+        CollisionOverlay::ObjectCentre::Volume volume{};
+        auto setCentre = [&](const Vector3& c) { volume.Centre[0] = c.x; volume.Centre[1] = c.y; volume.Centre[2] = c.z; };
+        auto addAxis = [&](const Vector3& a)
+        {
+            volume.Axes[volume.AxisCount][0] = a.x;
+            volume.Axes[volume.AxisCount][1] = a.y;
+            volume.Axes[volume.AxisCount][2] = a.z;
+            volume.AxisCount++;
+        };
+
+        uint32_t vftable = LoadU32(leaf);
+        float convexRadius = LoadFloat(leaf + 0x10);
+        if (vftable == CYLINDER_SHAPE_VFTABLE || vftable == CAPSULE_SHAPE_VFTABLE)
+        {
+            Vector3 a = leafTransform(LoadVector(leaf + 0x20));
+            Vector3 b = leafTransform(LoadVector(leaf + 0x30));
+            setCentre((a + b) * 0.5f);
+            addAxis((b - a) * 0.5f);
+            volume.Radius = convexRadius + (vftable == CYLINDER_SHAPE_VFTABLE ? LoadFloat(leaf + 0x14) : 0.0f);
+        }
+        else if (vftable == SPHERE_SHAPE_VFTABLE)
+        {
+            setCentre(leafTransform.translation);
+            volume.Radius = convexRadius;
+        }
+        else if (vftable == BOX_SHAPE_VFTABLE)
+        {
+            Vector3 half = LoadVector(leaf + 0x20);
+            setCentre(leafTransform.translation);
+            addAxis(leafTransform.columns[0] * half.x);
+            addAxis(leafTransform.columns[1] * half.y);
+            addAxis(leafTransform.columns[2] * half.z);
+            volume.Radius = convexRadius;
+        }
+        else
+        {
+            setCentre(leafTransform.translation);
+            volume.Radius = 1.0f;
+        }
+
+        if (!(std::isfinite(volume.Radius) && volume.Radius >= 0.0f && volume.Radius < 100.0f))
+            volume.Radius = 1.0f;
+
+        volume.Radius += 0.05f;
+        volumes.push_back(volume);
+    });
+}
+
 void CollisionOverlay::GetObjectCentres(float x, float y, float z, float range, std::vector<ObjectCentre>& centres)
 {
     centres.clear();
@@ -1635,12 +2102,19 @@ void CollisionOverlay::GetObjectCentres(float x, float y, float z, float range, 
     {
         Vector3 centre;
         float radius;
-        if (tracked.Kind == ObjectKind::Ring || !GetUnitCentre(unit, centre, radius) || Length(centre - from) > range)
+        if (tracked.Kind == ObjectKind::Ring || tracked.Kind == ObjectKind::Terrain || !GetUnitCentre(unit, centre, radius) ||
+            Length(centre - from) > range)
             continue;
 
         auto [it, added] = indices.emplace(tracked.Object, centres.size());
         if (added)
-            centres.push_back({ tracked.Object, LoadU32(tracked.Object), 0.0f, 0.0f, 0.0f, INFINITY, tracked.Kind == ObjectKind::Enemy });
+        {
+            ObjectCentre object{};
+            object.Object = tracked.Object;
+            object.Vftable = LoadU32(tracked.Object);
+            object.Radius = INFINITY;
+            centres.push_back(std::move(object));
+        }
 
         auto& object = centres[it->second];
         if (radius < object.Radius)
@@ -1650,28 +2124,15 @@ void CollisionOverlay::GetObjectCentres(float x, float y, float z, float range, 
             object.Z = centre.z;
             object.Radius = radius;
         }
-    }
-}
 
-bool CollisionOverlay::GetObjectCentre(uint32_t object, float& x, float& y, float& z)
-{
-    bool found = false;
-    float smallest = INFINITY;
-
-    std::lock_guard lock(g_unitsMutex);
-    for (auto& [unit, tracked] : g_units)
-    {
-        Vector3 centre;
-        float radius;
-        if (tracked.Object != object || !GetUnitCentre(unit, centre, radius) || radius >= smallest)
+        // Its collisions the search meets.
+        uint32_t body = LoadU32(unit + PHYSICS_UNIT_BODY_OFFSET);
+        Transform transform;
+        uint32_t shape;
+        if (!IsHomingTargetCollision(body) || !GetCollidable(body, transform, shape))
             continue;
 
-        x = centre.x;
-        y = centre.y;
-        z = centre.z;
-        smallest = radius;
-        found = true;
+        object.HomingCandidate = true;
+        GetHomingVolumes(transform, shape, object.HomingVolumes);
     }
-
-    return found;
 }
