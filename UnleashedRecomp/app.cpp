@@ -6,6 +6,7 @@
 #include <os/process.h>
 #include <patches/audio_patches.h>
 #include <patches/inspire_patches.h>
+#include <tas_mode.h>
 #include <ui/game_window.h>
 #include <user/config.h>
 #include <user/paths.h>
@@ -51,7 +52,31 @@ PPC_FUNC(sub_822C1130)
     Video::WaitOnSwapChain();
 
     // Correct small delta time errors.
-    if (Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX)
+    if (IsTasMode())
+    {
+        // libTAS sets the frame rate (and a movie can change it per frame), whatever the FPS option says: round to it.
+        // TAS mode gives each frame libTAS's length in whole microseconds (16666 at 60 fps), so the step comes out a
+        // hair short of 1/60, and the option alone made a movie desync when it was 241 (unlimited) instead of the
+        // movie's rate. The step measured here is the last frame's, while the length already is this frame's: on the
+        // frame the rate changes, either one. Steps that aren't close to one (a frame that lasted two) stay as they are.
+        static uint64_t s_previousFrameLength;
+        uint64_t frameLength = TasScheduler::GetFrameLength();
+        for (uint64_t length : { frameLength, s_previousFrameLength })
+        {
+            if (length == 0)
+                continue;
+
+            double targetDeltaTime = 1.0 / std::round(1000000.0 / double(length));
+            if (abs(ctx.f1.f64 - targetDeltaTime) < 0.00001)
+            {
+                ctx.f1.f64 = targetDeltaTime;
+                break;
+            }
+        }
+
+        s_previousFrameLength = frameLength;
+    }
+    else if (Config::FPS >= FPS_MIN && Config::FPS < FPS_MAX)
     {
         double targetDeltaTime = 1.0 / Config::FPS;
 
