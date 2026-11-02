@@ -10,6 +10,9 @@
 // as see-through solids.
 // Drawn over the frame, projected with the game's camera, behind what the game drew (tested against its depth buffer);
 // F12 switches to over everything and back. Hidden with the views (F11). It only reads the game's memory.
+// Its parts: the 3D drawing and the hint ring labels in collision_overlay.cpp; the radar in tas/radar.cpp; what's
+// followed in the game (camera, rails, objects) and the object centres in tas/object_tracking.cpp; the stage's collision
+// and the line of sight in tas/stage_collision.cpp. The game's addresses are in tas/game_addresses.h.
 namespace CollisionOverlay
 {
     bool IsEnabled();

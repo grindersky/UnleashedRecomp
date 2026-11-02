@@ -166,6 +166,12 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
     "ui/options_menu_thumbnails.cpp"
     "ui/tas_hud.cpp"
     "ui/tas_hud_dump.cpp"
+    "ui/tas/collision.cpp"
+    "ui/tas/hud_predictions.cpp"
+    "ui/tas/hud_state.cpp"
+    "ui/tas/object_tracking.cpp"
+    "ui/tas/radar.cpp"
+    "ui/tas/stage_collision.cpp"
     "ui/tv_static.cpp"
 )
 

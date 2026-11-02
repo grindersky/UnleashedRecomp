@@ -6,8 +6,10 @@
 // Sonic: his movement mode, on the ground, sliding, whether a jump or stomp would be accepted; the Werehog: on
 // the ground, dashing, attacking, which attack and when it ends, whether a guard would be accepted, his Unleash
 // gauge and the stage time), the left stick (for Sonic with the M-/D-Speed target zones and the break-jump zone),
-// and the buttons; for Sonic, a radar of the rings around him above it (CollisionOverlay::DrawRadar). It's drawn into the game's frames, so it also shows up in encodes. It only reads the game's
-// memory.
+// and the buttons; for Sonic, a radar of the rings around him above it (CollisionOverlay::DrawRadar). It's drawn into the
+// game's frames, so it also shows up in encodes. It only reads the game's memory.
+// Its parts: the drawing in tas_hud.cpp; reading the player and recording the game's checks in tas/hud_state.cpp; the
+// predictions (presses, attacks, M-/D-Speed) in tas/hud_predictions.cpp. The game's addresses are in tas/game_addresses.h.
 namespace TasHud
 {
     bool IsEnabled();
