@@ -1970,6 +1970,15 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     // Mesa's Vulkan driver on top of D3D12 (dozen) names its devices "Microsoft Direct3D12 (<GPU>)".
     g_vulkanOnD3D12 = g_vulkan && g_device->getDescription().name.starts_with("Microsoft Direct3D12");
 
+    // A libTAS savestate only restores the game's process, while dozen's GPU memory lives in the Windows driver: after a
+    // load, the game's idea of it no longer matches, allocations fail (vmaCreateImage) and the game crashes (2026-11-02,
+    // vk_image_view_init on a null image). The TAS HUD shows this too.
+    if (IsTasMode() && g_vulkanOnD3D12)
+    {
+        fprintf(stderr, "TAS mode: rendering on dozen (%s). libTAS savestates don't work on it: loading one crashes the game. "
+            "Turn on \"Force software rendering\" in libTAS (lavapipe) to TAS with savestates.\n", g_device->getDescription().name.c_str());
+    }
+
     LoadEmbeddedResources();
 
     constexpr uint64_t LowEndMemoryLimit = 2048ULL * 1024ULL * 1024ULL;
@@ -3820,6 +3829,11 @@ static void ProcSetRenderTarget(const RenderCommand& cmd)
 GuestSurface* Video::GetSceneDepthStencil()
 {
     return g_sceneMultisampledDepthStencil != nullptr ? g_sceneMultisampledDepthStencil : g_sceneDepthStencil;
+}
+
+bool Video::IsVulkanOnD3D12()
+{
+    return g_vulkanOnD3D12;
 }
 
 static void SetDepthStencilSurface(GuestDevice* device, GuestSurface* depthStencil) 

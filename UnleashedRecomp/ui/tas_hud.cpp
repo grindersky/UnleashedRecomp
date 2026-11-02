@@ -2,6 +2,7 @@
 #include <api/SWA.h>
 #include <app.h>
 #include <gpu/imgui/imgui_snapshot.h>
+#include <gpu/video.h>
 #include <ui/collision_overlay.h>
 #include <ui/imgui_utils.h>
 #include <ui/tas/drawing.h>
@@ -460,6 +461,13 @@ void TasHud::Draw()
     float left = panelMin.x + padding;
 
     drawList->AddRectFilled(panelMin, panelMax, IM_COL32(0, 0, 0, 140), Scale(6));
+
+    // On dozen, loading a libTAS savestate crashes the game (Video::CreateHostDevice says why): under the panel.
+    if (Video::IsVulkanOnD3D12())
+    {
+        DrawShadowedText(drawList, font, Scale(11), { left, panelMax.y + Scale(4) }, IM_COL32(255, 160, 40, 255),
+            "DOZEN: no savestates");
+    }
 
     // Speedometer: the speed along the ground, the full speed, and the vertical part, along the up vector
     // or against it.
