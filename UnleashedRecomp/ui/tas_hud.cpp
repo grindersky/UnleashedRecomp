@@ -1812,6 +1812,9 @@ void TasHud::Draw()
     float stateTime = state != 0 ? LoadFloat(state + STATE_TIME_OFFSET) : 0.0f;
     float deltaTime = std::max(float(App::s_deltaTime), 0.001f);
 
+    // Over the hint rings: when each can be touched.
+    CollisionOverlay::DrawHintRings(deltaTime);
+
     float indicatorWidth = (width - 2 * padding - 2 * gap) / 3;
     float column2 = left + indicatorWidth + gap;
     float column3 = column2 + indicatorWidth + gap;

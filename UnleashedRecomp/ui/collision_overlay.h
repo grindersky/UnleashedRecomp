@@ -52,4 +52,9 @@ namespace CollisionOverlay
     // from a to b is blocked by it.
     void UpdateStage();
     bool IsSightBlocked(float ax, float ay, float az, float bx, float by, float bz);
+
+    // The TAS HUD's labels over the hint rings (SWA::CObjHintRing): in how many frames each can be touched ("HINT ready
+    // in Nf", it ignores Sonic for 2 s after it's made), "HINT ready", or "HINT touched". deltaTime: the frame's time,
+    // for rings not seen on the last frame.
+    void DrawHintRings(float deltaTime);
 }

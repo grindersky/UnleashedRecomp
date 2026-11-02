@@ -483,6 +483,15 @@ PPC_FUNC(sub_82516838)
     g_eventCollisionOwner = owner;
 }
 
+// Another (r3 = the object, r4 its name, r5 the shape): SWA::CObjHintRing's set-up (sub_827382C0) adds its box with it.
+PPC_FUNC_IMPL(__imp__sub_82516960);
+PPC_FUNC(sub_82516960)
+{
+    uint32_t owner = std::exchange(g_eventCollisionOwner, ctx.r3.u32);
+    __imp__sub_82516960(ctx, base);
+    g_eventCollisionOwner = owner;
+}
+
 // Makes an event collision (SWA::CEventCollision) into the shared_ptr at r3.
 PPC_FUNC_IMPL(__imp__sub_8248F210);
 PPC_FUNC(sub_8248F210)
@@ -1097,19 +1106,12 @@ static void DrawRail(ImDrawList* drawList, const Projector& projector, uint32_t 
     }
 }
 
-void CollisionOverlay::Draw()
+// The camera that was updated last, as a projector onto the window; false if there's none.
+static bool MakeProjector(Projector& projector)
 {
-    // Hidden with the views (F11).
-    if (!IsEnabled() || !CollisionView::IsShown())
-        return;
+    if (g_camera == 0 || LoadU32(g_camera) != g_cameraVftable)
+        return false;
 
-    // Only in levels, with the camera that was updated last.
-    bool werehog;
-    uint32_t context = TasHud::GetPlayerContext(werehog);
-    if (context == 0 || g_camera == 0 || LoadU32(g_camera) != g_cameraVftable)
-        return;
-
-    Projector projector;
     for (int i = 0; i < 16; i++)
     {
         projector.View[i] = LoadFloat(g_camera + CAMERA_VIEW_OFFSET + i * 4);
@@ -1122,10 +1124,25 @@ void CollisionOverlay::Draw()
     auto& res = ImGui::GetIO().DisplaySize;
     float aspectRatio = projector.Projection[0] != 0.0f ? projector.Projection[5] / projector.Projection[0] : res.x / res.y;
     if (!(aspectRatio > 0.0f) || !std::isfinite(aspectRatio))
-        return;
+        return false;
 
     projector.Size = res.x / res.y > aspectRatio ? ImVec2(res.y * aspectRatio, res.y) : ImVec2(res.x, res.x / aspectRatio);
     projector.Origin = { (res.x - projector.Size.x) / 2, (res.y - projector.Size.y) / 2 };
+    return true;
+}
+
+void CollisionOverlay::Draw()
+{
+    // Hidden with the views (F11).
+    if (!IsEnabled() || !CollisionView::IsShown())
+        return;
+
+    // Only in levels, with the camera that was updated last.
+    bool werehog;
+    uint32_t context = TasHud::GetPlayerContext(werehog);
+    Projector projector;
+    if (context == 0 || !MakeProjector(projector))
+        return;
 
     auto drawList = ImGui::GetBackgroundDrawList();
 
@@ -2135,4 +2152,118 @@ void CollisionOverlay::GetObjectCentres(float x, float y, float z, float range, 
         object.HomingCandidate = true;
         GetHomingVolumes(transform, shape, object.HomingVolumes);
     }
+}
+
+// SWA::CObjHintRing (vtable 0x82064034; constructor sub_82739988, set-up sub_827382C0, update sub_82738088, messages
+// sub_82739870). What touches it is a box event collision named "HintRing" (half extents 0.5, 0.7, 0.2 plus 0.05, much
+// smaller than the ring of orbs), which only the player's body collision meets. MsgHitEventCollision (sub_827391E0) is
+// accepted from the player while the ring is untouched (+328), not turned off (+356 set with +360 4) and its timer
+// (+348) is at 0 or below. The constructor sets the timer to 2 s, and so does the hint's end (MsgNoticeFinishHelp,
+// sub_82738E20); the update takes the frame's time off it while the ring is untouched (-1 once it's done). Rings are made
+// as Sonic comes near, so at speed he can reach one before it's ready: in a friend's Windmill Isle Act 2 movie he hit one
+// with 1.25 s left, and nothing happened. Havok sends the hit once when the contact begins, so staying inside doesn't
+// count later. The touch is handled after the update that frame (its timer was the one that update left).
+static constexpr uint32_t HINT_RING_VFTABLE = 0x82064034;
+static constexpr uint32_t HINT_RING_TOUCHED_OFFSET = 328;
+static constexpr uint32_t HINT_RING_TIMER_OFFSET = 348;
+static constexpr uint32_t HINT_RING_OFF_OFFSET = 356;
+static constexpr uint32_t HINT_RING_MODE_OFFSET = 360;
+static constexpr uint32_t HINT_RING_OFF_MODE = 4;
+// How far from the camera the labels are shown.
+static constexpr float HINT_RING_LABEL_DISTANCE = 300.0f;
+
+// Each ring's timer on the last drawn frame, to step it by as much as it moved since (slowdowns change the step).
+static std::unordered_map<uint32_t, std::pair<uint32_t, float>> g_hintRingTimers;
+static uint32_t g_hintRingFrame;
+
+void CollisionOverlay::DrawHintRings(float deltaTime)
+{
+    g_hintRingFrame++;
+
+    Projector projector;
+    if (!MakeProjector(projector))
+        return;
+
+    // The rings' touch boxes in the world.
+    std::vector<std::pair<uint32_t, uint32_t>> rings;
+    {
+        std::lock_guard lock(g_unitsMutex);
+        for (auto& [unit, tracked] : g_units)
+        {
+            if (LoadU32(tracked.Object) == HINT_RING_VFTABLE)
+                rings.emplace_back(tracked.Object, LoadU32(unit + PHYSICS_UNIT_BODY_OFFSET));
+        }
+    }
+
+    auto drawList = ImGui::GetBackgroundDrawList();
+    auto font = ImFontAtlasSnapshot::GetFont("FOT-SeuratPro-M.otf");
+    float size = Scale(14);
+
+    for (auto& [ring, body] : rings)
+    {
+        Transform transform;
+        uint32_t shape;
+        if (!GetCollidable(body, transform, shape))
+            continue;
+
+        bool touched = LoadU8(ring + HINT_RING_TOUCHED_OFFSET) != 0;
+        float timer = LoadFloat(ring + HINT_RING_TIMER_OFFSET);
+        bool off = LoadU8(ring + HINT_RING_OFF_OFFSET) != 0 && LoadU32(ring + HINT_RING_MODE_OFFSET) == HINT_RING_OFF_MODE;
+
+        // The step: how much the timer dropped since the last drawn frame, or the frame's time.
+        float step = deltaTime;
+        auto previous = g_hintRingTimers.find(ring);
+        if (previous != g_hintRingTimers.end() && previous->second.first + 1 == g_hintRingFrame && previous->second.second > timer &&
+            previous->second.second - timer < 1.0f)
+        {
+            step = previous->second.second - timer;
+        }
+
+        g_hintRingTimers[ring] = { g_hintRingFrame, timer };
+
+        // Above the box's top, along its up.
+        Vector3 top = transform(Vector3{ 0.0f, 1.1f, 0.0f });
+        if (Length(top - projector.Eye) > HINT_RING_LABEL_DISTANCE)
+            continue;
+
+        Vector3 view = projector.ToView(top);
+        if (!Projector::IsVisible(view))
+            continue;
+
+        // In how many updates the timer gets to 0 or below, taking the step off in single precision like the game: a
+        // touch in that update counts.
+        std::string label;
+        ImU32 colour;
+        if (off)
+        {
+            continue;
+        }
+        else if (touched)
+        {
+            label = "HINT touched";
+            colour = IM_COL32(170, 170, 170, 230);
+        }
+        else if (timer <= 0.0f)
+        {
+            label = "HINT ready";
+            colour = IM_COL32(80, 220, 80, 255);
+        }
+        else
+        {
+            int frames = 0;
+            for (float left = timer; left > 0.0f && frames < 10000; frames++)
+                left -= step;
+
+            label = fmt::format("HINT ready in {}f", frames);
+            colour = IM_COL32(255, 200, 60, 255);
+        }
+
+        float depth;
+        ImVec2 point = projector.ToScreen(view, depth);
+        float width = font->CalcTextSizeA(size, FLT_MAX, 0.0f, label.c_str()).x;
+        DrawRadarText(drawList, font, size, { point.x - width / 2, point.y - size }, colour, label);
+    }
+
+    // Forget the rings that weren't seen for a while.
+    std::erase_if(g_hintRingTimers, [](auto& entry) { return entry.second.first + 60 < g_hintRingFrame; });
 }
