@@ -30,6 +30,7 @@
 #include <ui/black_bar.h>
 #include <ui/collision_overlay.h>
 #include <ui/tas_hud.h>
+#include <ui/tas_hud_dump.h>
 #include <patches/aspect_ratio_patches.h>
 #include <user/config.h>
 #include <sdl_listener.h>
@@ -2782,8 +2783,10 @@ static void DrawImGui()
     assert(ImGui::GetBackgroundDrawList()->_ClipRectStack.Size == 1 && "Some clip rects were not removed from the stack!");
 
     DrawFPS();
+    TasHudDump::Begin();
     CollisionOverlay::Draw();
     TasHud::Draw();
+    TasHudDump::End();
     DrawProfiler();
     ImGui::Render();
 
