@@ -569,14 +569,7 @@ struct UploadAllocator
             if (buffer.buffer == nullptr)
                 continue;
 
-            uint64_t deviceAddress = buffer.buffer->getDeviceAddress();
-            if (deviceAddress != buffer.deviceAddress)
-            {
-                // TEMPORARY (libTAS GPU host black screens)
-                fprintf(stderr, "TAS mode: upload buffer moved from 0x%llx to 0x%llx\n",
-                    (unsigned long long)buffer.deviceAddress, (unsigned long long)deviceAddress);
-                buffer.deviceAddress = deviceAddress;
-            }
+            buffer.deviceAddress = buffer.buffer->getDeviceAddress();
         }
     }
 };
@@ -2001,11 +1994,14 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     // A libTAS savestate only restores the game's process, while dozen's GPU memory lives in the Windows driver: after a
     // load, the game's idea of it no longer matches, allocations fail (vmaCreateImage) and the game crashes (2026-11-02,
-    // vk_image_view_init on a null image). The TAS HUD shows this too.
+    // vk_image_view_init on a null image). libTAS's Forwarded GPU rendering (its GPU host keeps the GPU state in its own
+    // process and snapshots it) works, but the device name the game sees there can be dozen's too, so this only warns.
     if (IsTasMode() && g_vulkanOnD3D12)
     {
-        fprintf(stderr, "TAS mode: rendering on dozen (%s). libTAS savestates don't work on it: loading one crashes the game. "
-            "Turn on \"Force software rendering\" in libTAS (lavapipe) to TAS with savestates.\n", g_device->getDescription().name.c_str());
+        fprintf(stderr, "TAS mode: rendering on dozen (%s). If the game renders on dozen directly, libTAS savestates don't "
+            "work: loading one crashes the game. To TAS with savestates, turn on \"Force software rendering\" in libTAS "
+            "(lavapipe), or use a libTAS build with \"Forwarded GPU\" rendering (then ignore this message).\n",
+            g_device->getDescription().name.c_str());
     }
 
     LoadEmbeddedResources();
