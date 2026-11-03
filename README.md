@@ -9,7 +9,7 @@
 This branch adds a TAS mode to Unleashed Recompiled for [libTAS](https://github.com/clementgallet/libTAS) on Linux, and on Windows through WSL: deterministic movie playback, savestates, correct audio at any libTAS frame rate, libTAS's on-screen display and Stop button, and an optional HUD for TASing. Without the TAS mode turned on, the game runs like the normal port.
 
 > [!TIP]
-> Under WSL, libTAS runs the game on the CPU, which is slow (about 12 fps when fast-forwarding). Once the game is set up, follow the [dozen guide](https://github.com/grindersky/UnleashedRecomp/blob/patches/DOZEN.md) to play back and encode movies on your graphics card instead, several times faster.
+> Under WSL, libTAS runs the game on the CPU, which is slow (about 12 fps when fast-forwarding). Once the game is set up, follow the [dozen guide](DOZEN.md) to play back and encode movies on your graphics card instead, several times faster.
 
 ## Setting Up the TAS Version
 
@@ -27,24 +27,12 @@ sudo apt install git autoconf automake libtool pkg-config curl cmake ninja-build
 
 ### 3. Get the source
 
-Either clone this branch:
+Clone this branch:
 
 ```bash
 git clone --recurse-submodules -b tas-mode https://github.com/grindersky/UnleashedRecomp.git
 cd UnleashedRecomp
 ```
-
-Or clone the original project and apply the TAS patch from the [`patches` branch](https://github.com/grindersky/UnleashedRecomp/tree/patches):
-
-```bash
-git clone --recurse-submodules https://github.com/hedge-dev/UnleashedRecomp.git
-cd UnleashedRecomp
-curl -LO https://raw.githubusercontent.com/grindersky/UnleashedRecomp/patches/UnleashedTAS.patch
-git apply UnleashedTAS.patch
-```
-
-> [!NOTE]
-> The patch is made against the original project's commit `cf829a9`. If `git apply` fails because the project has changed since, check out that commit first with `git checkout cf829a9 && git submodule update --init --recursive`, then apply the patch.
 
 ### 4. Add the game files needed to build
 
@@ -89,15 +77,16 @@ Choose `out/build/linux-release/UnleashedRecomp/UnleashedRecomp` as the game exe
 - **Input → Mouse support**: off, as the game doesn't use the mouse. **Joystick support**: 1 controller, for analog stick inputs.
 
 > [!TIP]
-> Software rendering is slow. To play back and encode movies on your graphics card, several times faster, set up dozen with the [dozen guide](https://github.com/grindersky/UnleashedRecomp/blob/patches/DOZEN.md). Keep software rendering on while making TASes: savestates haven't been tested on dozen.
+> Software rendering is slow. To play back and encode movies on your graphics card, several times faster, set up dozen with the [dozen guide](DOZEN.md). Keep software rendering on while making TASes: loading a libTAS savestate on dozen crashes the game.
+
+> [!NOTE]
+> Savestates on the graphics card are in development in [jakobhellermann's libTAS](https://github.com/jakobhellermann/libTAS): its "Forwarded GPU" rendering keeps the GPU's state in a separate process that it saves along with the game. The TAS mode works with it (under WSL with `LIBTAS_GPU_MODE=COPYMODE`, as WSL can't share GPU memory with the game), but it isn't part of a libTAS release yet and setting it up isn't covered here.
 
 Start the game from libTAS and TAS as usual.
 
 ### Updating the TAS version
 
-When the TAS version gets an update, update the source, then build the game again.
-
-If you cloned this branch:
+When the TAS version gets an update, update the source, then build the game again:
 
 ```bash
 cd UnleashedRecomp
@@ -105,17 +94,6 @@ git pull
 git submodule sync --recursive
 git submodule update --init --recursive
 ```
-
-If you applied the patch to the original project, take the old patch back out with the `UnleashedTAS.patch` you applied, then download and apply the new one:
-
-```bash
-cd UnleashedRecomp
-git apply -R UnleashedTAS.patch
-curl -LO https://raw.githubusercontent.com/grindersky/UnleashedRecomp/patches/UnleashedTAS.patch
-git apply UnleashedTAS.patch
-```
-
-`git apply -R` only works if you haven't changed the source yourself since applying the patch. If it fails, start again from a fresh clone, as in step 3.
 
 Then build the game again, as in step 5:
 
@@ -132,9 +110,10 @@ Set these in front of `libTAS`, like `UNLEASHED_TAS_MODE=1`:
 
 - `UNLEASHED_TAS_MODE=1`: turns the TAS mode on. Without it, the game runs like the normal port.
 - `UNLEASHED_TAS_HUD=1`: a HUD, shown in levels. It's drawn into the frames, so it also shows up in encodes.
-  - As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump, stomp or quick step pressed on the current frame would work, with countdowns until a stomp is allowed again after a jump or an air boost, and until the next quick step), the stick with the M-Speed zone (in 3D, on the side of the stick Sonic faces: green where it works, red where it doesn't), the D-Speed zone (in 2D, a strip where the stick's part along the path counts on the next frame, which moves as the game turns its stick direction, coloured the same way, with "air brake" when Sonic brakes in the air instead) and the break-jump zone, and the buttons.
+  - As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump, stomp or quick step pressed on the current frame would work, with countdowns until a stomp is allowed again after a jump or an air boost, and until the next quick step), whether he is out of control (after a dash panel or a run quick step: "OUT OF CONTROL Nf", where presses do nothing for the next N frames; "until landing" when it only ends on the ground, and no number when it has no timer), the stick with the M-Speed zone (in 3D, on the side of the stick Sonic faces: green where it works, red where it doesn't), the D-Speed zone (in 2D, a strip where the stick's part along the path counts on the next frame, which moves as the game turns its stick direction, coloured the same way, with "air brake" when Sonic brakes in the air instead) and the break-jump zone, and the buttons.
   - As the Werehog: his speed, his state (on the ground or in the air, dashing, attacking, which attack and in how many frames it ends on its own, with and without the stick), whether a guard (LB) pressed on the current frame would work, his Unleash gauge, the stage time, the stick and the buttons.
   - Over each hint ring on screen: whether touching it now would count. A hint ring ignores touches for 2 seconds after the game creates it (as Sonic gets near) and after its hint closes, so at speed Sonic can go through one without anything happening. The label shows "HINT ready in Nf" (a touch counts from N frames after the current one), "HINT ready" or "HINT touched". Only Sonic's body counts, and the box that has to be touched is much smaller than the ring of orbs: about 1.1 m wide, 1.5 m tall and 0.5 m deep, around the question mark.
+  - A TAS camera: press `\` to switch between the game's camera, a camera behind Sonic along his facing and one looking down on him from above. It only changes what's drawn, not the game, so a movie plays back the same with any of them. Things the game's own camera doesn't see can still be left out. Under libTAS, `\` is recorded into the movie like the game's keys.
 
 ### Mods and codes
 
@@ -191,5 +170,5 @@ Movies recorded at frame rates other than 60 fps with a version from before 2026
 
 ### Faster playback and encoding
 
-To play back and encode movies on your graphics card instead of the CPU under WSL, see the [dozen guide](https://github.com/grindersky/UnleashedRecomp/blob/patches/DOZEN.md). It makes playback and encoding several times faster.
+To play back and encode movies on your graphics card instead of the CPU under WSL, see the [dozen guide](DOZEN.md). It makes playback and encoding several times faster.
 
