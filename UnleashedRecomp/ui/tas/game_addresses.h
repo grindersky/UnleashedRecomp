@@ -61,6 +61,15 @@ namespace Tas
     inline constexpr uint32_t HOMING_PHANTOM_2D_OFFSET = 3464;
     // In a side view (2D) section (sub_82316208).
     inline constexpr uint32_t SIDE_VIEW_OFFSET = 1204;
+    // Set while on a rail, it seems: the grind actions do nothing without it (the context's vfunc 35, sub_82370750).
+    inline constexpr uint32_t GRIND_RAIL_OFFSET = 3600;
+
+    // CPlayerSpeedPosturePluginOutOfControl (vftable 0x82013B00), which keeps flag 3 set (sub_82351068, sub_82351148).
+    // Like a state, it has its time at +16 (STATE_TIME_OFFSET), and +28 is set once it ends (sub_82E62780).
+    inline constexpr uint32_t PLUGIN_CONTEXT_OFFSET = 8;
+    inline constexpr uint32_t PLUGIN_ENDED_OFFSET = 28;
+    // Its duration: it ends on the update its time gets past this (below 0: no timer).
+    inline constexpr uint32_t OUT_OF_CONTROL_DURATION_OFFSET = 96;
 
     // State flags (first set).
     inline constexpr uint32_t OUT_OF_CONTROL_FLAG = 3; // CPlayerSpeedPosturePluginOutOfControl, the context's vfunc 56
@@ -71,6 +80,7 @@ namespace Tas
     inline constexpr uint32_t AIR_BOOST_DISABLED_FLAG = 18;
     inline constexpr uint32_t AIR_BOOST_ENABLED_FLAG = 19; // one air boost or homing attack per airtime
     inline constexpr uint32_t STOMP_DISABLED_FLAG = 20; // set by the short hops until StompingDisableTime
+    inline constexpr uint32_t OUT_OF_CONTROL_UNTIL_LANDING_FLAG = 25; // the out-of-control also ends on the ground (sub_82351208)
     inline constexpr uint32_t NO_AIR_DECELERATION_FLAG = 27; // set on leaving the ground (vfunc 25, sub_82374360)
     inline constexpr uint32_t BOOST_DISABLED_FLAG_2 = 66;
 
@@ -125,14 +135,19 @@ namespace Tas
     inline constexpr uint32_t STATE_CONTEXT_OFFSET = 0x8;
     inline constexpr uint32_t STATE_TIME_OFFSET = 0x10;
 
-    // The states whose update starts with the ground actions (the context's vfunc 36, sub_82386FF8: TryJump, then
-    // TryQuickStep and TryBoost).
+    // The states whose update runs the ground actions on every update that doesn't change the state first (the context's
+    // vfunc 36, sub_82386FF8: TryJump, then TryQuickStep and TryBoost; all skipped while Sonic is out of control).
     inline constexpr uint32_t GROUND_ACTIONS_STATE_VFTABLES[] =
     {
         0x820167F4, // CPlayerSpeedStateStand
+        0x82016908, // CSonicStateStand (sub_8239B050 -> sub_8233EDE0)
         0x820128B0, // CPlayerSpeedContext::CStateWalk
-        0x82016934, // CSonicContext::CStateWalk
+        0x82016934, // CSonicContext::CStateWalk (sub_8239DF90)
+        0x820169E4, // CSonicContext::CStateBrake (sub_82390338: after its own state changes)
         0x82016A10, // CSonicContext::CStateBrakeEnd
+        0x8201658C, // CPlayerSpeedStateBrakeTurn (sub_82335318: unless its animation ends)
+        0x82011EC4, // CPlayerSpeedStateJumpSpringHeadLand (sub_82339488: unless its animation ends)
+        0x8201C0D8, // CSonicContext::CStateSlidingEnd (sub_8239A010)
         0x820169B8, // CSonicStateMoveStop
         0x8201B7F0, // CSonicStateDrift
         0x8201BC60, // CSonicStateOnIce
@@ -167,6 +182,14 @@ namespace Tas
     {
         0x8201C0AC, // CSonicContext::CStateSliding (sub_823997C8)
         0x82016BA0, // CSonicStatePushingWall
+    };
+
+    // The states whose update runs the grind actions (sub_82387F50: while GRIND_RAIL_OFFSET is set and Sonic is in
+    // control, three rail actions, then TryBoost).
+    inline constexpr uint32_t GRIND_ACTIONS_STATE_VFTABLES[] =
+    {
+        0x8201B81C, // CSonicStateGrind (sub_82392510)
+        0x8201BC20, // CSonicStateLandGrindJumpShort (sub_82395C20: unless its animation ends)
     };
 
     // The states with a jump buffer instead of TryJump: a timer at ctx+3384 started on A (sub_82316210), a jump on the

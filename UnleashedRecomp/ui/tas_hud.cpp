@@ -628,6 +628,15 @@ void TasHud::Draw()
         DrawShadowedText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), gauge), boostRow + Scale(2) },
             IM_COL32(220, 220, 220, 255), gauge);
 
+        // Out of control, on the right of the state: for how many more frames a press still does nothing.
+        if (presses.OutOfControl)
+        {
+            std::string text = presses.OutOfControlFrames >= 0 ? fmt::format("OUT OF CONTROL {}f", presses.OutOfControlFrames) :
+                presses.OutOfControlUntilLanding ? "OUT OF CONTROL until landing" : "OUT OF CONTROL";
+            DrawShadowedText(drawList, font, Scale(11), { panelMax.x - padding - TextWidth(font, Scale(11), text), stateRow },
+                IM_COL32(255, 110, 80, 255), text);
+        }
+
         // The radar, above the panel, while Sonic is alive (not in DrowningDead, NormalDamageDead, PressDead...).
         if (stateName.find("Dead") == std::string::npos)
         {

@@ -210,6 +210,23 @@ static bool g_recordQuickStepFrame;
 static bool g_recordQuickStepAnimation;
 static bool g_inPathInput = false;
 
+// CPlayerSpeedPosturePluginOutOfControl's update: its time already has this frame's added. It ends the plugin once its
+// time is past its duration, or on the ground with flag 25.
+PPC_FUNC_IMPL(__imp__sub_82351090);
+PPC_FUNC(sub_82351090)
+{
+    uint32_t plugin = ctx.r3.u32;
+    __imp__sub_82351090(ctx, base);
+
+    if (TasHud::IsEnabled() && LoadU32(plugin + PLUGIN_CONTEXT_OFFSET) == g_speedContext)
+    {
+        g_checks.OutOfControlFrame = g_frame;
+        g_checks.OutOfControlTime = LoadFloat(plugin + STATE_TIME_OFFSET);
+        g_checks.OutOfControlDuration = LoadFloat(plugin + OUT_OF_CONTROL_DURATION_OFFSET);
+        g_checks.OutOfControlEnded = LoadU8(plugin + PLUGIN_ENDED_OFFSET) != 0;
+    }
+}
+
 // The context's TryJump: jumps if the jump button is pressed. The states that allow jumping call it every
 // frame; others, like a quick step until it ends, don't.
 PPC_FUNC_IMPL(__imp__sub_82330CB0);
@@ -324,7 +341,32 @@ PPC_FUNC(sub_82386E60)
     __imp__sub_82386E60(ctx, base);
 }
 
-// The context's TryBoost, called by the ground actions, sliding and pushing a wall.
+// The player's parameter getters by ID (sub_8245DB60 floats in f1, sub_8245DB18 bools in r3).
+PPC_FUNC_IMPL(__imp__sub_8245DB60);
+PPC_FUNC_IMPL(__imp__sub_8245DB18);
+
+// More than the getters' calls use below the caller's stack pointer.
+static constexpr uint32_t PARAMETER_GETTER_STACK_SIZE = 0x1000;
+
+// Calls a parameter getter on a copy of the registers and returns them. The getters only look the value up (no writes
+// outside their stack), and the stack they use is put back, so the game's memory and registers stay as they were.
+static PPCContext CallParameterGetter(const PPCContext& ctx, uint8_t* base, uint32_t context, uint32_t parameter,
+    void (*getter)(PPCContext& __restrict, uint8_t*))
+{
+    PPCContext call = ctx;
+    call.r3.u64 = LoadU32(context + PARAMETER_READER_OFFSET);
+    call.r4.u64 = parameter;
+
+    uint8_t* stack = base + (ctx.r1.u32 - PARAMETER_GETTER_STACK_SIZE);
+    static uint8_t saved[PARAMETER_GETTER_STACK_SIZE];
+    memcpy(saved, stack, sizeof(saved));
+    getter(call, base);
+    memcpy(stack, saved, sizeof(saved));
+    return call;
+}
+
+// The context's TryBoost, called by the ground actions, sliding and pushing a wall. It reads BoostEnableChaosEnergy only
+// once X is pressed, so the HUD reads it here on every try: a mod's value then counts before the first press.
 PPC_FUNC_IMPL(__imp__sub_823787B0);
 PPC_FUNC(sub_823787B0)
 {
@@ -335,36 +377,29 @@ PPC_FUNC(sub_823787B0)
         g_checks.BoostCheckFrame = g_frame;
         g_checks.BoostCheckState = GetCurrentState(context);
         g_checks.BoostAllowed = IsBoostAllowed(context);
+        g_checks.BoostEnableEnergy =
+            float(CallParameterGetter(ctx, base, context, BOOST_ENABLE_CHAOS_ENERGY_PARAMETER, __imp__sub_8245DB60).f1.f64);
     }
 
     __imp__sub_823787B0(ctx, base);
 }
 
-// The context's TryAirBoost, called by the air actions after TryStomp.
+// The context's TryAirBoost, called by the air actions after TryStomp. Like TryBoost, it reads its parameters
+// (XButtonHoming, AirBoostEnableChaosEnergy) only once X is pressed.
 PPC_FUNC_IMPL(__imp__sub_82375748);
 PPC_FUNC(sub_82375748)
 {
     uint32_t context = ctx.r3.u32;
 
     if (TasHud::IsEnabled() && context == g_speedContext)
+    {
         g_checks.AirBoostCheckFrame = g_frame;
+        g_checks.AirBoostHoming = CallParameterGetter(ctx, base, context, AIR_BOOST_HOMING_PARAMETER, __imp__sub_8245DB18).r3.u8 != 0;
+        g_checks.AirBoostEnableEnergy =
+            float(CallParameterGetter(ctx, base, context, AIR_BOOST_ENABLE_CHAOS_ENERGY_PARAMETER, __imp__sub_8245DB60).f1.f64);
+    }
 
     __imp__sub_82375748(ctx, base);
-}
-
-// Reads a bool parameter of the player by ID. Records whether the air boost can turn into a homing attack.
-PPC_FUNC_IMPL(__imp__sub_8245DB18);
-PPC_FUNC(sub_8245DB18)
-{
-    uint32_t reader = ctx.r3.u32;
-    uint32_t parameter = ctx.r4.u32;
-    __imp__sub_8245DB18(ctx, base);
-
-    if (parameter == AIR_BOOST_HOMING_PARAMETER && TasHud::IsEnabled() && g_speedContext != 0 &&
-        reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
-    {
-        g_checks.AirBoostHoming = ctx.r3.u8 != 0;
-    }
 }
 
 // The quick steps' updates, which first read the animation frame they compare.
@@ -466,7 +501,8 @@ PPC_FUNC(sub_82344B88)
 
 // Reads a float parameter of the player by ID. Records StompingDisableTime when the short hop reads it, the
 // movement input's deadzone when the input is read, day Sonic's InAirMaxAccelVelocity when the air update reads it, the
-// boosts' energies, the lock-on frustum, and how long HomingAttackAfter waits before the air actions.
+// lock-on frustum, and how long HomingAttackAfter waits before the air actions. (The boosts' parameters are read in
+// TryBoost and TryAirBoost above.)
 PPC_FUNC_IMPL(__imp__sub_8245DB60);
 PPC_FUNC(sub_8245DB60)
 {
@@ -484,12 +520,6 @@ PPC_FUNC(sub_8245DB60)
         reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
     {
         g_checks.InAirMaxAccelVelocity = float(ctx.f1.f64);
-    }
-
-    if ((parameter == BOOST_ENABLE_CHAOS_ENERGY_PARAMETER || parameter == AIR_BOOST_ENABLE_CHAOS_ENERGY_PARAMETER) &&
-        TasHud::IsEnabled() && g_speedContext != 0 && reader == LoadU32(g_speedContext + PARAMETER_READER_OFFSET))
-    {
-        (parameter == BOOST_ENABLE_CHAOS_ENERGY_PARAMETER ? g_checks.BoostEnableEnergy : g_checks.AirBoostEnableEnergy) = float(ctx.f1.f64);
     }
 
     if (g_recordingLockonFrustum >= 0 && parameter >= LOCKON_FRUSTUM_FIRST_PARAMETER && parameter < LOCKON_FRUSTUM_FIRST_PARAMETER + 4)

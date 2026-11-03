@@ -110,6 +110,12 @@ namespace Tas
         uint32_t PathFrame = 0;
         float PathDirection[3] = {};
 
+        // The out-of-control plugin's last update (sub_82351090): its time and duration then, and whether it ended.
+        uint32_t OutOfControlFrame = 0;
+        float OutOfControlTime = 0.0f;
+        float OutOfControlDuration = 0.0f;
+        bool OutOfControlEnded = false;
+
         // The 2D air posture's Brake state's update (CPlayerSpeedPosture2DAir::CStateBrake, sub_82344B88).
         uint32_t Air2DBrakeFrame = 0;
     };

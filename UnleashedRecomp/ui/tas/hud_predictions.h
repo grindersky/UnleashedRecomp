@@ -90,6 +90,11 @@ namespace Tas
         bool CanBoost = false;
         bool Boosting = false;
         float Energy = 0.0f;
+        // Out of control (flag 3: a dash panel, a run quick step...): for how many more frames a press still does
+        // nothing (-1: no timer), and whether it ends on landing.
+        bool OutOfControl = false;
+        int OutOfControlFrames = -1;
+        bool OutOfControlUntilLanding = false;
     };
 
     // Also remembers the state for the next frame: call once per drawn frame, with day Sonic shown.

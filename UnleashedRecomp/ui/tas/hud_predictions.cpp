@@ -440,16 +440,49 @@ static bool EstimateNextHomingTarget(uint32_t context)
 // How many frames after an air boost (a one-frame tap) the stomp is accepted.
 static constexpr int AIR_BOOST_STOMP_FRAMES = 2;
 
+// While Sonic is out of control: on how many more updates his state still finds him out of control, or -1 without a timer.
+// The out-of-control plugin adds the frame's time to its own (in single precision) before its update (sub_82351090),
+// which ends it once that time is past its duration, or on the ground when it ends on landing (flag 25). The plugin
+// updates after the state (sub_82302E80), so the update that ends it still runs the state out of control: a press
+// works on the update after that.
+static int GetOutOfControlFramesLeft(bool grounded, bool untilLanding, float deltaTime)
+{
+    const SonicChecks& checks = GetSonicChecks();
+    if (checks.OutOfControlFrame != GetHudFrame())
+        return -1;
+
+    // Ended, but the flag is still set: the next update removes it (unverified).
+    if (checks.OutOfControlEnded || (untilLanding && grounded))
+        return 1;
+
+    float duration = checks.OutOfControlDuration;
+    if (!(duration >= 0.0f))
+        return -1;
+
+    float time = checks.OutOfControlTime;
+    for (int frames = 1; frames <= 100000; frames++)
+    {
+        time += deltaTime;
+        if (time > duration)
+            return frames;
+    }
+
+    return -1;
+}
+
 // Sonic's state on the last drawn frame.
 static std::string g_sonicPreviousState;
 static uint32_t g_sonicPreviousStateObject;
 
 // What a press entered now would do: the next update reads it. A state keeps trying what it tried during this frame's
 // update, and a state entered during it tries what its update starts with: the states in GROUND_ACTIONS_STATE_VFTABLES
-// try the jump, then the quick step (Land skips them only on the update that ends its animation, and StompingLand also
-// when it has lasted 0.1 s with the stick held past 0.25: then it picks the next state; LandJumpShort skips them on the
-// update that ends its animation, sub_82307CB0, or while Sonic is faster than parameter 83: it changes state instead);
-// those in AIR_ACTIONS_STATE_VFTABLES the homing attack, the stomp and the air boost; those in BOOST_STATE_VFTABLES the
+// try the jump, then the quick step and the boost (Land skips them only on the update that ends its animation, and
+// StompingLand also when it has lasted 0.1 s with the stick held past 0.25: then it picks the next state; LandJumpShort
+// skips them on the update that ends its animation, sub_82307CB0, or while Sonic is faster than parameter 83: it changes
+// state instead). So does one of them that skipped its tries during this frame's update because Sonic was out of control
+// (a dash panel, say): the posture's out-of-control plugin ends after the state's update (the player's update runs the
+// state machine at ctx+204 first, sub_82302E80), so when the flag is off now, the next update tries again. Those in
+// AIR_ACTIONS_STATE_VFTABLES the homing attack, the stomp and the air boost; those in BOOST_STATE_VFTABLES the
 // boost. The states in JUMP_BUFFER_STATE_VFTABLES jump on the ground from a press buffered on the update before: running
 // on water keeps Sonic in Fall but on the ground, where a press jumps on the next update.
 SonicPresses Tas::PredictSonicPresses(uint32_t context, uint32_t state, const std::string& stateName, float stateTime, bool grounded,
@@ -464,7 +497,17 @@ SonicPresses Tas::PredictSonicPresses(uint32_t context, uint32_t state, const st
 
     bool entered = state != g_sonicPreviousStateObject;
     bool outOfControl = GetFlag(context, STATE_FLAGS_OFFSET, OUT_OF_CONTROL_FLAG);
-    bool groundActionsNext = grounded && !outOfControl && entered && IsStateIn(state, GROUND_ACTIONS_STATE_VFTABLES);
+    if (outOfControl)
+    {
+        presses.OutOfControl = true;
+        presses.OutOfControlUntilLanding = GetFlag(context, STATE_FLAGS_OFFSET, OUT_OF_CONTROL_UNTIL_LANDING_FLAG);
+        presses.OutOfControlFrames = GetOutOfControlFramesLeft(grounded, presses.OutOfControlUntilLanding, deltaTime);
+    }
+
+    // Whether this state's ground actions ran during this frame's update (TryJump is the first thing they try). When they
+    // didn't, in a state that runs them on every update, the next update runs them if Sonic is in control by then.
+    bool jumpTried = checks.JumpCheckFrame == frame && (!entered || checks.JumpCheckState == state);
+    bool groundActionsNext = grounded && !outOfControl && !jumpTried && IsStateIn(state, GROUND_ACTIONS_STATE_VFTABLES);
 
     // A quick step runs the ground actions from a frame of its animation on: in how many updates. (The run quick
     // step is still out of control then, and ends instead.)
@@ -478,7 +521,6 @@ SonicPresses Tas::PredictSonicPresses(uint32_t context, uint32_t state, const st
     if (presses.QuickStepUpdates == 1 && grounded && !outOfControl)
         groundActionsNext = true;
 
-    bool jumpTried = checks.JumpCheckFrame == frame && (!entered || checks.JumpCheckState == state);
     bool jumpBuffered = IsStateIn(state, JUMP_BUFFER_STATE_VFTABLES);
     presses.CanJump = grounded && (jumpTried || groundActionsNext || jumpBuffered);
 
@@ -557,28 +599,32 @@ SonicPresses Tas::PredictSonicPresses(uint32_t context, uint32_t state, const st
     // homing attack): only estimated.
     presses.HomingEstimated = presses.HomingPress && !presses.HomingTarget && EstimateNextHomingTarget(context);
 
-    // Whether X would boost: on the ground TryBoost, in the air TryAirBoost, with enough energy in the gauge (out of
-    // 100). As for the other presses, a state entered during this frame's update tries it if its update starts with it.
+    // Whether X would boost: TryBoost (the ground actions, the grind actions, sliding, pushing a wall, the air actions
+    // on water) or, in the air, TryAirBoost, with enough energy in the gauge (out of 100). As for the other presses, a
+    // state entered during this frame's update tries it if its update starts with it.
     presses.Energy = LoadFloat(context + CHAOS_ENERGY_OFFSET);
     presses.Boosting = GetFlag(context, STATE_FLAGS_OFFSET, BOOSTING_FLAG);
-    if (grounded)
-    {
-        bool boostTried = checks.BoostCheckFrame == frame && (!entered || checks.BoostCheckState == state) && checks.BoostAllowed;
-        // Sliding's update (sub_823997C8) only tries the boost while ctx+1056 (a length the posture's ground check,
-        // sub_8232F370, stores) is at least 1, so on its first frames it can skip it during this frame's update and try
-        // on the next. This goes by the value as the HUD sees it, assuming the next update reads the same one.
-        bool slideBoostNext = stateName == "Sliding" && !outOfControl && LoadFloat(context + SLIDE_BOOST_LENGTH_OFFSET) >= 1.0f;
-        bool boostNext = (groundActionsNext || (entered && IsStateIn(state, BOOST_STATE_VFTABLES)) || slideBoostNext) &&
-            IsBoostAllowed(context);
-        presses.CanBoost = presses.Energy > checks.BoostEnableEnergy && (boostTried || boostNext);
-    }
-    else
-    {
-        // The air actions do nothing while Sonic is on the ground or out of control (sub_82316118, vfunc 56), so this
-        // goes by the state after this frame's update: a hop that just left the ground, or the end of an
-        // out-of-control (RooftopRunAct1.ltm, frames 1159 and 3037). HomingAttackAfter waits for parameter 278 first.
-        presses.CanBoost = presses.Energy > checks.AirBoostEnableEnergy && airActionsNext && !outOfControl && IsAirBoostAllowed(context);
-    }
+
+    // TryBoost: a state that tried it during this frame's update tries it again, whether or not the grounded byte is on
+    // (the air actions try it on water, and the rails may not set it).
+    bool boostTried = checks.BoostCheckFrame == frame && (!entered || checks.BoostCheckState == state) && checks.BoostAllowed;
+    // Sliding's update (sub_823997C8) only tries the boost while ctx+1056 (a length the posture's ground check,
+    // sub_8232F370, stores) is at least 1, so on its first frames it can skip it during this frame's update and try
+    // on the next. This goes by the value as the HUD sees it, assuming the next update reads the same one.
+    bool slideBoostNext = grounded && stateName == "Sliding" && !outOfControl && LoadFloat(context + SLIDE_BOOST_LENGTH_OFFSET) >= 1.0f;
+    // The grind actions skip TryBoost while Sonic is out of control, like the ground actions.
+    bool grindActionsNext = !outOfControl && IsStateIn(state, GRIND_ACTIONS_STATE_VFTABLES) && LoadU32(context + GRIND_RAIL_OFFSET) != 0;
+    bool boostNext = (groundActionsNext || grindActionsNext || (grounded && entered && IsStateIn(state, BOOST_STATE_VFTABLES)) ||
+        slideBoostNext) && IsBoostAllowed(context);
+    bool canGroundBoost = presses.Energy > checks.BoostEnableEnergy && (boostTried || boostNext);
+
+    // TryAirBoost: the air actions do nothing while Sonic is on the ground or out of control (sub_82316118, vfunc 56),
+    // so this goes by the state after this frame's update: a hop that just left the ground, or the end of an
+    // out-of-control (RooftopRunAct1.ltm, frames 1159 and 3037). HomingAttackAfter waits for parameter 278 first.
+    bool canAirBoost = !grounded && presses.Energy > checks.AirBoostEnableEnergy && airActionsNext && !outOfControl &&
+        IsAirBoostAllowed(context);
+
+    presses.CanBoost = canGroundBoost || canAirBoost;
 
     g_sonicPreviousState = stateName;
     g_sonicPreviousStateObject = state;
