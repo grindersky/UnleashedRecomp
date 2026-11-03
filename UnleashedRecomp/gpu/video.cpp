@@ -545,10 +545,39 @@ struct UploadAllocator
         return result;
     }
 
+    // The buffers stay mapped: makes what this frame wrote visible to the GPU before the frame is submitted. Only
+    // does something on memory that isn't host coherent (Vulkan through libTAS's GPU host in copy mode).
+    void flush()
+    {
+        for (uint32_t i = 0; i <= index && i < buffers.size(); i++)
+        {
+            uint32_t size = (i < index) ? UploadBuffer::SIZE : offset;
+            if (buffers[i].buffer != nullptr && size != 0)
+                buffers[i].buffer->flush(0, size);
+        }
+    }
+
     void reset()
     {
         index = 0;
         offset = 0;
+
+        // Shaders read constants through these addresses. libTAS's GPU host recreates the buffers when it loads a
+        // state, and they may land at other addresses: ask again every frame (a few buffers).
+        for (auto& buffer : buffers)
+        {
+            if (buffer.buffer == nullptr)
+                continue;
+
+            uint64_t deviceAddress = buffer.buffer->getDeviceAddress();
+            if (deviceAddress != buffer.deviceAddress)
+            {
+                // TEMPORARY (libTAS GPU host black screens)
+                fprintf(stderr, "TAS mode: upload buffer moved from 0x%llx to 0x%llx\n",
+                    (unsigned long long)buffer.deviceAddress, (unsigned long long)deviceAddress);
+                buffer.deviceAddress = deviceAddress;
+            }
+        }
     }
 };
 
@@ -3451,6 +3480,8 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
             FlushBarriers();
         }
     }
+
+    g_uploadAllocators[g_frame].flush();
 
     auto &commandList = g_commandLists[g_frame];
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
