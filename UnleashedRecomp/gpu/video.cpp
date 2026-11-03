@@ -5508,7 +5508,21 @@ static GuestVertexDeclaration* CreateVertexDeclarationWithoutAddRef(GuestVertexE
                 }
             }
 
-            assert(inputElement.location != ~0);
+            // An element no shader input reads (mod models can have them, e.g. a second set of blend weights) would
+            // reach the driver with location ~0, and pipeline creation crashes (lavapipe and dozen). Leave it out.
+            if (inputElement.location == ~0)
+            {
+                static std::set<uint32_t> s_reported;
+                if (s_reported.insert((vertexElement->usage << 8) | vertexElement->usageIndex).second)
+                {
+                    fprintf(stderr, "Vertex element without a shader input skipped: usage %u, index %u, type 0x%X\n",
+                        uint32_t(vertexElement->usage), uint32_t(vertexElement->usageIndex), uint32_t(vertexElement->type));
+                }
+
+                inputElements.pop_back();
+                ++vertexElement;
+                continue;
+            }
 
             inputElement.format = ConvertDeclType(vertexElement->type);
             inputElement.slotIndex = vertexElement->stream;
