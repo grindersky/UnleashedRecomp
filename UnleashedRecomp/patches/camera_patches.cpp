@@ -3,6 +3,7 @@
 #include <user/config.h>
 #include <gpu/video.h>
 #include <ui/collision_overlay.h>
+#include <ui/tas/tas_camera.h>
 #include "camera_patches.h"
 #include "aspect_ratio_patches.h"
 
@@ -67,4 +68,5 @@ PPC_FUNC(sub_82467890)
     uint32_t camera = ctx.r3.u32;
     __imp__sub_82467890(ctx, base);
     CollisionOverlay::OnCameraUpdate(camera);
+    TasCamera::OnCameraUpdate(camera);
 }

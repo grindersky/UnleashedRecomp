@@ -8,6 +8,7 @@
 #include <ui/tas/drawing.h>
 #include <ui/tas/hud_predictions.h>
 #include <ui/tas/hud_state.h>
+#include <ui/tas/tas_camera.h>
 #include <ui/tas/vector_math.h>
 #include <tas_mode.h>
 
@@ -443,6 +444,14 @@ void TasHud::Draw()
     auto drawList = ImGui::GetBackgroundDrawList();
     auto& res = ImGui::GetIO().DisplaySize;
     auto font = ImFontAtlasSnapshot::GetFont("FOT-SeuratPro-M.otf");
+
+    // The TAS camera's mode ("\"), at the top of the screen while it's on.
+    if (TasCamera::GetMode() != TasCamera::Mode::Off)
+    {
+        const char* cameraMode = TasCamera::GetModeName();
+        DrawShadowedText(drawList, font, Scale(13), { (res.x - TextWidth(font, Scale(13), cameraMode)) / 2, Scale(8) },
+            IM_COL32(255, 220, 80, 255), cameraMode);
+    }
 
     // Wide enough for the longest stick line and three indicators a row as wide as the widest, away from
     // the edge of the screen.

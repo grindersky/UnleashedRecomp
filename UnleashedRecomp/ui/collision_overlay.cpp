@@ -6,6 +6,7 @@
 #include <ui/tas/collision.h>
 #include <ui/tas/drawing.h>
 #include <ui/tas/object_tracking.h>
+#include <ui/tas/tas_camera.h>
 #include <ui/tas_hud.h>
 #include <user/config.h>
 #include <sdl_listener.h>
@@ -593,6 +594,11 @@ static bool MakeProjector(Projector& projector)
     }
 
     projector.Eye = LoadVector(camera + CAMERA_POSITION_OFFSET);
+
+    // With the TAS camera on, the picture is drawn from its view (same projection).
+    float tasEye[3];
+    if (TasCamera::GetView(camera, projector.View, tasEye))
+        projector.Eye = { tasEye[0], tasEye[1], tasEye[2] };
 
     // The scene keeps its aspect ratio (the projection's), centred in the window.
     auto& res = ImGui::GetIO().DisplaySize;

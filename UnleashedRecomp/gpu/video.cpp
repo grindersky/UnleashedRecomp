@@ -31,6 +31,7 @@
 #include <ui/collision_overlay.h>
 #include <ui/tas_hud.h>
 #include <ui/tas_hud_dump.h>
+#include <ui/tas/tas_camera.h>
 #include <patches/aspect_ratio_patches.h>
 #include <user/config.h>
 #include <sdl_listener.h>
@@ -4840,6 +4841,30 @@ struct LocalRenderCommandQueue
     }
 };
 
+// Where the game puts its camera in the shader constants (as floats): the view in vertex c4-c7 and pixel c8-c11, the eye
+// in vertex c178 and pixel c22 (the projection is in c0-c3 of both and stays). The 512x512 shadow map pass uses its own.
+static constexpr uint32_t VERTEX_VIEW_CONSTANT = 4 * 4;
+static constexpr uint32_t VERTEX_EYE_CONSTANT = 178 * 4;
+static constexpr uint32_t PIXEL_VIEW_CONSTANT = 8 * 4;
+static constexpr uint32_t PIXEL_EYE_CONSTANT = 22 * 4;
+
+// The TAS camera swaps the game camera's view and eye in the host's copy of the constants going to the GPU (the game's own
+// constants stay as they are). index and size: the copied range, in floats and bytes.
+static void ReplaceTasCameraConstants(uint8_t* memory, uint32_t index, uint32_t size, uint32_t viewConstant, uint32_t eyeConstant)
+{
+    if (TasCamera::GetMode() == TasCamera::Mode::Off)
+        return;
+
+    auto constants = reinterpret_cast<uint32_t*>(memory);
+    uint32_t end = index + size / sizeof(uint32_t);
+
+    if (viewConstant >= index && viewConstant + 16 <= end)
+        TasCamera::ReplaceView(constants + (viewConstant - index));
+
+    if (eyeConstant >= index && eyeConstant + 3 <= end)
+        TasCamera::ReplaceEye(constants + (eyeConstant - index));
+}
+
 static void FlushRenderStateForMainThread(GuestDevice* device, LocalRenderCommandQueue& queue)
 {
     constexpr size_t BOOL_MASK = 0x100000000000000ull;
@@ -4880,6 +4905,7 @@ static void FlushRenderStateForMainThread(GuestDevice* device, LocalRenderComman
         auto& cmd = queue.enqueue();
         cmd.type = RenderCommandType::SetVertexShaderConstants;
         cmd.setVertexShaderConstants.memory = g_intermediaryUploadAllocator.allocate(&device->vertexShaderFloatConstants[index], size);
+        ReplaceTasCameraConstants(cmd.setVertexShaderConstants.memory, index, size, VERTEX_VIEW_CONSTANT, VERTEX_EYE_CONSTANT);
         cmd.setVertexShaderConstants.index = index;
         cmd.setVertexShaderConstants.size = size;
 
@@ -4898,6 +4924,7 @@ static void FlushRenderStateForMainThread(GuestDevice* device, LocalRenderComman
         auto& cmd = queue.enqueue();
         cmd.type = RenderCommandType::SetPixelShaderConstants;
         cmd.setPixelShaderConstants.memory = g_intermediaryUploadAllocator.allocate(&device->pixelShaderFloatConstants[index], size);
+        ReplaceTasCameraConstants(cmd.setPixelShaderConstants.memory, index, size, PIXEL_VIEW_CONSTANT, PIXEL_EYE_CONSTANT);
         cmd.setPixelShaderConstants.index = index;
         cmd.setPixelShaderConstants.size = size;
 

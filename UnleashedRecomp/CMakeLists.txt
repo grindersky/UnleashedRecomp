@@ -172,6 +172,7 @@ set(UNLEASHED_RECOMP_UI_CXX_SOURCES
     "ui/tas/object_tracking.cpp"
     "ui/tas/radar.cpp"
     "ui/tas/stage_collision.cpp"
+    "ui/tas/tas_camera.cpp"
     "ui/tv_static.cpp"
 )
 
