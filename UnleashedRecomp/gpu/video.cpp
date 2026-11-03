@@ -1990,19 +1990,22 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
     g_capabilities = g_device->getCapabilities();
 
-    // Mesa's Vulkan driver on top of D3D12 (dozen) names its devices "Microsoft Direct3D12 (<GPU>)".
-    g_vulkanOnD3D12 = g_vulkan && g_device->getDescription().name.starts_with("Microsoft Direct3D12");
+    // Mesa's Vulkan driver on top of D3D12 (dozen) names its devices "Microsoft Direct3D12 (<GPU>)". Through libTAS's
+    // Forwarded GPU rendering, gfxstream wraps the host's name: "Virtio-GPU GFXStream (Microsoft Direct3D12 (<GPU>))".
+    // dozen still draws there, with the same depth bias bug (see the pipeline change in FlushRenderStateForRenderThread).
+    const std::string& deviceName = g_device->getDescription().name;
+    bool directDozen = deviceName.starts_with("Microsoft Direct3D12");
+    g_vulkanOnD3D12 = g_vulkan && deviceName.find("Microsoft Direct3D12") != std::string::npos;
 
     // A libTAS savestate only restores the game's process, while dozen's GPU memory lives in the Windows driver: after a
     // load, the game's idea of it no longer matches, allocations fail (vmaCreateImage) and the game crashes (2026-11-02,
-    // vk_image_view_init on a null image). libTAS's Forwarded GPU rendering (its GPU host keeps the GPU state in its own
-    // process and snapshots it) works, but the device name the game sees there can be dozen's too, so this only warns.
-    if (IsTasMode() && g_vulkanOnD3D12)
+    // vk_image_view_init on a null image). Not through Forwarded GPU rendering: its GPU host keeps the GPU state in its
+    // own process and snapshots it.
+    if (IsTasMode() && g_vulkan && directDozen)
     {
-        fprintf(stderr, "TAS mode: rendering on dozen (%s). If the game renders on dozen directly, libTAS savestates don't "
-            "work: loading one crashes the game. To TAS with savestates, turn on \"Force software rendering\" in libTAS "
-            "(lavapipe), or use a libTAS build with \"Forwarded GPU\" rendering (then ignore this message).\n",
-            g_device->getDescription().name.c_str());
+        fprintf(stderr, "TAS mode: rendering on dozen (%s). libTAS savestates don't work on it: loading one crashes the "
+            "game. To TAS with savestates, turn on \"Force software rendering\" in libTAS (lavapipe), or use a libTAS build "
+            "with \"Forwarded GPU\" rendering.\n", deviceName.c_str());
     }
 
     LoadEmbeddedResources();

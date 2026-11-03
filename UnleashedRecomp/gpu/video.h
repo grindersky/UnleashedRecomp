@@ -31,8 +31,8 @@ struct Video
     // (anti-aliasing on), else the last single-sampled one, or null.
     static GuestSurface* GetSceneDepthStencil();
 
-    // Whether the game's Vulkan device is Mesa's driver on top of D3D12 (dozen), where libTAS savestates don't work
-    // unless libTAS forwards the GPU.
+    // Whether the game renders through Mesa's Vulkan driver on top of D3D12 (dozen), directly or through libTAS's
+    // Forwarded GPU rendering (gfxstream).
     static bool IsVulkanOnD3D12();
 };
 
