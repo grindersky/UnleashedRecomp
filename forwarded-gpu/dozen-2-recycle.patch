@@ -1,0 +1,831 @@
+--- a/src/microsoft/vulkan/dzn_device.c
++++ b/src/microsoft/vulkan/dzn_device.c
+@@ -41,6 +41,10 @@
+ #include "util/u_dl.h"
+ #include "util/hash_table.h"
+ #include "util/simple_mtx.h"
++#include "util/list.h"
++#include "util/os_time.h"
++#include "util/u_atomic.h"
++#include <inttypes.h>
+ 
+ #include "util/driconf.h"
+ 
+@@ -529,6 +533,435 @@
+ }
+ 
+ static void
++dzn_persistent_meta_key(struct dzn_device *device, uint32_t kind, uint32_t index,
++                        ID3D12RootSignature *root_sig, uint8_t *key)
++{
++   struct mesa_sha1 ctx;
++   _mesa_sha1_init(&ctx);
++   _mesa_sha1_update(&ctx, "MetaPipeline", 12);
++   _mesa_sha1_update(&ctx, &device->dev, sizeof(device->dev));
++   _mesa_sha1_update(&ctx, &kind, sizeof(kind));
++   _mesa_sha1_update(&ctx, &index, sizeof(index));
++   _mesa_sha1_update(&ctx, &root_sig, sizeof(root_sig));
++   _mesa_sha1_final(&ctx, key);
++}
++
++/* Meta pipelines (indirect draw and triangle fan rewrites) are compiled from NIR on every
++ * device creation; with the cache, a new device of the kept D3D12 device reuses them. */
++ID3D12PipelineState *
++dzn_persistent_meta_lookup(struct dzn_device *device, uint32_t kind, uint32_t index,
++                           ID3D12RootSignature *root_sig)
++{
++   if (!dzn_persistent_usable(device))
++      return NULL;
++   uint8_t key[SHA1_DIGEST_LENGTH];
++   dzn_persistent_meta_key(device, kind, index, root_sig, key);
++   return (ID3D12PipelineState *)dzn_persistent_lookup(key);
++}
++
++ID3D12PipelineState *
++dzn_persistent_meta_insert(struct dzn_device *device, uint32_t kind, uint32_t index,
++                           ID3D12RootSignature *root_sig, ID3D12PipelineState *pso)
++{
++   if (!dzn_persistent_usable(device))
++      return pso;
++   uint8_t key[SHA1_DIGEST_LENGTH];
++   dzn_persistent_meta_key(device, kind, index, root_sig, key);
++   return (ID3D12PipelineState *)dzn_persistent_insert(key, (IUnknown *)pso);
++}
++
++/* DZN_TIMING=1 (set by ~/libtas-gpu/kumquat.sh): counts and times of the calls a libTAS GPU
++ * savestate load makes, written to stderr (kumquat.log) at the first submit of a new device and
++ * when a device is destroyed. */
++DEBUG_GET_ONCE_BOOL_OPTION(dzn_timing, "DZN_TIMING", false)
++
++enum dzn_stat {
++   DZN_STAT_ALLOC_HEAP,
++   DZN_STAT_ALLOC_BUFFER,
++   DZN_STAT_ALLOC_IMAGE,
++   DZN_STAT_ALLOC_OTHER,
++   DZN_STAT_ALLOC_RECYCLED,
++   DZN_STAT_FREE_RELEASED,
++   DZN_STAT_FREE_PARKED,
++   DZN_STAT_MAP,
++   DZN_STAT_MAP_KEPT,
++   DZN_STAT_RECYCLE_DROPPED,
++   DZN_STAT_COUNT,
++};
++
++static const char *const dzn_stat_names[DZN_STAT_COUNT] = {
++   [DZN_STAT_ALLOC_HEAP] = "AllocateMemory heap",
++   [DZN_STAT_ALLOC_BUFFER] = "AllocateMemory dedicated buffer",
++   [DZN_STAT_ALLOC_IMAGE] = "AllocateMemory dedicated image",
++   [DZN_STAT_ALLOC_OTHER] = "AllocateMemory import/export",
++   [DZN_STAT_ALLOC_RECYCLED] = "AllocateMemory recycled",
++   [DZN_STAT_FREE_RELEASED] = "FreeMemory released",
++   [DZN_STAT_FREE_PARKED] = "FreeMemory parked",
++   [DZN_STAT_MAP] = "MapMemory",
++   [DZN_STAT_MAP_KEPT] = "MapMemory kept mapping",
++   [DZN_STAT_RECYCLE_DROPPED] = "recycle: released unused",
++};
++
++static struct {
++   uint64_t count, ns, bytes;
++} dzn_stats[DZN_STAT_COUNT];
++
++static inline uint64_t
++dzn_timing_now(void)
++{
++   return debug_get_option_dzn_timing() ? os_time_get_nano() : 0;
++}
++
++static inline double
++dzn_ms_since(uint64_t start)
++{
++   return (os_time_get_nano() - start) / 1e6;
++}
++
++static void
++dzn_stat_add(enum dzn_stat stat, uint64_t start, uint64_t bytes)
++{
++   if (!debug_get_option_dzn_timing())
++      return;
++   p_atomic_inc(&dzn_stats[stat].count);
++   p_atomic_add(&dzn_stats[stat].ns, os_time_get_nano() - start);
++   p_atomic_add(&dzn_stats[stat].bytes, bytes);
++}
++
++static void
++dzn_stats_report(const char *when)
++{
++   if (!debug_get_option_dzn_timing())
++      return;
++   fprintf(stderr, "dzn: TIMING %s:\n", when);
++   for (unsigned i = 0; i < DZN_STAT_COUNT; i++) {
++      uint64_t count = p_atomic_xchg(&dzn_stats[i].count, 0);
++      uint64_t ns = p_atomic_xchg(&dzn_stats[i].ns, 0);
++      uint64_t bytes = p_atomic_xchg(&dzn_stats[i].bytes, 0);
++      if (count)
++         fprintf(stderr, "dzn: TIMING   %-34s x%-6" PRIu64 " %8.1f ms %8.1f MB\n",
++                 dzn_stat_names[i], count, ns / 1e6, bytes / 1048576.0);
++   }
++   fflush(stderr);
++}
++
++/* DZN_RECYCLE=1 (with DZN_PERSISTENT_PSO_CACHE=1, set by ~/libtas-gpu/kumquat.sh): freed memory
++ * of the kept D3D12 device is parked instead of released, and an allocation with the same size,
++ * type and dedicated image/buffer description takes it back. gfxstream frees all memory on a
++ * savestate load and then allocates the same again, ~1200 D3D12 heaps and committed resources.
++ * Host visible memory also stays mapped. Parked memory is released at the first submit of a newer
++ * device (the load is done allocating by then) or 2 s after it was parked. Dedicated images are
++ * only recycled with enhanced barriers: a recycled texture keeps its layout, and only those
++ * barriers can leave an unknown layout (Vulkan's UNDEFINED). Device descriptor heaps are kept
++ * for the next device too. */
++DEBUG_GET_ONCE_BOOL_OPTION(dzn_recycle, "DZN_RECYCLE", false)
++DEBUG_GET_ONCE_NUM_OPTION(dzn_recycle_max_mb, "DZN_RECYCLE_MAX_MB", 4096)
++
++#define DZN_RECYCLE_MAX_AGE_NS (2ull * 1000 * 1000 * 1000)
++
++static_assert(sizeof(((struct dzn_device_memory *)NULL)->recycle_key) == SHA1_DIGEST_LENGTH,
++              "recycle_key holds a mesa-sha1 digest");
++
++struct dzn_recycled_mem {
++   struct list_head link;        /* all parked memory, oldest first */
++   struct list_head bucket_link; /* parked memory of the same key */
++   uint8_t key[SHA1_DIGEST_LENGTH];
++   uint64_t parked_ns;
++   uint64_t serial;
++   uint64_t bytes;
++   ID3D12Heap *heap;
++   ID3D12Resource *dedicated_res;
++   ID3D12Resource *map_res;
++   void *kept_map;
++};
++
++struct dzn_recycle_bucket {
++   uint8_t key[SHA1_DIGEST_LENGTH];
++   struct list_head entries;
++};
++
++static simple_mtx_t dzn_recycle_lock = SIMPLE_MTX_INITIALIZER;
++static struct list_head dzn_recycle_list;
++static struct hash_table *dzn_recycle_buckets;
++static uint64_t dzn_recycle_bytes;
++static uint32_t dzn_recycle_count;
++static uint64_t dzn_recycle_next_serial;
++
++static struct {
++   ID3D12Device4 *dev;
++   D3D12_DESCRIPTOR_HEAP_TYPE type;
++   struct dzn_descriptor_heap heap;
++} dzn_parked_desc_heaps[8];
++static unsigned dzn_parked_desc_heap_count;
++
++static bool
++dzn_recycle_usable(struct dzn_device *device)
++{
++   return debug_get_option_dzn_recycle() && dzn_persistent_usable(device);
++}
++
++static void
++dzn_recycled_mem_release(struct dzn_recycled_mem *e)
++{
++   if (e->kept_map)
++      ID3D12Resource_Unmap(e->map_res, 0, NULL);
++   if (e->map_res)
++      ID3D12Resource_Release(e->map_res);
++   if (e->heap)
++      ID3D12Heap_Release(e->heap);
++   if (e->dedicated_res)
++      ID3D12Resource_Release(e->dedicated_res);
++   free(e);
++}
++
++/* Takes parked memory made for key into mem; false if there is none */
++static bool
++dzn_recycle_take(const uint8_t *key, struct dzn_device_memory *mem)
++{
++   struct dzn_recycled_mem *e = NULL;
++   simple_mtx_lock(&dzn_recycle_lock);
++   struct hash_entry *he =
++      dzn_recycle_buckets ? _mesa_hash_table_search(dzn_recycle_buckets, key) : NULL;
++   if (he) {
++      struct dzn_recycle_bucket *bucket = he->data;
++      if (!list_is_empty(&bucket->entries)) {
++         e = list_first_entry(&bucket->entries, struct dzn_recycled_mem, bucket_link);
++         list_del(&e->bucket_link);
++         list_del(&e->link);
++         dzn_recycle_bytes -= e->bytes;
++         p_atomic_dec(&dzn_recycle_count);
++      }
++   }
++   simple_mtx_unlock(&dzn_recycle_lock);
++   if (!e)
++      return false;
++
++   mem->heap = e->heap;
++   mem->dedicated_res = e->dedicated_res;
++   mem->map_res = e->map_res;
++   mem->kept_map = e->kept_map;
++   free(e);
++   return true;
++}
++
++/* Parks the D3D12 objects of mem; false (and nothing changed) if it can't */
++static bool
++dzn_recycle_park(struct dzn_device *device, struct dzn_device_memory *mem)
++{
++   struct dzn_recycled_mem *e = calloc(1, sizeof(*e));
++   if (!e)
++      return false;
++   memcpy(e->key, mem->recycle_key, sizeof(e->key));
++   e->parked_ns = os_time_get_nano();
++   e->serial = device->recycle_serial;
++   e->bytes = mem->size;
++   e->heap = mem->heap;
++   e->dedicated_res = mem->dedicated_res;
++   e->map_res = mem->map_res;
++   e->kept_map = mem->kept_map;
++
++   simple_mtx_lock(&dzn_recycle_lock);
++   if (!dzn_recycle_buckets) {
++      list_inithead(&dzn_recycle_list);
++      dzn_recycle_buckets =
++         _mesa_hash_table_create(NULL, dzn_persistent_key_hash, dzn_persistent_key_equal);
++   }
++   struct hash_entry *he =
++      dzn_recycle_buckets ? _mesa_hash_table_search(dzn_recycle_buckets, e->key) : NULL;
++   struct dzn_recycle_bucket *bucket = he ? he->data : NULL;
++   if (!bucket && dzn_recycle_buckets) {
++      bucket = calloc(1, sizeof(*bucket));
++      if (bucket) {
++         memcpy(bucket->key, e->key, sizeof(bucket->key));
++         list_inithead(&bucket->entries);
++         _mesa_hash_table_insert(dzn_recycle_buckets, bucket->key, bucket);
++      }
++   }
++   bool parked = bucket &&
++      dzn_recycle_bytes + e->bytes <= (uint64_t)debug_get_option_dzn_recycle_max_mb() << 20;
++   if (parked) {
++      list_addtail(&e->link, &dzn_recycle_list);
++      list_addtail(&e->bucket_link, &bucket->entries);
++      dzn_recycle_bytes += e->bytes;
++      p_atomic_inc(&dzn_recycle_count);
++   }
++   simple_mtx_unlock(&dzn_recycle_lock);
++
++   if (!parked) {
++      free(e);
++      return false;
++   }
++   mem->heap = NULL;
++   mem->dedicated_res = NULL;
++   mem->map_res = NULL;
++   mem->kept_map = NULL;
++   mem->map = NULL;
++   return true;
++}
++
++/* Releases parked memory a device can't take anymore: from an older device, or too old */
++static void
++dzn_recycle_drain(struct dzn_device *device)
++{
++   if (!device->recycle_reported) {
++      device->recycle_reported = true;
++      if (debug_get_option_dzn_timing()) {
++         char when[96];
++         snprintf(when, sizeof(when), "first submit of device %" PRIu64 " (%u parked unused)",
++                  device->recycle_serial, p_atomic_read(&dzn_recycle_count));
++         dzn_stats_report(when);
++      }
++   }
++   if (!p_atomic_read(&dzn_recycle_count))
++      return;
++
++   uint64_t now = os_time_get_nano();
++   struct list_head dropped;
++   list_inithead(&dropped);
++   simple_mtx_lock(&dzn_recycle_lock);
++   list_for_each_entry_safe(struct dzn_recycled_mem, e, &dzn_recycle_list, link) {
++      if (e->serial < device->recycle_serial || now - e->parked_ns > DZN_RECYCLE_MAX_AGE_NS) {
++         list_del(&e->bucket_link);
++         list_del(&e->link);
++         dzn_recycle_bytes -= e->bytes;
++         p_atomic_dec(&dzn_recycle_count);
++         list_addtail(&e->link, &dropped);
++      }
++   }
++   simple_mtx_unlock(&dzn_recycle_lock);
++
++   list_for_each_entry_safe(struct dzn_recycled_mem, e, &dropped, link) {
++      uint64_t start = dzn_timing_now();
++      uint64_t bytes = e->bytes;
++      dzn_recycled_mem_release(e);
++      dzn_stat_add(DZN_STAT_RECYCLE_DROPPED, start, bytes);
++   }
++}
++
++/* Device descriptor heaps (bindless) of the kept D3D12 device, for the next device */
++static bool
++dzn_recycle_take_desc_heap(struct dzn_device *device, D3D12_DESCRIPTOR_HEAP_TYPE type,
++                           uint32_t desc_count, struct dzn_descriptor_heap *out)
++{
++   if (!dzn_recycle_usable(device))
++      return false;
++   bool found = false;
++   simple_mtx_lock(&dzn_recycle_lock);
++   for (unsigned i = 0; i < dzn_parked_desc_heap_count; i++) {
++      if ((void *)dzn_parked_desc_heaps[i].dev == (void *)device->dev &&
++          dzn_parked_desc_heaps[i].type == type &&
++          dzn_parked_desc_heaps[i].heap.desc_count == desc_count) {
++         *out = dzn_parked_desc_heaps[i].heap;
++         dzn_parked_desc_heaps[i] = dzn_parked_desc_heaps[--dzn_parked_desc_heap_count];
++         found = true;
++         break;
++      }
++   }
++   simple_mtx_unlock(&dzn_recycle_lock);
++   return found;
++}
++
++static bool
++dzn_recycle_park_desc_heap(struct dzn_device *device, D3D12_DESCRIPTOR_HEAP_TYPE type,
++                           struct dzn_descriptor_heap *heap)
++{
++   if (!heap->heap || !dzn_recycle_usable(device))
++      return false;
++   bool parked = false;
++   simple_mtx_lock(&dzn_recycle_lock);
++   if (dzn_parked_desc_heap_count < ARRAY_SIZE(dzn_parked_desc_heaps)) {
++      dzn_parked_desc_heaps[dzn_parked_desc_heap_count].dev = device->dev;
++      dzn_parked_desc_heaps[dzn_parked_desc_heap_count].type = type;
++      dzn_parked_desc_heaps[dzn_parked_desc_heap_count].heap = *heap;
++      dzn_parked_desc_heap_count++;
++      parked = true;
++   }
++   simple_mtx_unlock(&dzn_recycle_lock);
++   if (parked)
++      heap->heap = NULL;
++   return parked;
++}
++
++/* Command queues (and their fences) of the kept D3D12 device, for the next device. Creating one
++ * takes ~50 ms in WSL, and gfxstream's device has 9. The fence keeps counting from where the
++ * old queue stopped, so values the new queue signals are always newer. */
++static struct {
++   ID3D12Device4 *dev;
++   D3D12_COMMAND_QUEUE_DESC desc;
++   ID3D12CommandQueue *cmdqueue;
++   ID3D12Fence *fence;
++   uint64_t fence_point;
++} dzn_parked_queues[32];
++static unsigned dzn_parked_queue_count;
++
++static bool
++dzn_recycle_take_queue(struct dzn_device *device, struct dzn_queue *queue,
++                       const D3D12_COMMAND_QUEUE_DESC *desc)
++{
++   if (!dzn_recycle_usable(device))
++      return false;
++   bool found = false;
++   simple_mtx_lock(&dzn_recycle_lock);
++   for (unsigned i = 0; i < dzn_parked_queue_count; i++) {
++      if ((void *)dzn_parked_queues[i].dev == (void *)device->dev &&
++          !memcmp(&dzn_parked_queues[i].desc, desc, sizeof(*desc))) {
++         queue->cmdqueue = dzn_parked_queues[i].cmdqueue;
++         queue->fence = dzn_parked_queues[i].fence;
++         queue->fence_point = dzn_parked_queues[i].fence_point;
++         dzn_parked_queues[i] = dzn_parked_queues[--dzn_parked_queue_count];
++         found = true;
++         break;
++      }
++   }
++   simple_mtx_unlock(&dzn_recycle_lock);
++   return found;
++}
++
++/* Parks the idle queue's D3D12 objects; false (and nothing changed) if it can't */
++static bool
++dzn_recycle_park_queue(struct dzn_queue *queue)
++{
++   struct dzn_device *device = container_of(queue->vk.base.device, struct dzn_device, vk);
++   if (!queue->cmdqueue || !queue->fence || !dzn_recycle_usable(device))
++      return false;
++   bool parked = false;
++   simple_mtx_lock(&dzn_recycle_lock);
++   if (dzn_parked_queue_count < ARRAY_SIZE(dzn_parked_queues)) {
++      dzn_parked_queues[dzn_parked_queue_count].dev = device->dev;
++      dzn_parked_queues[dzn_parked_queue_count].desc = queue->d3d12_desc;
++      dzn_parked_queues[dzn_parked_queue_count].cmdqueue = queue->cmdqueue;
++      dzn_parked_queues[dzn_parked_queue_count].fence = queue->fence;
++      dzn_parked_queues[dzn_parked_queue_count].fence_point = queue->fence_point;
++      dzn_parked_queue_count++;
++      parked = true;
++   }
++   simple_mtx_unlock(&dzn_recycle_lock);
++   if (parked) {
++      queue->cmdqueue = NULL;
++      queue->fence = NULL;
++   }
++   return parked;
++}
++
++#define MEM_HASH(ctx, value) _mesa_sha1_update(ctx, &(value), sizeof(value))
++
++static void
++dzn_recycle_hash_resource_desc(struct mesa_sha1 *ctx, const D3D12_RESOURCE_DESC *desc)
++{
++   MEM_HASH(ctx, desc->Dimension);
++   MEM_HASH(ctx, desc->Alignment);
++   MEM_HASH(ctx, desc->Width);
++   MEM_HASH(ctx, desc->Height);
++   MEM_HASH(ctx, desc->DepthOrArraySize);
++   MEM_HASH(ctx, desc->MipLevels);
++   MEM_HASH(ctx, desc->Format);
++   MEM_HASH(ctx, desc->SampleDesc.Count);
++   MEM_HASH(ctx, desc->SampleDesc.Quality);
++   MEM_HASH(ctx, desc->Layout);
++   MEM_HASH(ctx, desc->Flags);
++}
++
++static void
+ dzn_physical_device_destroy(struct vk_physical_device *physical)
+ {
+    struct dzn_physical_device *pdev = container_of(physical, struct dzn_physical_device, vk);
+@@ -2352,6 +2785,9 @@
+    struct dzn_device *device = container_of(q->base.device, struct dzn_device, vk);
+    VkResult result = VK_SUCCESS;
+ 
++   if (debug_get_option_dzn_recycle() || !device->recycle_reported)
++      dzn_recycle_drain(device);
++
+    for (uint32_t i = 0; i < info->wait_count; i++) {
+       result = dzn_queue_sync_wait(queue, &info->waits[i]);
+       if (result != VK_SUCCESS)
+@@ -2418,6 +2854,8 @@
+ static void
+ dzn_queue_finish(struct dzn_queue *queue)
+ {
++   dzn_recycle_park_queue(queue);
++
+    if (queue->cmdqueue)
+       ID3D12CommandQueue_Release(queue->cmdqueue);
+ 
+@@ -2450,6 +2888,10 @@
+    queue_desc.Priority =
+       priority_in > 0.5f ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queue_desc.NodeMask = 0;
++   queue->d3d12_desc = queue_desc;
++
++   if (dzn_recycle_take_queue(device, queue, &queue_desc))
++      return VK_SUCCESS;
+ 
+    if (FAILED(ID3D12Device1_CreateCommandQueue(device->dev, &queue_desc,
+                                                &IID_ID3D12CommandQueue,
+@@ -2540,6 +2982,7 @@
+    }
+ 
+    dzn_foreach_pool_type(type) {
++      dzn_recycle_park_desc_heap(device, type, &device->device_heaps[type].heap);
+       dzn_descriptor_heap_finish(&device->device_heaps[type].heap);
+       util_dynarray_fini(&device->device_heaps[type].slot_freelist);
+       mtx_destroy(&device->device_heaps[type].lock);
+@@ -2635,6 +3078,7 @@
+       device->cmd_dispatch.CmdPipelineBarrier2 = dzn_CmdPipelineBarrier2_enhanced;
+    }
+ 
++   uint64_t t_start = dzn_timing_now();
+    VkResult result =
+       vk_device_init(&device->vk, &pdev->vk, &dispatch_table, pCreateInfo, pAllocator);
+    if (result != VK_SUCCESS) {
+@@ -2647,6 +3091,7 @@
+     */
+    device->vk.command_dispatch_table = &device->cmd_dispatch;
+    device->vk.check_status = dzn_device_check_status;
++   device->recycle_serial = p_atomic_inc_return(&dzn_recycle_next_serial);
+ 
+    if (debug_get_option_dzn_persistent_pso_cache()) {
+       /* Pipelines created without a VkPipelineCache use this one, backed by the disk cache */
+@@ -2702,18 +3147,21 @@
+ 
+    IUnknown_QueryInterface(device->dev, &IID_ID3D12DeviceConfiguration, (void **)&device->dev_config);
+ 
++   uint64_t t_meta = dzn_timing_now();
+    result = dzn_meta_init(device);
+    if (result != VK_SUCCESS) {
+       dzn_device_destroy(device, pAllocator);
+       return result;
+    }
+ 
++   uint64_t t_query = dzn_timing_now();
+    result = dzn_device_query_init(device);
+    if (result != VK_SUCCESS) {
+       dzn_device_destroy(device, pAllocator);
+       return result;
+    }
+ 
++   uint64_t t_queues = dzn_timing_now();
+    uint32_t qindex = 0;
+    for (uint32_t qf = 0; qf < pCreateInfo->queueCreateInfoCount; qf++) {
+       const VkDeviceQueueCreateInfo *qinfo = &pCreateInfo->pQueueCreateInfos[qf];
+@@ -2754,6 +3202,7 @@
+       device->need_swapchain_blits = true;
+    }
+ 
++   uint64_t t_heaps = dzn_timing_now();
+    device->support_static_samplers = true;
+    device->bindless = (instance->debug_flags & DZN_DEBUG_BINDLESS) != 0 ||
+       device->vk.enabled_features.descriptorIndexing ||
+@@ -2767,7 +3216,9 @@
+       dzn_foreach_pool_type(type) {
+          uint32_t descriptor_count = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ?
+             sampler_count : D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1;
+-         result = dzn_descriptor_heap_init(&device->device_heaps[type].heap, device, type, descriptor_count, true);
++         if (!dzn_recycle_take_desc_heap(device, type, descriptor_count,
++                                         &device->device_heaps[type].heap))
++            result = dzn_descriptor_heap_init(&device->device_heaps[type].heap, device, type, descriptor_count, true);
+          if (result != VK_SUCCESS) {
+             dzn_device_destroy(device, pAllocator);
+             return result;
+@@ -2779,6 +3230,18 @@
+       }
+    }
+ 
++   if (debug_get_option_dzn_timing()) {
++      uint64_t t_end = os_time_get_nano();
++      fprintf(stderr,
++              "dzn: TIMING CreateDevice %" PRIu64 " %.1f ms: init %.1f, meta %.1f, query %.1f, "
++              "queues %.1f (%u), heaps %.1f; enhanced barriers %d, bindless %d\n",
++              device->recycle_serial, (t_end - t_start) / 1e6, (t_meta - t_start) / 1e6,
++              (t_query - t_meta) / 1e6, (t_queues - t_query) / 1e6, (t_heaps - t_queues) / 1e6,
++              qindex, (t_end - t_heaps) / 1e6, pdev->options12.EnhancedBarriersSupported,
++              device->bindless);
++      fflush(stderr);
++   }
++
+    assert(queue_count == qindex);
+    *out = dzn_device_to_handle(device);
+    return VK_SUCCESS;
+@@ -2885,9 +3348,19 @@
+ {
+    VK_FROM_HANDLE(dzn_device, device, dev);
+ 
++   if (!device)
++      return;
++
++   uint64_t start = dzn_timing_now();
++   uint64_t serial = device->recycle_serial;
+    device->vk.dispatch_table.DeviceWaitIdle(dev);
+ 
+    dzn_device_destroy(device, pAllocator);
++   if (debug_get_option_dzn_timing()) {
++      fprintf(stderr, "dzn: TIMING DestroyDevice %" PRIu64 " %.1f ms\n", serial,
++              dzn_ms_since(start));
++      dzn_stats_report("device destroyed");
++   }
+ }
+ 
+ static void
+@@ -2899,7 +3372,15 @@
+ 
+    struct dzn_device *device = container_of(mem->base.device, struct dzn_device, vk);
+ 
+-   if (mem->map && mem->map_res)
++   uint64_t start = dzn_timing_now();
++   uint64_t bytes = mem->size;
++   bool counted = mem->recyclable || mem->heap || mem->dedicated_res;
++   bool parked = mem->recyclable && dzn_recycle_usable(device) &&
++      dzn_recycle_park(device, mem);
++
++   if (mem->kept_map)
++      ID3D12Resource_Unmap(mem->map_res, 0, NULL);
++   else if (mem->map && mem->map_res)
+       ID3D12Resource_Unmap(mem->map_res, 0, NULL);
+ 
+    if (mem->map_res)
+@@ -2919,6 +3400,9 @@
+       close((int)(intptr_t)mem->export_handle);
+ #endif
+ 
++   if (counted)
++      dzn_stat_add(parked ? DZN_STAT_FREE_PARKED : DZN_STAT_FREE_RELEASED, start, bytes);
++
+    vk_object_base_finish(&mem->base);
+    vk_free2(&device->vk.alloc, pAllocator, mem);
+ }
+@@ -2952,6 +3436,7 @@
+    struct dzn_physical_device *pdevice =
+       container_of(device->vk.physical, struct dzn_physical_device, vk);
+ 
++   uint64_t start = dzn_timing_now();
+    const struct dzn_buffer *buffer = NULL;
+    const struct dzn_image *image = NULL;
+ 
+@@ -3104,7 +3589,47 @@
+    }
+ #endif
+ 
+-   if (host_pointer) {
++   /* DZN_RECYCLE: the key covers everything the D3D12 objects below are made from */
++   const bool use_desc1 = image && device->dev10 && image->castable_format_count > 0;
++   const bool recycle = !export_flags && !import_handle && !host_pointer &&
++      (!image || pdevice->options12.EnhancedBarriersSupported) &&
++      dzn_recycle_usable(device);
++   bool recycled = false;
++   if (recycle) {
++      struct mesa_sha1 ctx;
++      _mesa_sha1_init(&ctx);
++      _mesa_sha1_update(&ctx, "DeviceMemory", 12);
++      MEM_HASH(&ctx, device->dev);
++      MEM_HASH(&ctx, pAllocateInfo->memoryTypeIndex);
++      MEM_HASH(&ctx, pAllocateInfo->allocationSize);
++      MEM_HASH(&ctx, heap_desc.SizeInBytes);
++      MEM_HASH(&ctx, heap_desc.Alignment);
++      MEM_HASH(&ctx, heap_desc.Flags);
++      MEM_HASH(&ctx, heap_desc.Properties.Type);
++      MEM_HASH(&ctx, heap_desc.Properties.CPUPageProperty);
++      MEM_HASH(&ctx, heap_desc.Properties.MemoryPoolPreference);
++      MEM_HASH(&ctx, heap_desc.Properties.CreationNodeMask);
++      MEM_HASH(&ctx, heap_desc.Properties.VisibleNodeMask);
++      const uint32_t kind = image ? 2 : buffer ? 1 : 0;
++      MEM_HASH(&ctx, kind);
++      if (buffer)
++         dzn_recycle_hash_resource_desc(&ctx, &buffer->desc);
++      if (image) {
++         dzn_recycle_hash_resource_desc(&ctx, &image->desc);
++         MEM_HASH(&ctx, use_desc1);
++         if (use_desc1) {
++            MEM_HASH(&ctx, image->castable_format_count);
++            _mesa_sha1_update(&ctx, image->castable_formats,
++                              image->castable_format_count * sizeof(*image->castable_formats));
++         }
++      }
++      _mesa_sha1_final(&ctx, mem->recycle_key);
++      recycled = dzn_recycle_take(mem->recycle_key, mem);
++   }
++
++   if (recycled) {
++      /* D3D12 objects (and mapping) of a freed allocation with the same key */
++   } else if (host_pointer) {
+       error = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+ 
+ #if defined(_WIN32)
+@@ -3227,7 +3752,7 @@
+ 
+    if ((mem_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+        !(heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
+-       !mem->map){
++       !mem->map && !recycled){
+       assert(!image);
+       if (buffer) {
+          mem->map_res = mem->dedicated_res;
+@@ -3271,6 +3796,13 @@
+          goto cleanup;
+    }
+ 
++   mem->recyclable = recycle;
++   dzn_stat_add(recycled ? DZN_STAT_ALLOC_RECYCLED :
++                (export_flags || import_handle || host_pointer) ? DZN_STAT_ALLOC_OTHER :
++                image ? DZN_STAT_ALLOC_IMAGE :
++                buffer ? DZN_STAT_ALLOC_BUFFER : DZN_STAT_ALLOC_HEAP,
++                start, mem->size);
++
+    *out = dzn_device_memory_to_handle(mem);
+    return VK_SUCCESS;
+ 
+@@ -3336,12 +3868,26 @@
+    assert(offset + size <= mem->size);
+ 
+    assert(mem->map_res);
+-   D3D12_RANGE range = { 0 };
+-   range.Begin = offset;
+-   range.End = offset + size;
++   uint64_t start = dzn_timing_now();
+    void *map = NULL;
+-   if (FAILED(ID3D12Resource_Map(mem->map_res, 0, &range, &map)))
+-      return vk_error(device, VK_ERROR_MEMORY_MAP_FAILED);
++   if (mem->kept_map) {
++      /* DZN_RECYCLE: still mapped since an earlier map, maybe of a freed allocation */
++      map = mem->kept_map;
++      dzn_stat_add(DZN_STAT_MAP_KEPT, start, size);
++   } else if (mem->recyclable) {
++      /* DZN_RECYCLE: map all of it once and keep the mapping until the memory is released */
++      if (FAILED(ID3D12Resource_Map(mem->map_res, 0, NULL, &map)))
++         return vk_error(device, VK_ERROR_MEMORY_MAP_FAILED);
++      mem->kept_map = map;
++      dzn_stat_add(DZN_STAT_MAP, start, size);
++   } else {
++      D3D12_RANGE range = { 0 };
++      range.Begin = offset;
++      range.End = offset + size;
++      if (FAILED(ID3D12Resource_Map(mem->map_res, 0, &range, &map)))
++         return vk_error(device, VK_ERROR_MEMORY_MAP_FAILED);
++      dzn_stat_add(DZN_STAT_MAP, start, size);
++   }
+ 
+    mem->map = map;
+    mem->map_size = size;
+@@ -3363,7 +3909,9 @@
+    if (!mem->map_res)
+       return;
+ 
+-   ID3D12Resource_Unmap(mem->map_res, 0, NULL);
++   /* DZN_RECYCLE: kept_map stays mapped */
++   if (!mem->kept_map)
++      ID3D12Resource_Unmap(mem->map_res, 0, NULL);
+ 
+    mem->map = NULL;
+    mem->map_size = 0;
+--- a/src/microsoft/vulkan/dzn_private.h
++++ b/src/microsoft/vulkan/dzn_private.h
+@@ -259,6 +259,8 @@
+    ID3D12CommandQueue *cmdqueue;
+    ID3D12Fence *fence;
+    uint64_t fence_point;
++   /* DZN_RECYCLE: what cmdqueue was created with, to park it for the next device */
++   D3D12_COMMAND_QUEUE_DESC d3d12_desc;
+ };
+ 
+ struct dzn_descriptor_heap {
+@@ -311,10 +313,24 @@
+    bool bindless;
+    bool support_static_samplers;
+    struct dzn_device_descriptor_heap device_heaps[NUM_POOL_TYPES];
++
++   /* DZN_RECYCLE: increases with every device, tells parked memory of old devices apart */
++   uint64_t recycle_serial;
++   bool recycle_reported;
+ };
+ 
+ void dzn_meta_finish(struct dzn_device *device);
+ 
++/* DZN_PERSISTENT_PSO_CACHE: the meta compute pipeline (kind, index) of the kept D3D12 device.
++ * lookup returns NULL when there is none or the cache is off; insert returns the pipeline to
++ * use, with a reference for the caller. */
++ID3D12PipelineState *
++dzn_persistent_meta_lookup(struct dzn_device *device, uint32_t kind, uint32_t index,
++                           ID3D12RootSignature *root_sig);
++ID3D12PipelineState *
++dzn_persistent_meta_insert(struct dzn_device *device, uint32_t kind, uint32_t index,
++                           ID3D12RootSignature *root_sig, ID3D12PipelineState *pso);
++
+ VkResult dzn_meta_init(struct dzn_device *device);
+ 
+ const struct dzn_meta_blit *
+@@ -354,6 +370,12 @@
+ 
+    /* These flags need to be added into all resources created on this heap */
+    D3D12_RESOURCE_FLAGS res_flags;
++
++   /* DZN_RECYCLE: what the D3D12 objects were made for; freeing parks them under this key */
++   bool recyclable;
++   uint8_t recycle_key[32]; /* SHA1_DIGEST_LENGTH */
++   /* DZN_RECYCLE: map_res stays mapped at this address until it is released */
++   void *kept_map;
+ };
+ 
+ enum dzn_cmd_bindpoint_dirty {
+--- a/src/microsoft/vulkan/dzn_meta.c
++++ b/src/microsoft/vulkan/dzn_meta.c
+@@ -211,6 +211,10 @@
+    }
+ 
+    desc.pRootSignature = meta->root_sig;
++   meta->pipeline_state = dzn_persistent_meta_lookup(device, 0, type.value, meta->root_sig);
++   if (meta->pipeline_state)
++      goto out;
++
+    dzn_meta_compile_shader(device, nir, &desc.CS);
+    assert(desc.CS.pShaderBytecode);
+ 
+@@ -218,6 +222,9 @@
+                                                        &IID_ID3D12PipelineState,
+                                                        (void **)&meta->pipeline_state)))
+       ret = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
++   else
++      meta->pipeline_state = dzn_persistent_meta_insert(device, 0, type.value, meta->root_sig,
++                                                        meta->pipeline_state);
+ 
+ out:
+    if (ret != VK_SUCCESS)
+@@ -391,13 +398,18 @@
+ 
+ 
+    desc.pRootSignature = meta->root_sig;
+-   dzn_meta_compile_shader(device, nir, &desc.CS);
+-
+-   if (FAILED(ID3D12Device1_CreateComputePipelineState(device->dev, &desc,
+-                                                       &IID_ID3D12PipelineState,
+-                                                       (void **)&meta->pipeline_state))) {
+-      ret = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+-      goto out;
++   meta->pipeline_state = dzn_persistent_meta_lookup(device, 1, old_index_type, meta->root_sig);
++   if (!meta->pipeline_state) {
++      dzn_meta_compile_shader(device, nir, &desc.CS);
++
++      if (FAILED(ID3D12Device1_CreateComputePipelineState(device->dev, &desc,
++                                                          &IID_ID3D12PipelineState,
++                                                          (void **)&meta->pipeline_state))) {
++         ret = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
++         goto out;
++      }
++      meta->pipeline_state = dzn_persistent_meta_insert(device, 1, old_index_type, meta->root_sig,
++                                                        meta->pipeline_state);
+    }
+ 
+    if (FAILED(ID3D12Device1_CreateCommandSignature(device->dev, &cmd_sig_desc,

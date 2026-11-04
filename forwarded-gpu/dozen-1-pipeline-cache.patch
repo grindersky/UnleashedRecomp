@@ -1,0 +1,538 @@
+--- a/src/microsoft/vulkan/dzn_device.c
++++ b/src/microsoft/vulkan/dzn_device.c
+@@ -28,6 +28,7 @@
+ #include "vk_cmd_enqueue_entrypoints.h"
+ #include "vk_debug_report.h"
+ #include "vk_format.h"
++#include "vk_pipeline_cache.h"
+ #include "vk_sync_dummy.h"
+ #include "vk_util.h"
+ 
+@@ -38,6 +39,8 @@
+ #include "util/macros.h"
+ #include "util/mesa-sha1.h"
+ #include "util/u_dl.h"
++#include "util/hash_table.h"
++#include "util/simple_mtx.h"
+ 
+ #include "util/driconf.h"
+ 
+@@ -195,6 +198,336 @@
+    { NULL, 0 }
+ };
+ 
++
++/* Process-wide cache of D3D12 root signatures and pipeline states, on with DZN_PERSISTENT_PSO_CACHE=1
++ * (set by ~/libtas-gpu/kumquat.sh). gfxstream (kumquat, the GPU host of libTAS savestates) destroys and
++ * recreates the whole Vulkan instance on every snapshot restore, which made the driver compile every
++ * pipeline again (~7 of 11 s per load in Unleashed Recompiled). With the cache every Vulkan instance
++ * gets the same D3D12 device for an adapter (each instance has its own device factory, which would make
++ * a new device), and identical root signatures and pipeline states come back as the same objects.
++ * It also turns on Mesa's disk cache for the DXIL compiles. Nothing in the cache is ever released. */
++DEBUG_GET_ONCE_BOOL_OPTION(dzn_persistent_pso_cache, "DZN_PERSISTENT_PSO_CACHE", false)
++
++static simple_mtx_t dzn_persistent_lock = SIMPLE_MTX_INITIALIZER;
++static struct hash_table *dzn_persistent_objects;
++static struct {
++   LUID luid;
++   ID3D12Device4 *dev;
++} dzn_persistent_devs[8];
++static unsigned dzn_persistent_dev_count;
++static unsigned dzn_persistent_hits, dzn_persistent_misses;
++
++static uint32_t
++dzn_persistent_key_hash(const void *key)
++{
++   uint32_t h;
++   memcpy(&h, key, sizeof(h));
++   return h;
++}
++
++static bool
++dzn_persistent_key_equal(const void *a, const void *b)
++{
++   return !memcmp(a, b, SHA1_DIGEST_LENGTH);
++}
++
++/* Returns the kept D3D12 device of the adapter with a reference for the caller, or NULL */
++static ID3D12Device4 *
++dzn_persistent_get_device(const LUID *luid)
++{
++   if (!debug_get_option_dzn_persistent_pso_cache())
++      return NULL;
++
++   ID3D12Device4 *dev = NULL;
++   simple_mtx_lock(&dzn_persistent_lock);
++   for (unsigned i = 0; i < dzn_persistent_dev_count; i++) {
++      if (!memcmp(&dzn_persistent_devs[i].luid, luid, sizeof(*luid))) {
++         dev = dzn_persistent_devs[i].dev;
++         ID3D12Device4_AddRef(dev);
++      }
++   }
++   simple_mtx_unlock(&dzn_persistent_lock);
++   return dev;
++}
++
++/* Keeps a reference to the adapter's new D3D12 device, for the next instances */
++static void
++dzn_persistent_keep_device(const LUID *luid, ID3D12Device4 *dev)
++{
++   if (!debug_get_option_dzn_persistent_pso_cache())
++      return;
++
++   simple_mtx_lock(&dzn_persistent_lock);
++   if (!dzn_persistent_objects)
++      dzn_persistent_objects =
++         _mesa_hash_table_create(NULL, dzn_persistent_key_hash, dzn_persistent_key_equal);
++   if (dzn_persistent_objects && dzn_persistent_dev_count < ARRAY_SIZE(dzn_persistent_devs)) {
++      ID3D12Device4_AddRef(dev);
++      dzn_persistent_devs[dzn_persistent_dev_count].luid = *luid;
++      dzn_persistent_devs[dzn_persistent_dev_count].dev = dev;
++      dzn_persistent_dev_count++;
++      fprintf(stderr, "dzn: persistent pipeline cache on, keeping D3D12 device %p\n", (void *)dev);
++   }
++   simple_mtx_unlock(&dzn_persistent_lock);
++}
++
++/* True when the device is a kept one: its objects can be cached (they never get released). */
++static bool
++dzn_persistent_usable(struct dzn_device *device)
++{
++   if (!debug_get_option_dzn_persistent_pso_cache())
++      return false;
++
++   bool usable = false;
++   simple_mtx_lock(&dzn_persistent_lock);
++   for (unsigned i = 0; i < dzn_persistent_dev_count; i++)
++      usable |= (void *)dzn_persistent_devs[i].dev == (void *)device->dev;
++   simple_mtx_unlock(&dzn_persistent_lock);
++   return usable;
++}
++
++/* Returns the cached object with a reference for the caller, or NULL */
++static IUnknown *
++dzn_persistent_lookup(const uint8_t *key)
++{
++   simple_mtx_lock(&dzn_persistent_lock);
++   struct hash_entry *he = _mesa_hash_table_search(dzn_persistent_objects, key);
++   IUnknown *obj = he ? he->data : NULL;
++   if (obj) {
++      IUnknown_AddRef(obj);
++      dzn_persistent_hits++;
++   } else {
++      dzn_persistent_misses++;
++   }
++   simple_mtx_unlock(&dzn_persistent_lock);
++   return obj;
++}
++
++/* Keeps a reference to obj in the cache and returns obj; if another thread stored an object
++ * for the key first, releases obj and returns that one (with a reference for the caller). */
++static IUnknown *
++dzn_persistent_insert(const uint8_t *key, IUnknown *obj)
++{
++   simple_mtx_lock(&dzn_persistent_lock);
++   struct hash_entry *he = _mesa_hash_table_search(dzn_persistent_objects, key);
++   if (he) {
++      IUnknown *existing = he->data;
++      IUnknown_AddRef(existing);
++      simple_mtx_unlock(&dzn_persistent_lock);
++      IUnknown_Release(obj);
++      return existing;
++   }
++   uint8_t *stored_key = malloc(SHA1_DIGEST_LENGTH);
++   if (stored_key) {
++      memcpy(stored_key, key, SHA1_DIGEST_LENGTH);
++      IUnknown_AddRef(obj);
++      _mesa_hash_table_insert(dzn_persistent_objects, stored_key, obj);
++   }
++   simple_mtx_unlock(&dzn_persistent_lock);
++   return obj;
++}
++
++#define PSO_HASH(ctx, value) _mesa_sha1_update(ctx, &(value), sizeof(value))
++
++static void
++dzn_pso_hash_stencil_op(struct mesa_sha1 *ctx, const D3D12_DEPTH_STENCILOP_DESC *op)
++{
++   PSO_HASH(ctx, op->StencilFailOp);
++   PSO_HASH(ctx, op->StencilDepthFailOp);
++   PSO_HASH(ctx, op->StencilPassOp);
++   PSO_HASH(ctx, op->StencilFunc);
++}
++
++static void
++dzn_pso_hash_stencil_op1(struct mesa_sha1 *ctx, const D3D12_DEPTH_STENCILOP_DESC1 *op)
++{
++   PSO_HASH(ctx, op->StencilFailOp);
++   PSO_HASH(ctx, op->StencilDepthFailOp);
++   PSO_HASH(ctx, op->StencilPassOp);
++   PSO_HASH(ctx, op->StencilFunc);
++   PSO_HASH(ctx, op->StencilReadMask);
++   PSO_HASH(ctx, op->StencilWriteMask);
++}
++
++/* Hashes everything a pipeline state stream describes, following its pointers (shader code, input
++ * layout, view instancing). Structs with padding are hashed field by field. Root signatures come
++ * from the cache too, so their pointers identify them. Returns false for subobject types it does
++ * not know: such a pipeline is not cached. */
++static bool
++dzn_pso_stream_key(const void *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *stream, uint8_t *key)
++{
++   struct mesa_sha1 ctx;
++   _mesa_sha1_init(&ctx);
++   _mesa_sha1_update(&ctx, "PipelineState", 13);
++   _mesa_sha1_update(&ctx, &dev, sizeof(dev));
++
++   const uint8_t *base = stream->pPipelineStateSubobjectStream;
++   size_t offset = 0;
++   while (true) {
++      offset = ALIGN_POT(offset, alignof(void *));
++      if (offset >= stream->SizeInBytes)
++         break;
++      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
++      memcpy(&type, base + offset, sizeof(type));
++      PSO_HASH(&ctx, type);
++
++      /* Same layout as d3d12_pipeline_state_stream_new_desc: struct { type; T desc; } */
++#define PSO_SUBOBJECT(T, var)                                                              \
++      const size_t var##_off = ALIGN_POT(sizeof(type), alignof(T));                        \
++      const size_t var##_size =                                                            \
++         ALIGN_POT(var##_off + sizeof(T), MAX2(alignof(T), alignof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))); \
++      if (offset + var##_size > stream->SizeInBytes)                                       \
++         return false;                                                                     \
++      const T *var = (const T *)(base + offset + var##_off);                               \
++      offset += var##_size
++
++      switch (type) {
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: {
++         PSO_SUBOBJECT(D3D12_SHADER_BYTECODE, bc);
++         uint64_t length = bc->BytecodeLength;
++         PSO_HASH(&ctx, length);
++         if (length && !bc->pShaderBytecode)
++            return false;
++         if (length)
++            _mesa_sha1_update(&ctx, bc->pShaderBytecode, length);
++         break;
++      }
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: {
++         PSO_SUBOBJECT(ID3D12RootSignature *, root_sig);
++         PSO_HASH(&ctx, *root_sig);
++         break;
++      }
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
++         PSO_SUBOBJECT(D3D12_INPUT_LAYOUT_DESC, layout);
++         PSO_HASH(&ctx, layout->NumElements);
++         for (UINT i = 0; i < layout->NumElements; i++) {
++            const D3D12_INPUT_ELEMENT_DESC *e = &layout->pInputElementDescs[i];
++            if (e->SemanticName)
++               _mesa_sha1_update(&ctx, e->SemanticName, strlen(e->SemanticName) + 1);
++            PSO_HASH(&ctx, e->SemanticIndex);
++            PSO_HASH(&ctx, e->Format);
++            PSO_HASH(&ctx, e->InputSlot);
++            PSO_HASH(&ctx, e->AlignedByteOffset);
++            PSO_HASH(&ctx, e->InputSlotClass);
++            PSO_HASH(&ctx, e->InstanceDataStepRate);
++         }
++         break;
++      }
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
++         PSO_SUBOBJECT(D3D12_VIEW_INSTANCING_DESC, vi);
++         PSO_HASH(&ctx, vi->ViewInstanceCount);
++         PSO_HASH(&ctx, vi->Flags);
++         if (vi->ViewInstanceCount && !vi->pViewInstanceLocations)
++            return false;
++         for (UINT i = 0; i < vi->ViewInstanceCount; i++) {
++            PSO_HASH(&ctx, vi->pViewInstanceLocations[i].ViewportArrayIndex);
++            PSO_HASH(&ctx, vi->pViewInstanceLocations[i].RenderTargetArrayIndex);
++         }
++         break;
++      }
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: {
++         PSO_SUBOBJECT(D3D12_BLEND_DESC, blend);
++         PSO_HASH(&ctx, blend->AlphaToCoverageEnable);
++         PSO_HASH(&ctx, blend->IndependentBlendEnable);
++         for (unsigned i = 0; i < ARRAY_SIZE(blend->RenderTarget); i++) {
++            const D3D12_RENDER_TARGET_BLEND_DESC *rt = &blend->RenderTarget[i];
++            PSO_HASH(&ctx, rt->BlendEnable);
++            PSO_HASH(&ctx, rt->LogicOpEnable);
++            PSO_HASH(&ctx, rt->SrcBlend);
++            PSO_HASH(&ctx, rt->DestBlend);
++            PSO_HASH(&ctx, rt->BlendOp);
++            PSO_HASH(&ctx, rt->SrcBlendAlpha);
++            PSO_HASH(&ctx, rt->DestBlendAlpha);
++            PSO_HASH(&ctx, rt->BlendOpAlpha);
++            PSO_HASH(&ctx, rt->LogicOp);
++            PSO_HASH(&ctx, rt->RenderTargetWriteMask);
++         }
++         break;
++      }
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
++         PSO_SUBOBJECT(D3D12_DEPTH_STENCIL_DESC1, ds);
++         PSO_HASH(&ctx, ds->DepthEnable);
++         PSO_HASH(&ctx, ds->DepthWriteMask);
++         PSO_HASH(&ctx, ds->DepthFunc);
++         PSO_HASH(&ctx, ds->StencilEnable);
++         PSO_HASH(&ctx, ds->StencilReadMask);
++         PSO_HASH(&ctx, ds->StencilWriteMask);
++         dzn_pso_hash_stencil_op(&ctx, &ds->FrontFace);
++         dzn_pso_hash_stencil_op(&ctx, &ds->BackFace);
++         PSO_HASH(&ctx, ds->DepthBoundsTestEnable);
++         break;
++      }
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
++         PSO_SUBOBJECT(D3D12_DEPTH_STENCIL_DESC2, ds);
++         PSO_HASH(&ctx, ds->DepthEnable);
++         PSO_HASH(&ctx, ds->DepthWriteMask);
++         PSO_HASH(&ctx, ds->DepthFunc);
++         PSO_HASH(&ctx, ds->StencilEnable);
++         dzn_pso_hash_stencil_op1(&ctx, &ds->FrontFace);
++         dzn_pso_hash_stencil_op1(&ctx, &ds->BackFace);
++         PSO_HASH(&ctx, ds->DepthBoundsTestEnable);
++         break;
++      }
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
++         PSO_SUBOBJECT(struct D3D12_RT_FORMAT_ARRAY, rts);
++         PSO_HASH(&ctx, rts->NumRenderTargets);
++         for (UINT i = 0; i < rts->NumRenderTargets && i < ARRAY_SIZE(rts->RTFormats); i++)
++            PSO_HASH(&ctx, rts->RTFormats[i]);
++         break;
++      }
++      /* Plain structs of 4-byte fields */
++#define PSO_PLAIN(id, T)                                    \
++      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_##id: {      \
++         PSO_SUBOBJECT(T, plain);                           \
++         _mesa_sha1_update(&ctx, plain, sizeof(T));         \
++         break;                                             \
++      }
++      PSO_PLAIN(PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE)
++      PSO_PLAIN(IB_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)
++      PSO_PLAIN(RASTERIZER, D3D12_RASTERIZER_DESC)
++      PSO_PLAIN(RASTERIZER1, D3D12_RASTERIZER_DESC1)
++      PSO_PLAIN(RASTERIZER2, D3D12_RASTERIZER_DESC2)
++      PSO_PLAIN(SAMPLE_DESC, DXGI_SAMPLE_DESC)
++      PSO_PLAIN(SAMPLE_MASK, UINT)
++      PSO_PLAIN(FLAGS, D3D12_PIPELINE_STATE_FLAGS)
++      PSO_PLAIN(DEPTH_STENCIL_FORMAT, DXGI_FORMAT)
++      PSO_PLAIN(NODE_MASK, UINT)
++#undef PSO_PLAIN
++      default:
++         return false;
++      }
++#undef PSO_SUBOBJECT
++   }
++   _mesa_sha1_final(&ctx, key);
++   return true;
++}
++
++HRESULT
++dzn_device_create_pipeline_state(struct dzn_device *device,
++                                 const D3D12_PIPELINE_STATE_STREAM_DESC *stream,
++                                 ID3D12PipelineState **out)
++{
++   uint8_t key[SHA1_DIGEST_LENGTH];
++   bool persistent = dzn_persistent_usable(device) && dzn_pso_stream_key(device->dev, stream, key);
++   if (persistent) {
++      *out = (ID3D12PipelineState *)dzn_persistent_lookup(key);
++      if (*out)
++         return S_OK;
++   }
++
++   HRESULT hres = ID3D12Device4_CreatePipelineState(device->dev, stream,
++                                                    &IID_ID3D12PipelineState,
++                                                    (void **)out);
++   if (persistent && SUCCEEDED(hres))
++      *out = (ID3D12PipelineState *)dzn_persistent_insert(key, (IUnknown *)*out);
++   return hres;
++}
++
+ static void
+ dzn_physical_device_destroy(struct vk_physical_device *physical)
+ {
+@@ -220,6 +553,8 @@
+       IUnknown_Release(pdev->adapter);
+ 
+    dzn_wsi_finish(pdev);
++   if (pdev->vk.disk_cache)
++      disk_cache_destroy(pdev->vk.disk_cache);
+    vk_physical_device_finish(&pdev->vk);
+    vk_free(&instance->vk.alloc, pdev);
+ }
+@@ -1133,10 +1468,15 @@
+ 
+    pdev->vk.pipeline_cache_import_ops = dzn_pipeline_cache_import_ops;
+ 
+-   pdev->dev = d3d12_create_device(dzn_instance->d3d12_mod,
+-                                   pdev->adapter,
+-                                   dzn_instance->factory,
+-                                   !dzn_instance->dxil_validator);
++   pdev->dev = dzn_persistent_get_device(&pdev->desc.adapter_luid);
++   if (!pdev->dev) {
++      pdev->dev = d3d12_create_device(dzn_instance->d3d12_mod,
++                                      pdev->adapter,
++                                      dzn_instance->factory,
++                                      !dzn_instance->dxil_validator);
++      if (pdev->dev)
++         dzn_persistent_keep_device(&pdev->desc.adapter_luid, pdev->dev);
++   }
+    if (!pdev->dev) {
+       list_del(&pdev->vk.link);
+       dzn_physical_device_destroy(&pdev->vk);
+@@ -1154,6 +1494,13 @@
+    dzn_physical_device_cache_caps(pdev);
+    dzn_physical_device_init_memory(pdev);
+    dzn_physical_device_init_uuids(pdev);
++   if (debug_get_option_dzn_persistent_pso_cache()) {
++      /* Shaders compiled to DXIL go to Mesa's disk cache (MESA_SHADER_CACHE_DIR) */
++      char uuid[VK_UUID_SIZE * 2 + 1];
++      for (unsigned i = 0; i < VK_UUID_SIZE; i++)
++         snprintf(uuid + i * 2, 3, "%02x", pdev->pipeline_cache_uuid[i]);
++      pdev->vk.disk_cache = disk_cache_create("dzn", uuid, 0);
++   }
+ 
+    if (dzn_instance->debug_flags & DZN_DEBUG_MULTIVIEW)
+       pdev->options3.ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+@@ -2184,6 +2531,14 @@
+    dzn_device_query_finish(device);
+    dzn_meta_finish(device);
+ 
++   if (debug_get_option_dzn_persistent_pso_cache()) {
++      simple_mtx_lock(&dzn_persistent_lock);
++      fprintf(stderr, "dzn: persistent pipeline cache: %u hits, %u misses, %u objects\n",
++              dzn_persistent_hits, dzn_persistent_misses,
++              dzn_persistent_objects ? dzn_persistent_objects->entries : 0);
++      simple_mtx_unlock(&dzn_persistent_lock);
++   }
++
+    dzn_foreach_pool_type(type) {
+       dzn_descriptor_heap_finish(&device->device_heaps[type].heap);
+       util_dynarray_fini(&device->device_heaps[type].slot_freelist);
+@@ -2208,6 +2563,9 @@
+    if (device->dev13)
+       ID3D12Device1_Release(device->dev13);
+ 
++   if (device->vk.mem_cache)
++      vk_pipeline_cache_destroy(device->vk.mem_cache, NULL);
++
+    vk_device_finish(&device->vk);
+    vk_free2(&instance->vk.alloc, pAllocator, device);
+ }
+@@ -2290,6 +2648,12 @@
+    device->vk.command_dispatch_table = &device->cmd_dispatch;
+    device->vk.check_status = dzn_device_check_status;
+ 
++   if (debug_get_option_dzn_persistent_pso_cache()) {
++      /* Pipelines created without a VkPipelineCache use this one, backed by the disk cache */
++      struct vk_pipeline_cache_create_info cache_info = { 0 };
++      device->vk.mem_cache = vk_pipeline_cache_create(&device->vk, &cache_info, NULL);
++   }
++
+    device->dev = pdev->dev;
+ 
+    ID3D12Device1_AddRef(device->dev);
+@@ -2457,6 +2821,22 @@
+    if (!sig)
+       return NULL;
+ 
++   uint8_t key[SHA1_DIGEST_LENGTH];
++   bool persistent = dzn_persistent_usable(device);
++   if (persistent) {
++      struct mesa_sha1 ctx;
++      _mesa_sha1_init(&ctx);
++      _mesa_sha1_update(&ctx, "RootSignature", 13);
++      _mesa_sha1_update(&ctx, &device->dev, sizeof(device->dev));
++      _mesa_sha1_update(&ctx, ID3D10Blob_GetBufferPointer(sig), ID3D10Blob_GetBufferSize(sig));
++      _mesa_sha1_final(&ctx, key);
++      ID3D12RootSignature *cached = (ID3D12RootSignature *)dzn_persistent_lookup(key);
++      if (cached) {
++         ID3D10Blob_Release(sig);
++         return cached;
++      }
++   }
++
+    ID3D12RootSignature *root_sig = NULL;
+    ID3D12Device1_CreateRootSignature(device->dev, 0,
+                                      ID3D10Blob_GetBufferPointer(sig),
+@@ -2464,6 +2844,8 @@
+                                      &IID_ID3D12RootSignature,
+                                      (void **)&root_sig);
+    ID3D10Blob_Release(sig);
++   if (persistent && root_sig)
++      root_sig = (ID3D12RootSignature *)dzn_persistent_insert(key, (IUnknown *)root_sig);
+    return root_sig;
+ }
+ 
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -1869,6 +1869,9 @@
+    const VkPipelineRenderingCreateInfo *ri = (const VkPipelineRenderingCreateInfo *)
+       vk_find_struct_const(pCreateInfo, PIPELINE_RENDERING_CREATE_INFO);
+    VK_FROM_HANDLE(vk_pipeline_cache, pcache, cache);
++   /* NULL unless DZN_PERSISTENT_PSO_CACHE is set */
++   if (!pcache)
++      pcache = device->vk.mem_cache;
+    VK_FROM_HANDLE(vk_render_pass, pass, pCreateInfo->renderPass);
+    VK_FROM_HANDLE(dzn_pipeline_layout, layout, pCreateInfo->layout);
+    uint32_t color_count = 0;
+@@ -2057,9 +2060,7 @@
+    }
+ 
+    if (!pipeline->variants) {
+-      hres = ID3D12Device4_CreatePipelineState(device->dev, stream_desc,
+-                                               &IID_ID3D12PipelineState,
+-                                               (void **)&pipeline->base.state);
++      hres = dzn_device_create_pipeline_state(device, stream_desc, &pipeline->base.state);
+       if (FAILED(hres)) {
+          ret = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+          goto out;
+@@ -2236,9 +2237,7 @@
+ 
+       update_stencil_state(pdev, pipeline, stream_buf, &masked_key);
+ 
+-      ASSERTED HRESULT hres = ID3D12Device4_CreatePipelineState(device->dev, &stream_desc,
+-                                                                &IID_ID3D12PipelineState,
+-                                                                (void**)(&variant->state));
++      ASSERTED HRESULT hres = dzn_device_create_pipeline_state(device, &stream_desc, &variant->state);
+       assert(!FAILED(hres));
+       he = _mesa_hash_table_insert(pipeline->variants, &variant->key, variant);
+       assert(he);
+@@ -2589,6 +2588,9 @@
+ {
+    VK_FROM_HANDLE(dzn_pipeline_layout, layout, pCreateInfo->layout);
+    VK_FROM_HANDLE(vk_pipeline_cache, pcache, cache);
++   /* NULL unless DZN_PERSISTENT_PSO_CACHE is set */
++   if (!pcache)
++      pcache = device->vk.mem_cache;
+ 
+    struct dzn_compute_pipeline *pipeline =
+       vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*pipeline), 8,
+@@ -2613,9 +2615,7 @@
+    if (ret != VK_SUCCESS)
+       goto out;
+ 
+-   if (FAILED(ID3D12Device4_CreatePipelineState(device->dev, &stream_desc,
+-                                                &IID_ID3D12PipelineState,
+-                                                (void **)&pipeline->base.state)))
++   if (FAILED(dzn_device_create_pipeline_state(device, &stream_desc, &pipeline->base.state)))
+       ret = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+ out:
+--- a/src/microsoft/vulkan/dzn_private.h
++++ b/src/microsoft/vulkan/dzn_private.h
+@@ -321,6 +321,11 @@
+ dzn_meta_blits_get_context(struct dzn_device *device,
+                            const struct dzn_meta_blit_key *key);
+ 
++HRESULT
++dzn_device_create_pipeline_state(struct dzn_device *device,
++                                 const D3D12_PIPELINE_STATE_STREAM_DESC *stream,
++                                 ID3D12PipelineState **out);
++
+ ID3D12RootSignature *
+ dzn_device_create_root_sig(struct dzn_device *device,
+                            const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc);
