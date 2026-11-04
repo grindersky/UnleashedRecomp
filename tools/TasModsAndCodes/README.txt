@@ -28,6 +28,9 @@ Using it
   Options are saved in the mod's own folder, so Hedge Mod Manager shows the same ones.
 - "Copy Hedge Mod Manager's mods" takes Hedge Mod Manager's mod list and order (not its codes).
 - Tick the codes on the right.
+  Note on the collision view codes (Enable Stage/Event/Object Collision Debug View): ticked,
+  the views start hidden when libTAS is started without the TAS HUD (libTASGPU, libTASdozen)
+  and shown when it's started with it (libTASGPUHUD, libTASdozenHUD). F11 shows or hides them.
 - Press Save. The game reads mods and codes only when it starts: restart it after saving.
 - "Save current as..." keeps a named setup (for example per movie) that "Load" brings back.
 

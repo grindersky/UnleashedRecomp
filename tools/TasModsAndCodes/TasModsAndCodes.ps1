@@ -956,7 +956,8 @@ function Import-CodeInfo {
     }
     $script:CodeInfo = $info
 }
-$CollisionViewNote = "Barely changes sync, but it can: a movie recorded with this on desynced by one frame at a stage load when played with it off. " +
+$CollisionViewNote = "Ticked, the view still starts hidden in libTAS without the TAS HUD (libTASGPU, libTASdozen) and shown with it (libTASGPUHUD, libTASdozenHUD). F11 shows or hides it.`n" +
+    "Barely changes sync, but it can: a movie recorded with this on desynced by one frame at a stage load when played with it off. " +
     "To be safe, keep it exactly as it was when recording, even when encoding. To hide the views in an encode, press F11 in the movie instead: F11 doesn't affect sync."
 $SyncNotes = @{
     EnableStageCollisionDebugView = $CollisionViewNote
