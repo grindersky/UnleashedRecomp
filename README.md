@@ -11,8 +11,33 @@
 
 This branch adds a TAS mode to Unleashed Recompiled for [libTAS](https://github.com/clementgallet/libTAS) on Linux, and on Windows through WSL: deterministic movie playback, savestates, correct audio at any libTAS frame rate, libTAS's on-screen display and Stop button, and an optional HUD for TASing. Without the TAS mode turned on, the game runs like the normal port.
 
-> [!TIP]
-> Under WSL, libTAS runs the game on the CPU, which is slow (about 12 fps when fast-forwarding). Once the game is set up, follow the [dozen guide](DOZEN.md) to play back and encode movies on your graphics card instead, several times faster.
+## 🚀 Savestates on your graphics card
+
+> [!IMPORTANT]
+> **TAS on your graphics card, savestates included.** Normally, libTAS savestates only work while the game draws on the CPU, at about 12 fps under WSL. With libTAS's new **Forwarded GPU** rendering, the TAS mode runs on your graphics card *and* saves and loads states in under a second.
+>
+> | On an RTX 5070, Rooftop Run | |
+> |---|---|
+> | Saving a state | about 0.9 s |
+> | Loading a state | about 0.7-0.9 s |
+> | GPU state saved per slot (kept in RAM) | about 140 MB |
+>
+> **➜ Set it up with the [Forwarded GPU guide](FORWARDED_GPU.md)** once the game runs (steps 1-7 below). Forwarded GPU is in development in [jakobhellermann's libTAS](https://github.com/jakobhellermann/libTAS) and isn't in a libTAS release yet: the guide builds it, with fixes for WSL and faster savestates.
+
+Three ways to have libTAS draw the game; movies play back the same with all of them:
+
+| | Speed | Savestates | Use it to | Set up with |
+|---|---|---|---|---|
+| **Forwarded GPU** | graphics card | ✅ under a second | make TASes, play back, encode | [Forwarded GPU guide](FORWARDED_GPU.md) |
+| **dozen** | graphics card (82 fps fast-forwarding) | ❌ loading one crashes the game | play back, encode | [dozen guide](DOZEN.md) |
+| **Software rendering** (lavapipe) | CPU (12 fps fast-forwarding) | ✅ | make TASes | step 7 below |
+
+## What's included
+
+- **TAS mode** (`UNLEASHED_TAS_MODE=1`): deterministic playback at any libTAS frame rate, savestates, and libTAS's OSD and Stop button.
+- **TAS HUD** (`UNLEASHED_TAS_HUD=1`): speed, state, what each button would do on this frame, out-of-control and quick step countdowns, the stick's M-Speed and D-Speed zones, hint ring timers, a radar and a TAS camera. See [Options](#options).
+- **Collision views** with Sonic's and the enemies' collision drawn over them. See [Mods and codes](#mods-and-codes).
+- **[TAS Mods and Codes](https://github.com/grindersky/UnleashedRecomp/releases/latest)**: a Windows window to pick the mods and codes the WSL build loads. **[Download the zip](https://github.com/grindersky/UnleashedRecomp/releases/latest/download/TasModsAndCodes.zip)**.
 
 ## Setting Up the TAS Version
 
@@ -79,13 +104,10 @@ Choose `out/build/linux-release/UnleashedRecomp/UnleashedRecomp` as the game exe
 - **Video → Force software rendering**: on. The game then draws with lavapipe, Mesa's renderer that runs on the CPU, which the TAS mode was made and tested with, savestates included.
 - **Input → Mouse support**: off, as the game doesn't use the mouse. **Joystick support**: 1 controller, for analog stick inputs.
 
-> [!TIP]
-> Software rendering is slow. To play back and encode movies on your graphics card, several times faster, set up dozen with the [dozen guide](DOZEN.md). Keep software rendering on while making TASes: loading a libTAS savestate on dozen crashes the game.
-
-> [!NOTE]
-> Savestates on the graphics card are in development in [jakobhellermann's libTAS](https://github.com/jakobhellermann/libTAS): its "Forwarded GPU" rendering keeps the GPU's state in a separate process that it saves along with the game. It isn't part of a libTAS release yet, but you can build it: see the [Forwarded GPU guide](FORWARDED_GPU.md). Saves and loads then take under a second, on your graphics card.
-
 Start the game from libTAS and TAS as usual.
+
+> [!TIP]
+> Software rendering is slow. **To TAS on your graphics card, savestates included, follow the [Forwarded GPU guide](FORWARDED_GPU.md)** next. To only play back and encode on it, the [dozen guide](DOZEN.md) is shorter.
 
 ### Updating the TAS version
 
@@ -124,7 +146,7 @@ Set these in front of `libTAS`, like `UNLEASHED_TAS_MODE=1`:
 The game loads mods and Hedge Mod Manager codes through two files, which Hedge Mod Manager usually writes. In WSL, you don't need Hedge Mod Manager: write them yourself. Edit them while the game is closed, as it only reads them when it starts.
 
 > [!TIP]
-> On Windows, [TAS Mods and Codes](tools/TasModsAndCodes/README.txt) does this for you: a window to tick and order the mods and codes, configure mods, copy Hedge Mod Manager's mod list, and change the game's graphics settings. Copy the `tools/TasModsAndCodes` folder to Windows (it doesn't start from inside WSL's own files), then double-click `TAS Mods and Codes.cmd`. It writes `ModsDB.ini`; `cpkredir.ini` below is still needed.
+> On Windows, [TAS Mods and Codes](tools/TasModsAndCodes/README.txt) does this for you: a window to tick and order the mods and codes, configure mods, copy Hedge Mod Manager's mod list, and change the game's graphics settings. **[Download the zip](https://github.com/grindersky/UnleashedRecomp/releases/latest/download/TasModsAndCodes.zip)**, extract it anywhere on Windows and double-click `TAS Mods and Codes.cmd` (or copy `tools/TasModsAndCodes` from this branch to Windows: it doesn't start from inside WSL's own files). It writes `ModsDB.ini`; `cpkredir.ini` below is still needed.
 
 **`~/.config/UnleashedRecomp/cpkredir.ini`** turns mods and codes on, and says where to find the list of them. Write the full path, as `~` doesn't work there:
 
@@ -176,7 +198,8 @@ Graphics settings (resolution, anti-aliasing, shadow resolution, motion blur...)
 
 Movies recorded at frame rates other than 60 fps with a version from before 2026-09-28 will probably desync, and so may movies recorded before 2026-10-26 with the game's FPS option different from libTAS's frame rate.
 
-### Faster playback and encoding
+### On your graphics card
 
-To play back and encode movies on your graphics card instead of the CPU under WSL, see the [dozen guide](DOZEN.md). It makes playback and encoding several times faster. To also make TASes on your graphics card, with savestates, see the [Forwarded GPU guide](FORWARDED_GPU.md).
+- **TAS with savestates on your graphics card**: the [Forwarded GPU guide](FORWARDED_GPU.md). Saves and loads take under a second.
+- **Only play back and encode on it**: the [dozen guide](DOZEN.md), several times faster than software rendering.
 
