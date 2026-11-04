@@ -187,12 +187,12 @@ CodeCount=2
 - **Codes**: list them under `[Codes]` as `Code0`, `Code1` and so on, with `CodeCount` set to one more than the highest number. To turn a code off without renumbering the others, put a `;` in front of its line. The names must be written exactly as below:
 
   `AllowCancellingUnleash`, `DisableAutoSaveWarning`, `DisableBoostFilter`, `DisableDLCIcon`, `DisableDPadMovement`, `DisableDWMRoundedCorners`, `DisableLowResolutionFontOnCustomUI`, `EnableEventCollisionDebugView`, `EnableGIMipLevelDebugView`, `EnableObjectCollisionDebugView`, `EnableStageCollisionDebugView`, `FixEggmanlandUsingEventGalleryTransition`, `FixUnleashOutOfControlDrain`, `HomingAttackOnJump`, `HUDToggleKey`, `RestoreReadyGoSkip`, `SaveScoreAtCheckpoints`, `SkipIntroLogos`, `UseAlternateTitle`, `UseArrowsForTimeOfDayTransition`, `UseOfficialTitleOnTitleBar`
-- **Collision views**: `EnableStageCollisionDebugView` shows the stage's collision instead of its models, `EnableEventCollisionDebugView` the event triggers, and `EnableObjectCollisionDebugView` the objects' collision. Press F11 to switch between the views and the level as it normally looks. With the stage collision view, the grind rails' collision is drawn too (orange), and with any of the three:
+- **Collision views**: `EnableStageCollisionDebugView` shows the stage's collision instead of its models, `EnableEventCollisionDebugView` the event triggers, and `EnableObjectCollisionDebugView` the objects' collision. Press F11 to switch between the views and the level as it normally looks. Effects like day Sonic's jump ball still show with the stage collision view on. With the stage collision view, the grind rails' collision is drawn too (orange), and with any of the three:
   - the player's collision that's on: his body (cyan), what touches rings, objects and triggers (magenta, green while day Sonic attacks, like when he slides), and day Sonic's path collision (blue), which most likely touches paths like the grind rails,
   - an arrow at his feet, pointing where he faces,
   - where the views don't already show them, the enemies' collision (red) and the goal ring's (white).
 
-  These are hidden behind walls; press F12 to switch to drawing them over everything, walls included, and back. Under libTAS, F11 and F12 are recorded into the movie like the game's keys. In TAS mode, the views start shown only with `UNLEASHED_TAS_HUD=1`, and the level starts as it normally looks without it: a movie without F11 presses then shows the views with the HUD and the normal level without it. Either way it plays back the same, as F11 only changes what's drawn. Turning the codes themselves off does change sync: keep them as they were when the movie was recorded.
+  These are hidden behind walls; press F12 to switch to drawing them over everything, walls included, and back. Under libTAS, F11 and F12 are recorded into the movie like the game's keys. In TAS mode, the views start shown only with `UNLEASHED_TAS_HUD=1` (for example `libTASGPUHUD` or `libTASdozenHUD` from the guides), and the level starts as it normally looks without it (`libTASGPU`, `libTASdozen`): a movie without F11 presses then shows the views with the HUD and the normal level without it. Either way it plays back the same, as F11 only changes what's drawn. Turning the codes themselves off does change sync: keep them as they were when the movie was recorded.
 - **Ready... GO! skip**: `RestoreReadyGoSkip` brings back a glitch the title update fixed. Pause during a stage's in-game cutscene and restart: Sonic can move during Ready... GO!
 
 ### Keeping movies in sync
@@ -202,7 +202,7 @@ libTAS doesn't save everything that matters in a movie. Play movies back with:
 - the same mods, mod options and codes enabled as when the movie was recorded (see [Mods and codes](#mods-and-codes)),
 - the same save.
 
-Graphics settings (resolution, anti-aliasing, shadow resolution, motion blur...) and the renderer (lavapipe, dozen) don't affect sync: TAS with fast settings, encode with high ones. The game's FPS option doesn't matter either: in TAS mode, the game steps by libTAS's frame rate.
+Graphics settings (resolution, anti-aliasing, shadow resolution, motion blur...) and the renderer (software rendering, dozen, Forwarded GPU) don't affect sync: TAS with fast settings, encode with high ones. The game's FPS option doesn't matter either: in TAS mode, the game steps by libTAS's frame rate.
 
 Movies recorded at frame rates other than 60 fps with a version from before 2026-09-28 will probably desync, and so may movies recorded before 2026-10-26 with the game's FPS option different from libTAS's frame rate.
 
