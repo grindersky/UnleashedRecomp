@@ -69,7 +69,8 @@ const char* TasCamera::GetModeName()
 }
 
 // What the game camera had after an update, and the TAS view made for it. The GPU upload can come a frame after the
-// update, so the last few are kept and an upload is matched to the one it equals.
+// update, so the last few are kept and an upload is matched to the one it equals. The motion blur also needs the
+// previous frame's (its g_MtxPrevView), so there are enough for a frame or two more.
 struct ViewRecord
 {
     std::array<float, 16> GameView{};
@@ -80,7 +81,7 @@ struct ViewRecord
 };
 
 static std::mutex g_mutex;
-static std::array<ViewRecord, 4> g_records;
+static std::array<ViewRecord, 8> g_records;
 static uint32_t g_nextRecord;
 
 // A right-handed view for row vectors (position * view), as the game's: rows 0-2 hold the axes' x, y and z, row 3 the
@@ -263,4 +264,31 @@ bool TasCamera::GetView(uint32_t camera, float view[16], float eye[3])
     memcpy(view, record->View.data(), sizeof(float) * 16);
     memcpy(eye, record->Eye.data(), sizeof(float) * 3);
     return true;
+}
+
+bool TasCamera::FindView(const float gameView[16], float view[16])
+{
+    if (GetMode() == Mode::Off)
+        return false;
+
+    std::lock_guard lock(g_mutex);
+    FindOrMakeRecord(GetCamera());
+
+    for (auto& record : g_records)
+    {
+        if (!record.Valid)
+            continue;
+
+        bool match = true;
+        for (int i = 0; i < 16 && match; i++)
+            match = IsClose(gameView[i], record.GameView[i]);
+
+        if (match)
+        {
+            memcpy(view, record.View.data(), sizeof(float) * 16);
+            return true;
+        }
+    }
+
+    return false;
 }

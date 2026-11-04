@@ -4846,14 +4846,18 @@ struct LocalRenderCommandQueue
 
 // Where the game puts its camera in the shader constants (as floats): the view in vertex c4-c7 and pixel c8-c11, the eye
 // in vertex c178 and pixel c22 (the projection is in c0-c3 of both and stays). The 512x512 shadow map pass uses its own.
+// The motion blur's velocity map (FxVelocityMap.xvu) also has the previous frame's view, g_MtxPrevView in vertex c16-c19:
+// it gets the TAS camera's previous view, or Sonic's velocity would be from the game camera's view to the TAS camera's.
 static constexpr uint32_t VERTEX_VIEW_CONSTANT = 4 * 4;
+static constexpr uint32_t VERTEX_PREV_VIEW_CONSTANT = 16 * 4;
 static constexpr uint32_t VERTEX_EYE_CONSTANT = 178 * 4;
 static constexpr uint32_t PIXEL_VIEW_CONSTANT = 8 * 4;
 static constexpr uint32_t PIXEL_EYE_CONSTANT = 22 * 4;
 
 // The TAS camera swaps the game camera's view and eye in the host's copy of the constants going to the GPU (the game's own
-// constants stay as they are). index and size: the copied range, in floats and bytes.
-static void ReplaceTasCameraConstants(uint8_t* memory, uint32_t index, uint32_t size, uint32_t viewConstant, uint32_t eyeConstant)
+// constants stay as they are). index and size: the copied range, in floats and bytes. prevViewConstant: UINT32_MAX for none.
+static void ReplaceTasCameraConstants(uint8_t* memory, uint32_t index, uint32_t size, uint32_t viewConstant, uint32_t eyeConstant,
+    uint32_t prevViewConstant = UINT32_MAX)
 {
     if (TasCamera::GetMode() == TasCamera::Mode::Off)
         return;
@@ -4863,6 +4867,10 @@ static void ReplaceTasCameraConstants(uint8_t* memory, uint32_t index, uint32_t 
 
     if (viewConstant >= index && viewConstant + 16 <= end)
         TasCamera::ReplaceView(constants + (viewConstant - index));
+
+    // Matched like the view: it equals the game camera's view of an earlier update, whose TAS view is recorded.
+    if (prevViewConstant != UINT32_MAX && prevViewConstant >= index && prevViewConstant + 16 <= end)
+        TasCamera::ReplaceView(constants + (prevViewConstant - index));
 
     if (eyeConstant >= index && eyeConstant + 3 <= end)
         TasCamera::ReplaceEye(constants + (eyeConstant - index));
@@ -4908,7 +4916,8 @@ static void FlushRenderStateForMainThread(GuestDevice* device, LocalRenderComman
         auto& cmd = queue.enqueue();
         cmd.type = RenderCommandType::SetVertexShaderConstants;
         cmd.setVertexShaderConstants.memory = g_intermediaryUploadAllocator.allocate(&device->vertexShaderFloatConstants[index], size);
-        ReplaceTasCameraConstants(cmd.setVertexShaderConstants.memory, index, size, VERTEX_VIEW_CONSTANT, VERTEX_EYE_CONSTANT);
+        ReplaceTasCameraConstants(cmd.setVertexShaderConstants.memory, index, size, VERTEX_VIEW_CONSTANT, VERTEX_EYE_CONSTANT,
+            VERTEX_PREV_VIEW_CONSTANT);
         cmd.setVertexShaderConstants.index = index;
         cmd.setVertexShaderConstants.size = size;
 

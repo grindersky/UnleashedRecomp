@@ -70,3 +70,61 @@ PPC_FUNC(sub_82467890)
     CollisionOverlay::OnCameraUpdate(camera);
     TasCamera::OnCameraUpdate(camera);
 }
+
+// The motion blur's previous view (called only from its pass, sub_82BA9990, on the render side): r3 out, r4 the render
+// camera's view (the pass's own copy on its stack), r5 the view it had last frame; it limits the camera's motion between
+// them, and the pass makes g_MtxPrevInvViewProjection (for FxZBufferToVelocity) from it and the r4 copy. With the TAS
+// camera on, both become the TAS camera's views for them, or the blur would be from the game camera's motion over the
+// TAS camera's depth. Only the pass's copy and a temporary on the stack change; the game's camera and its stored
+// previous view stay as they are.
+PPC_FUNC_IMPL(__imp__sub_82BA88C8);
+PPC_FUNC(sub_82BA88C8)
+{
+    auto load = [&](uint32_t address, float matrix[16])
+    {
+        auto values = reinterpret_cast<be<float>*>(g_memory.Translate(address));
+        for (int i = 0; i < 16; i++)
+            matrix[i] = values[i];
+    };
+
+    auto store = [&](uint32_t address, const float matrix[16])
+    {
+        auto values = reinterpret_cast<be<float>*>(g_memory.Translate(address));
+        for (int i = 0; i < 16; i++)
+            values[i] = matrix[i];
+    };
+
+    float gameView[16], gamePrevView[16], view[16], prevView[16];
+    if (TasCamera::GetMode() == TasCamera::Mode::Off || ctx.r4.u32 == 0 || ctx.r5.u32 == 0)
+    {
+        __imp__sub_82BA88C8(ctx, base);
+        return;
+    }
+
+    load(ctx.r4.u32, gameView);
+    load(ctx.r5.u32, gamePrevView);
+
+    if (!TasCamera::FindView(gameView, view))
+    {
+        __imp__sub_82BA88C8(ctx, base);
+        return;
+    }
+
+    // No record for last frame's view (the TAS camera was just turned on): no camera motion.
+    if (!TasCamera::FindView(gamePrevView, prevView))
+        memcpy(prevView, view, sizeof(view));
+
+    store(ctx.r4.u32, view);
+
+    // The previous view goes in a temporary below the caller's stack. The callee writes at its entry r1 + 60 (the
+    // caller's parameter area), so the matrix sits at + 128.
+    uint32_t stack = ctx.r1.u32;
+    ctx.r1.u32 = stack - 256;
+    uint32_t temporary = ctx.r1.u32 + 128;
+    store(temporary, prevView);
+    ctx.r5.u32 = temporary;
+
+    __imp__sub_82BA88C8(ctx, base);
+
+    ctx.r1.u32 = stack;
+}

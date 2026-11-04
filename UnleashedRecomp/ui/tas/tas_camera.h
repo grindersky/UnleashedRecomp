@@ -29,4 +29,7 @@ namespace TasCamera
 
     // The TAS view and eye that match this game camera's current ones, for drawing the overlay on the picture.
     bool GetView(uint32_t camera, float view[16], float eye[3]);
+
+    // The TAS view recorded for this game view (host floats), also an earlier frame's: the motion blur's previous view.
+    bool FindView(const float gameView[16], float view[16]);
 }
