@@ -7,7 +7,7 @@
 # Unleashed Recompiled: TAS mode
 
 > [!NOTE]
-> WARNING: this tool was vibecoded with Claude (Opus 5.5). IF YOU DON'T LIKE IT OR YOU THINK IT'S "iffy", PLEASE MAKE YOUR OWN.
+> WARNING: this tool was vibecoded with Claude (Opus 5.5). IF YOU DON'T LIKE IT OR YOU THINK IT'S "iffy", THEN PLEASE GO MAKE YOUR OWN.
 
 This branch adds a TAS mode to Unleashed Recompiled for [libTAS](https://github.com/clementgallet/libTAS) on Linux, and on Windows through WSL: deterministic movie playback, savestates, correct audio at any libTAS frame rate, libTAS's on-screen display and Stop button, and an optional HUD for TASing. Without the TAS mode turned on, the game runs like the normal port.
 
