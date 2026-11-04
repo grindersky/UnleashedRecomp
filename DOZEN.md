@@ -13,6 +13,9 @@ Use dozen to **play back and encode** movies. Keep making TASes (recording, save
 libTAS's "Force software rendering": loading a savestate on dozen crashes the game. A movie plays back the same on both
 drivers; playbacks on each were compared frame by frame and matched over 2800 frames.
 
+> Savestates on the graphics card are in development in libTAS ("Forwarded GPU" rendering, see the note in the
+> README's step 7). It isn't released yet; this guide only covers playing back and encoding on dozen.
+
 ## What you need
 
 - Windows 11, or Windows 10 21H2 or newer, with WSL 2 up to date (run `wsl --update` in PowerShell).
@@ -116,7 +119,8 @@ To confirm dozen is in use: when the game starts, the terminal you started libTA
 `WARNING: dzn is not a conformant Vulkan implementation, testing use only.`
 
 > Dozen changes only how frames are drawn. The TAS mode makes the game behave the same on both drivers, so movies
-> made on lavapipe play back in sync on dozen. Keep the same game FPS option and codes as when the movie was recorded.
+> made on lavapipe play back in sync on dozen. Keep the same mods and codes as when the movie was recorded. Graphics
+> settings (resolution, anti-aliasing, shadow resolution...) don't affect sync: TAS with fast ones, encode with high ones.
 
 ## If something goes wrong
 
@@ -138,8 +142,16 @@ internet connection.
 
 **The game crashes at startup on dozen**
 Update to the current `tas-mode` branch and rebuild (see "Updating the TAS version" in the README). Older versions
-require a Vulkan extension that
-dozen doesn't have.
+require a Vulkan extension that dozen doesn't have.
+
+**The game crashes at startup at high resolutions, with `vmaCreateImage failed with error code 0xFFFFFFFE`**
+Turn fullscreen off: set `Fullscreen = false` in `~/.config/UnleashedRecomp/config.toml` while the game is closed. In
+fullscreen on dozen, a 4K game crashed at startup (dozen reports the failure as out of memory, though it isn't); the
+same resolution in a window works.
+
+**Models shadow themselves in dark stripes or patches**
+Update to the current `tas-mode` branch and rebuild. Dozen loses the shadows' depth bias when the game switches
+pipelines; the game sets it again on dozen.
 
 ---
 

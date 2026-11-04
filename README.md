@@ -110,14 +110,18 @@ Set these in front of `libTAS`, like `UNLEASHED_TAS_MODE=1`:
 
 - `UNLEASHED_TAS_MODE=1`: turns the TAS mode on. Without it, the game runs like the normal port.
 - `UNLEASHED_TAS_HUD=1`: a HUD, shown in levels. It's drawn into the frames, so it also shows up in encodes.
-  - As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump, stomp or quick step pressed on the current frame would work, with countdowns until a stomp is allowed again after a jump or an air boost, and until the next quick step), whether he is out of control (after a dash panel or a run quick step: "OUT OF CONTROL Nf", where presses do nothing for the next N frames; "until landing" when it only ends on the ground, and no number when it has no timer), the stick with the M-Speed zone (in 3D, on the side of the stick Sonic faces: green where it works, red where it doesn't), the D-Speed zone (in 2D, a strip where the stick's part along the path counts on the next frame, which moves as the game turns its stick direction, coloured the same way, with "air brake" when Sonic brakes in the air instead) and the break-jump zone, and the buttons.
+  - As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump, stomp, quick step, homing attack (once the game has a target) or boost pressed on the current frame would work, with the boost gauge and countdowns until a stomp is allowed again after a jump or an air boost, and until the next quick step), whether he is out of control (after a dash panel or a run quick step: "OUT OF CONTROL Nf", where presses do nothing for the next N frames; "until landing" when it only ends on the ground, and no number when it has no timer), the stick with the M-Speed zone (in 3D, on the side of the stick Sonic faces: green where it works, red where it doesn't), the D-Speed zone (in 2D, a strip where the stick's part along the path counts on the next frame, which moves as the game turns its stick direction, coloured the same way, with "air brake" when Sonic brakes in the air instead) and the break-jump zone, and the buttons.
   - As the Werehog: his speed, his state (on the ground or in the air, dashing, attacking, which attack and in how many frames it ends on its own, with and without the stick), whether a guard (LB) pressed on the current frame would work, his Unleash gauge, the stage time, the stick and the buttons.
   - Over each hint ring on screen: whether touching it now would count. A hint ring ignores touches for 2 seconds after the game creates it (as Sonic gets near) and after its hint closes, so at speed Sonic can go through one without anything happening. The label shows "HINT ready in Nf" (a touch counts from N frames after the current one), "HINT ready" or "HINT touched". Only Sonic's body counts, and the box that has to be touched is much smaller than the ring of orbs: about 1.1 m wide, 1.5 m tall and 0.5 m deep, around the question mark.
+  - A radar above the panel, as day Sonic: Sonic seen from above, with the stage's walls and floor edges around his height, the rings, enemies and goal ring around him, and in the air an estimate of where he reaches the next ring's height (without stick input or walls). Press Home to change how far it reaches and M to hide or show it. Under libTAS, both keys are recorded into the movie like the game's keys.
   - A TAS camera: press `\` to switch between the game's camera, a camera behind Sonic along his facing and one looking down on him from above. It only changes what's drawn, not the game, so a movie plays back the same with any of them. Things the game's own camera doesn't see can still be left out. Under libTAS, `\` is recorded into the movie like the game's keys.
 
 ### Mods and codes
 
 The game loads mods and Hedge Mod Manager codes through two files, which Hedge Mod Manager usually writes. In WSL, you don't need Hedge Mod Manager: write them yourself. Edit them while the game is closed, as it only reads them when it starts.
+
+> [!TIP]
+> On Windows, [TAS Mods and Codes](tools/TasModsAndCodes/README.txt) does this for you: a window to tick and order the mods and codes, configure mods, copy Hedge Mod Manager's mod list, and change the game's graphics settings. Copy the `tools/TasModsAndCodes` folder to Windows (it doesn't start from inside WSL's own files), then double-click `TAS Mods and Codes.cmd`. It writes `ModsDB.ini`; `cpkredir.ini` below is still needed.
 
 **`~/.config/UnleashedRecomp/cpkredir.ini`** turns mods and codes on, and says where to find the list of them. Write the full path, as `~` doesn't work there:
 
@@ -155,18 +159,19 @@ CodeCount=2
   - an arrow at his feet, pointing where he faces,
   - where the views don't already show them, the enemies' collision (red) and the goal ring's (white).
 
-  These are hidden behind walls; press F12 to switch to drawing them over everything, walls included, and back. Hiding them needs anti-aliasing off: with it on, they're always drawn over everything. Under libTAS, F11 and F12 are recorded into the movie like the game's keys.
+  These are hidden behind walls; press F12 to switch to drawing them over everything, walls included, and back. Hiding them needs anti-aliasing off: with it on, they're always drawn over everything. Under libTAS, F11 and F12 are recorded into the movie like the game's keys. In TAS mode, the views start shown only with `UNLEASHED_TAS_HUD=1`, and the level starts as it normally looks without it: a movie without F11 presses then shows the views with the HUD and the normal level without it. Either way it plays back the same, as F11 only changes what's drawn. Turning the codes themselves off does change sync: keep them as they were when the movie was recorded.
 - **Ready... GO! skip**: `RestoreReadyGoSkip` brings back a glitch the title update fixed. Pause during a stage's in-game cutscene and restart: Sonic can move during Ready... GO!
 
 ### Keeping movies in sync
 
 libTAS doesn't save everything that matters in a movie. Play movies back with:
 
-- the game's FPS option set to libTAS's frame rate,
-- the same mods and codes enabled as when the movie was recorded (see [Mods and codes](#mods-and-codes)),
+- the same mods, mod options and codes enabled as when the movie was recorded (see [Mods and codes](#mods-and-codes)),
 - the same save.
 
-Movies recorded at frame rates other than 60 fps with a version from before 2026-09-28 will probably desync.
+Graphics settings (resolution, anti-aliasing, shadow resolution, motion blur...) and the renderer (lavapipe, dozen) don't affect sync: TAS with fast settings, encode with high ones. The game's FPS option doesn't matter either: in TAS mode, the game steps by libTAS's frame rate.
+
+Movies recorded at frame rates other than 60 fps with a version from before 2026-09-28 will probably desync, and so may movies recorded before 2026-10-26 with the game's FPS option different from libTAS's frame rate.
 
 ### Faster playback and encoding
 
