@@ -72,6 +72,16 @@ export GPU=~/libtas-gpu
 export TAS=~/UnleashedRecomp
 ```
 
+Check that `$TAS` is right and up to date; steps 6 and 8 take files from it:
+
+```bash
+ls $TAS/forwarded-gpu
+```
+
+It must list `dozen-1-pipeline-cache.patch`, `dozen-2-recycle.patch`, `kumquat.sh` and `libTASGPU.sh`. If it says
+`No such file or directory`, either your TAS version is in another folder (set `TAS` to it), or it's older than this
+guide: update it first (README, "Updating the TAS version"), and build the game again.
+
 ```bash
 mkdir -p $GPU/src && cd $GPU/src
 git clone --depth 1 -b unleashed https://github.com/grindersky/libTAS.git
@@ -182,6 +192,21 @@ Start the game and TAS as usual: savestates now work on your graphics card.
 ## If something goes wrong
 
 kumquat writes what it does to `/tmp/libtas-gpu/kumquat.log`; check it first.
+
+**`cp: cannot stat '.../forwarded-gpu/kumquat.sh': No such file or directory`** (step 8), or
+**`.../forwarded-gpu/dozen-1-pipeline-cache.patch: No such file or directory`** (step 6)
+`$TAS` doesn't point to a TAS version that has this guide's files: see the check in step 2, and update the TAS
+version if needed. If step 6 failed this way, dozen was built without its patches; once the files are there, patch
+and rebuild it (the build folder from before is reused):
+
+```bash
+cd $GPU/src/mesa-26.0.8
+patch -p1 < $TAS/forwarded-gpu/dozen-1-pipeline-cache.patch
+patch -p1 < $TAS/forwarded-gpu/dozen-2-recycle.patch
+ninja -C build install
+```
+
+Then do step 8 again.
 
 **The game crashes at startup with `Failed to allocate coherent memory`**
 libTAS was started without `LIBTAS_GPU_MODE=COPYMODE`: use `libTASGPU` or `libTASGPUHUD`, not `libTAS`.

@@ -120,6 +120,14 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
+> [!NOTE]
+> If `git pull` stops with "divergent branches" or "refusing to merge unrelated histories" (the history was rewritten on 2026-11-04, so clones from before then can't pull), reset to the current version instead, then run the two `git submodule` lines above. This throws away changes you made to the source yourself; the game files in `UnleashedRecompLib/private/` and your build in `out/` stay.
+>
+> ```bash
+> git fetch origin
+> git reset --hard origin/tas-mode
+> ```
+
 Then build the game again, as in step 5:
 
 ```bash
