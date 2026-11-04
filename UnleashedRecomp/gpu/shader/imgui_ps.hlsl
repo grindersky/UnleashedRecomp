@@ -184,7 +184,10 @@ float4 main(in Interpolators interpolators) : SV_Target
             }
             else
             {
-                color = SampleSdfFont(color, texture, interpolators.UV, 1.0 / fwidth(interpolators.UV));
+                // Shapes use one texel (the white pixel or a baked line row), so the UV barely changes and its
+                // derivative can be exactly 0 on some pixels. An infinite screen range there can come out as NaN
+                // (alpha 0, a hole in the shape), so the derivative is kept above a tiny floor; text is far above it.
+                color = SampleSdfFont(color, texture, interpolators.UV, 1.0 / max(fwidth(interpolators.UV), 1.0e-6));
             }
         }
         else
