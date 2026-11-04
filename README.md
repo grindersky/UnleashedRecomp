@@ -6,6 +6,9 @@
 
 # Unleashed Recompiled: TAS mode
 
+> [!NOTE]
+> Disclaimer: this TAS mode was vibecoded with Claude.
+
 This branch adds a TAS mode to Unleashed Recompiled for [libTAS](https://github.com/clementgallet/libTAS) on Linux, and on Windows through WSL: deterministic movie playback, savestates, correct audio at any libTAS frame rate, libTAS's on-screen display and Stop button, and an optional HUD for TASing. Without the TAS mode turned on, the game runs like the normal port.
 
 > [!TIP]
@@ -80,7 +83,7 @@ Choose `out/build/linux-release/UnleashedRecomp/UnleashedRecomp` as the game exe
 > Software rendering is slow. To play back and encode movies on your graphics card, several times faster, set up dozen with the [dozen guide](DOZEN.md). Keep software rendering on while making TASes: loading a libTAS savestate on dozen crashes the game.
 
 > [!NOTE]
-> Savestates on the graphics card are in development in [jakobhellermann's libTAS](https://github.com/jakobhellermann/libTAS): its "Forwarded GPU" rendering keeps the GPU's state in a separate process that it saves along with the game. The TAS mode works with it (under WSL with `LIBTAS_GPU_MODE=COPYMODE`, as WSL can't share GPU memory with the game), but it isn't part of a libTAS release yet and setting it up isn't covered here.
+> Savestates on the graphics card are in development in [jakobhellermann's libTAS](https://github.com/jakobhellermann/libTAS): its "Forwarded GPU" rendering keeps the GPU's state in a separate process that it saves along with the game. It isn't part of a libTAS release yet, but you can build it: see the [Forwarded GPU guide](FORWARDED_GPU.md). Saves and loads then take under a second, on your graphics card.
 
 Start the game from libTAS and TAS as usual.
 
@@ -175,5 +178,5 @@ Movies recorded at frame rates other than 60 fps with a version from before 2026
 
 ### Faster playback and encoding
 
-To play back and encode movies on your graphics card instead of the CPU under WSL, see the [dozen guide](DOZEN.md). It makes playback and encoding several times faster.
+To play back and encode movies on your graphics card instead of the CPU under WSL, see the [dozen guide](DOZEN.md). It makes playback and encoding several times faster. To also make TASes on your graphics card, with savestates, see the [Forwarded GPU guide](FORWARDED_GPU.md).
 

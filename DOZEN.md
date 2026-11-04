@@ -13,8 +13,9 @@ Use dozen to **play back and encode** movies. Keep making TASes (recording, save
 libTAS's "Force software rendering": loading a savestate on dozen crashes the game. A movie plays back the same on both
 drivers; playbacks on each were compared frame by frame and matched over 2800 frames.
 
-> Savestates on the graphics card are in development in libTAS ("Forwarded GPU" rendering, see the note in the
-> README's step 7). It isn't released yet; this guide only covers playing back and encoding on dozen.
+> Savestates on the graphics card are in development in libTAS ("Forwarded GPU" rendering). It isn't released yet,
+> but you can build it: see the [Forwarded GPU guide](FORWARDED_GPU.md). This guide only covers playing back and
+> encoding on dozen.
 
 ## What you need
 
