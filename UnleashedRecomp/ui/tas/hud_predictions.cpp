@@ -521,6 +521,13 @@ SonicPresses Tas::PredictSonicPresses(uint32_t context, uint32_t state, const st
     if (presses.QuickStepUpdates == 1 && grounded && !outOfControl)
         groundActionsNext = true;
 
+    // Sliding's update (sub_823997C8) also runs the ground actions (the context's vfunc 36, at loc_82399C6C: TryJump,
+    // TryQuickStep, TryBoost) while Sonic is in control, from when ctx+1056 (a length the posture's ground check,
+    // sub_8232F370, stores) is at least 1 (assumed to be the same gate as its boost; not checked at run time).
+    bool slideActionsNext = grounded && stateName == "Sliding" && !outOfControl && LoadFloat(context + SLIDE_BOOST_LENGTH_OFFSET) >= 1.0f;
+    if (slideActionsNext && !jumpTried)
+        groundActionsNext = true;
+
     bool jumpBuffered = IsStateIn(state, JUMP_BUFFER_STATE_VFTABLES);
     presses.CanJump = grounded && (jumpTried || groundActionsNext || jumpBuffered);
 
@@ -611,7 +618,7 @@ SonicPresses Tas::PredictSonicPresses(uint32_t context, uint32_t state, const st
     // Sliding's update (sub_823997C8) only tries the boost while ctx+1056 (a length the posture's ground check,
     // sub_8232F370, stores) is at least 1, so on its first frames it can skip it during this frame's update and try
     // on the next. This goes by the value as the HUD sees it, assuming the next update reads the same one.
-    bool slideBoostNext = grounded && stateName == "Sliding" && !outOfControl && LoadFloat(context + SLIDE_BOOST_LENGTH_OFFSET) >= 1.0f;
+    bool slideBoostNext = slideActionsNext;
     // The grind actions skip TryBoost while Sonic is out of control, like the ground actions.
     bool grindActionsNext = !outOfControl && IsStateIn(state, GRIND_ACTIONS_STATE_VFTABLES) && LoadU32(context + GRIND_RAIL_OFFSET) != 0;
     bool boostNext = (groundActionsNext || grindActionsNext || (grounded && entered && IsStateIn(state, BOOST_STATE_VFTABLES)) ||
