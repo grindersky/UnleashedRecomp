@@ -192,7 +192,7 @@ CodeCount=2
   - an arrow at his feet, pointing where he faces,
   - where the views don't already show them, the enemies' collision (red) and the goal ring's (white).
 
-  These are hidden behind walls; press F12 to switch to drawing them over everything, walls included, and back. Hiding them needs anti-aliasing off: with it on, they're always drawn over everything. Under libTAS, F11 and F12 are recorded into the movie like the game's keys. In TAS mode, the views start shown only with `UNLEASHED_TAS_HUD=1`, and the level starts as it normally looks without it: a movie without F11 presses then shows the views with the HUD and the normal level without it. Either way it plays back the same, as F11 only changes what's drawn. Turning the codes themselves off does change sync: keep them as they were when the movie was recorded.
+  These are hidden behind walls; press F12 to switch to drawing them over everything, walls included, and back. Under libTAS, F11 and F12 are recorded into the movie like the game's keys. In TAS mode, the views start shown only with `UNLEASHED_TAS_HUD=1`, and the level starts as it normally looks without it: a movie without F11 presses then shows the views with the HUD and the normal level without it. Either way it plays back the same, as F11 only changes what's drawn. Turning the codes themselves off does change sync: keep them as they were when the movie was recorded.
 - **Ready... GO! skip**: `RestoreReadyGoSkip` brings back a glitch the title update fixed. Pause during a stage's in-game cutscene and restart: Sonic can move during Ready... GO!
 
 ### Keeping movies in sync
