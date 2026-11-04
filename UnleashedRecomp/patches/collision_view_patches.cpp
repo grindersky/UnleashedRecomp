@@ -272,6 +272,29 @@ PPC_FUNC(sub_82BAE248)
     PPC_STORE_U32(SHADOW_MAP_MODE, mode);
 }
 
+// The game's effect helpers: each makes an effect, then attaches and starts it unless the stage collision view is on
+// (ms_IsCollisionRender), so with the view the effects (day Sonic's jump ball, boost, hits, splashes...) never start
+// and F11 had nothing to show. Start them as without the view, shown or not. This changes what the game does with the
+// code on (movies recorded with it before may not sync), but F11 still only changes what's drawn.
+// sub_827D9A50: objects' effects (explosions, smoke); sub_827D9BA0 / sub_827D9C30: cutscene particles (Inspire);
+// sub_827DA400 / sub_827DA560 / sub_827DA6C8: objects' and the player's (sub_8230ABA0, sub_82308BD0 and others).
+#define START_EFFECTS_WITH_STAGE_VIEW(function) \
+    PPC_FUNC_IMPL(__imp__##function); \
+    PPC_FUNC(function) \
+    { \
+        bool hidden = g_stageViewHidden; \
+        g_stageViewHidden = true; \
+        __imp__##function(ctx, base); \
+        g_stageViewHidden = hidden; \
+    }
+
+START_EFFECTS_WITH_STAGE_VIEW(sub_827D9A50)
+START_EFFECTS_WITH_STAGE_VIEW(sub_827D9BA0)
+START_EFFECTS_WITH_STAGE_VIEW(sub_827D9C30)
+START_EFFECTS_WITH_STAGE_VIEW(sub_827DA400)
+START_EFFECTS_WITH_STAGE_VIEW(sub_827DA560)
+START_EFFECTS_WITH_STAGE_VIEW(sub_827DA6C8)
+
 PPC_FUNC_IMPL(__imp__sub_82BADDF0);
 PPC_FUNC(sub_82BADDF0)
 {
