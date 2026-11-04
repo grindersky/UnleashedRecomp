@@ -4,6 +4,8 @@
 #include <kernel/memory.h>
 #include <user/config.h>
 #include <sdl_listener.h>
+#include <tas_mode.h>
+#include <ui/tas_hud.h>
 
 #include <atomic>
 #include <mutex>
@@ -25,7 +27,10 @@ static constexpr uint32_t EMPTY_STRING = 0x8200A621;
 // The shadow map's mode, the second of its parameters.
 static constexpr uint32_t SHADOW_MAP_MODE = 0x83302768;
 
-static std::atomic<bool> g_shown{ true };
+// Whether the views are shown (F11 switches it). In TAS mode they start shown only with the TAS HUD, so one movie without
+// F11 presses gives the level as it normally looks under plain libTAS and the views under the HUD; outside TAS mode they
+// start shown. Only what's drawn changes, so the movie syncs either way.
+static std::atomic<bool> g_shown{ !IsTasMode() || TasHud::IsEnabled() };
 
 bool CollisionView::IsEnabled()
 {
