@@ -210,6 +210,7 @@ namespace TasScheduler
     static thread_local uint32_t g_operationsSinceBlocked;
     static constexpr uint32_t OperationsBeforePreempting = 10000;
     static int g_stallFile = -1;
+    static std::string g_stallPath;
 
     static std::mutex g_mutex;
     static std::condition_variable g_presenterCondition; // Wakes a thread in WaitForOtherThreads().
@@ -504,13 +505,11 @@ namespace TasScheduler
             std::_Exit(0);
         });
 
-        // Where to report threads that keep a frame from ending, written with raw system calls so libTAS
-        // doesn't intercept it. backtrace() is called once here, as its first call isn't signal-safe.
+        // Where to report threads that keep a frame from ending. The file is only created on the first stall
+        // (see OpenStallFile), so starting the game again doesn't wipe the last report.
+        // backtrace() is called once here, as its first call isn't signal-safe.
         if (const char* home = std::getenv("HOME"))
-        {
-            std::string path = fmt::format("{}/tas_stall.txt", home);
-            g_stallFile = int(syscall(SYS_openat, AT_FDCWD, path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644));
-        }
+            g_stallPath = fmt::format("{}/tas_stall.txt", home);
 
         void* frames[1];
         backtrace(frames, 1);
@@ -732,9 +731,40 @@ namespace TasScheduler
         Update();
     }
 
+    // Lock held. Creates the stall report on the first stall of this run (replacing the last run's) and
+    // keeps it open for later ones. Raw system calls, so libTAS doesn't intercept the writes.
+    // The file stays open at a fixed descriptor: a savestate load restores g_stallFile to -1, and without
+    // finding the open file again, the next stall would wipe the report from before the load.
+    static bool OpenStallFile()
+    {
+        constexpr int StallFd = 999;
+
+        if (g_stallFile >= 0 || g_stallPath.empty())
+            return g_stallFile >= 0;
+
+        if (syscall(SYS_fcntl, StallFd, F_GETFD) >= 0)
+        {
+            g_stallFile = StallFd;
+            return true;
+        }
+
+        int fd = int(syscall(SYS_openat, AT_FDCWD, g_stallPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644));
+        if (fd < 0)
+            return false;
+
+        if (syscall(SYS_dup3, fd, StallFd, O_CLOEXEC) == StallFd)
+        {
+            syscall(SYS_close, fd);
+            fd = StallFd;
+        }
+
+        g_stallFile = fd;
+        return true;
+    }
+
     static void ReportStall()
     {
-        if (g_stallFile < 0)
+        if (!OpenStallFile())
             return;
 
         std::string header = fmt::format("=== stall: token held by thread {}, {} runnable, {} presenting, reported by thread {} ===\n",
@@ -751,7 +781,7 @@ namespace TasScheduler
     // Lock held. Writes every tracked thread's stack to the stall report, one after the other.
     static void DumpAllThreads(const char* reason)
     {
-        if (g_stallFile < 0)
+        if (!OpenStallFile())
             return;
 
         std::string header = fmt::format("=== {} (virtual time {} us, frame started at {} us) ===\n", reason, g_virtualTime, g_frameStart);
