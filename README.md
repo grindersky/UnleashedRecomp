@@ -62,6 +62,18 @@ git clone --recurse-submodules -b tas-mode https://github.com/grindersky/Unleash
 cd UnleashedRecomp
 ```
 
+`git clone` downloads the source into a new `UnleashedRecomp` folder. `cd` ("change directory") moves the terminal into a folder, so the commands after it run there. The prompt shows where you are, for example `~/UnleashedRecomp$`, where `~` is your Linux home folder.
+
+> [!TIP]
+> A new WSL window starts in your Linux home folder, so that's where the clone goes. To pick the folder, put it at the end of the clone command. Windows drives are under `/mnt` (`C:` is `/mnt/c`, `F:` is `/mnt/f`), so for example for `F:\libTAS\UnleashedRecomp`:
+>
+> ```bash
+> git clone --recurse-submodules -b tas-mode https://github.com/grindersky/UnleashedRecomp.git /mnt/f/libTAS/UnleashedRecomp
+> cd /mnt/f/libTAS/UnleashedRecomp
+> ```
+>
+> Use that same path wherever this guide says `cd UnleashedRecomp`. A folder on a Windows drive is easy to open in Explorer, but the build is slower there than in your Linux home. Don't rebuild while the game is running from it.
+
 ### 4. Add the game files needed to build
 
 Copy `default.xex`, `default.xexp` and `shader.ar` from your copy of the game into `UnleashedRecompLib/private/`.
