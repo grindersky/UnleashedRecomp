@@ -1,5 +1,5 @@
-TAS Mods and Codes
-==================
+TAS Mods and Codes 1.1
+======================
 
 A small Windows window for picking the mods and codes that the Linux (WSL) TAS build of
 Unleashed Recompiled loads, instead of editing ModsDB.ini by hand.
@@ -26,6 +26,11 @@ Using it
   change the same file. Drag a mod into "Not loaded" to turn it off.
 - Mods with a gear have options: right-click > Configure, or the Configure... button.
   Options are saved in the mod's own folder, so Hedge Mod Manager shows the same ones.
+- The search box above the list (Ctrl+F) shows only mods whose name, author or folder matches.
+  Esc clears it. Loaded mods keep their load-order numbers while filtered.
+- The list follows the mods folder on its own, like Hedge Mod Manager: a mod you add, delete or
+  change there shows up within a couple of seconds. If the game's ModsDB.ini is changed outside
+  the window, it is reloaded (or, with unsaved changes here, the status line says so).
 - "Copy Hedge Mod Manager's mods" takes Hedge Mod Manager's mod list and order (not its codes).
 - Tick the codes on the right.
   Note on the collision view codes (Enable Stage/Event/Object Collision Debug View): ticked,
@@ -53,3 +58,8 @@ Settings
   or a build folder with its own cpkredir.ini.
 The tool writes the game's ModsDB.ini (normally ~/.config/UnleashedRecomp/ModsDB.ini in WSL)
 and keeps the previous one as ModsDB.ini.bak.
+
+Changes
+- 1.1: the mod list follows the mods folder and the game's ModsDB.ini on its own; search box
+  for mods (Ctrl+F).
+- 1: first version.

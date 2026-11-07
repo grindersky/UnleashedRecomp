@@ -27,7 +27,8 @@ $SetupsDir = ''
 # The game's code list (from this repository). Codes not in this build are shown under "Not in this build".
 $ConfigDefPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\UnleashedRecomp\user\config_def.h'))
 
-$AppTitle = 'TAS Mods and Codes'
+$AppVersion = '1.1'
+$AppTitle = "TAS Mods and Codes $AppVersion"
 
 # ---- Dark theme ---------------------------------------------------------------------------------
 # Styles shared by every window: pasted into each XAML window's resources (THEME placeholder) and
@@ -1086,6 +1087,14 @@ THEME
               <TextBlock x:Name="ModInfo" TextWrapping="Wrap" Foreground="#C8C8CE"/>
             </ScrollViewer>
           </Border>
+          <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+            <TextBox x:Name="SearchBox" VerticalContentAlignment="Center" Padding="8,5,28,5"/>
+            <TextBlock x:Name="SearchHint" Text="Search mods (name or author)" Foreground="#7A7A82" Margin="11,0,0,0"
+                       VerticalAlignment="Center" IsHitTestVisible="False"/>
+            <Button x:Name="SearchClear" Content="x" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,4,0"
+                    Padding="6,0,6,1" Background="Transparent" BorderBrush="Transparent" Visibility="Collapsed"
+                    ToolTip="Clear the search (Esc)"/>
+          </Grid>
           <ListBox x:Name="ModList" HorizontalContentAlignment="Stretch" AllowDrop="True"
                    ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
         </DockPanel>
@@ -1109,7 +1118,7 @@ $ui = @{}
 foreach ($name in 'WarningBanner', 'WarningText', 'SetupBox', 'LoadSetupButton', 'SaveSetupButton', 'DeleteSetupButton',
                   'MatchText', 'RevertButton', 'SaveButton', 'CloseButton', 'StatusText', 'FileText', 'UpButton',
                   'DownButton', 'HmmButton', 'NoneButton', 'FolderButton', 'ModInfo', 'ModList', 'CodePanel',
-                  'ConfigureButton', 'SettingsButton', 'GraphicsButton') {
+                  'ConfigureButton', 'SettingsButton', 'GraphicsButton', 'SearchBox', 'SearchHint', 'SearchClear') {
     $ui[$name] = $window.FindName($name)
 }
 
@@ -1242,17 +1251,44 @@ function New-HeaderItem([string]$text, [string]$uid) {
     return $item
 }
 
+function Test-ModMatch($mod, [string]$filter) {
+    if (-not $filter) { return $true }
+    foreach ($word in ($filter -split '\s+')) {
+        if ($mod.Title.IndexOf($word, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+            $mod.Author.IndexOf($word, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+            (Split-Path (Split-Path $mod.WinPath -Parent) -Leaf).IndexOf($word, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Update-ModList([string]$selectPath) {
     if (-not $selectPath) { $selectPath = Get-SelectedModPath }
     $State.Updating = $true
     $ui.ModList.Items.Clear()
     $count = $State.Enabled.Count
     [void]$ui.ModList.Items.Add((New-HeaderItem ($(if ($count) { "Loaded ($count)" } else { 'Loaded (none: the game runs without mods)' })) 'loaded'))
+    # The search box hides mods that don't match; loaded mods keep their real load-order numbers.
+    $filter = $ui.SearchBox.Text.Trim()
+    $shown = 0
     $rank = 1
-    foreach ($p in $State.Enabled) { [void]$ui.ModList.Items.Add((New-ModItem $Mods[$p] $rank)); $rank++ }
+    foreach ($p in $State.Enabled) {
+        if (Test-ModMatch $Mods[$p] $filter) { [void]$ui.ModList.Items.Add((New-ModItem $Mods[$p] $rank)); $shown++ }
+        $rank++
+    }
     [void]$ui.ModList.Items.Add((New-HeaderItem 'Not loaded' 'unloaded'))
     foreach ($mod in ($Mods.Values | Where-Object { -not $State.Enabled.Contains($_.Path) } | Sort-Object Title)) {
-        [void]$ui.ModList.Items.Add((New-ModItem $mod 0))
+        if (Test-ModMatch $mod $filter) { [void]$ui.ModList.Items.Add((New-ModItem $mod 0)); $shown++ }
+    }
+    if ($filter -and $shown -eq 0) {
+        $none = New-Object System.Windows.Controls.ListBoxItem
+        $none.Focusable = $false
+        $none.Padding = '4,6,4,2'
+        $none.Content = "No mods match `"$filter`"."
+        $none.Foreground = $GreyBrush
+        $none.Add_PreviewMouseLeftButtonDown({ $_.Handled = $true })
+        [void]$ui.ModList.Items.Add($none)
     }
     if ($selectPath) {
         foreach ($item in $ui.ModList.Items) {
@@ -1413,6 +1449,103 @@ $ui.ModList.Add_KeyDown({
     }
 })
 
+# ---- Search -------------------------------------------------------------------------------------
+$ui.SearchBox.Add_TextChanged({
+    $has = [bool]$ui.SearchBox.Text
+    $ui.SearchHint.Visibility = $(if ($has) { 'Collapsed' } else { 'Visible' })
+    $ui.SearchClear.Visibility = $(if ($has) { 'Visible' } else { 'Collapsed' })
+    Update-ModList
+})
+$ui.SearchBox.Add_KeyDown({
+    if ($_.Key -eq 'Escape' -and $ui.SearchBox.Text) { $ui.SearchBox.Text = ''; $_.Handled = $true }
+    elseif ($_.Key -eq 'Down' -and $ui.ModList.Items.Count) {
+        # Down arrow jumps into the results.
+        foreach ($it in $ui.ModList.Items) {
+            if ($it.Tag) { $ui.ModList.SelectedItem = $it; [void]$it.Focus(); break }
+        }
+        $_.Handled = $true
+    }
+})
+$ui.SearchClear.Add_Click({ $ui.SearchBox.Text = ''; [void]$ui.SearchBox.Focus() })
+$window.Add_PreviewKeyDown({
+    if ($_.Key -eq 'F' -and [System.Windows.Input.Keyboard]::Modifiers -eq 'Control') {
+        [void]$ui.SearchBox.Focus(); $ui.SearchBox.SelectAll(); $_.Handled = $true
+    }
+})
+
+# ---- Auto-refresh -------------------------------------------------------------------------------
+# Like Hedge Mod Manager: mods added to, removed from or changed in the mods folder show up on their
+# own, and a ModsDB.ini changed outside this window (another tool, a text editor) is reloaded.
+function Get-ModsFolderStamp {
+    if (-not (Test-ModsFolder)) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    try {
+        foreach ($dir in [IO.Directory]::GetDirectories($ModsFolder)) {
+            $ini = [IO.Path]::Combine($dir, 'mod.ini')
+            [void]$sb.Append($dir).Append('|').Append([IO.File]::GetLastWriteTimeUtc($ini).Ticks).Append("`n")
+        }
+    } catch { return $State.ModsStamp }
+    return $sb.ToString()
+}
+
+function Get-ModsDbStamp {
+    try {
+        $f = New-Object IO.FileInfo $ModsDbPath
+        if (-not $f.Exists) { return 'none' }
+        return "$($f.LastWriteTimeUtc.Ticks)|$($f.Length)"
+    } catch { return $State.ModsDbStamp }
+}
+
+# Re-reads the mods folder: new mods appear under "Not loaded", deleted ones disappear (or show
+# "mod.ini not found" if they are loaded), and changed mod.ini files (title, options) are re-read.
+function Update-ModsFromFolder {
+    $before = @{}
+    foreach ($m in $Mods.Values) { if (-not $m.Missing) { $before[$m.Path] = $m.Title } }
+    $keep = @($Mods.Keys | Where-Object { $State.Enabled.Contains($_) })
+    $Mods.Clear()
+    foreach ($p in $keep) { [void](Add-ModEntry $p) }
+    Find-Mods
+    try { Import-HmmIds } catch { }
+    $ui.HmmButton.IsEnabled = (Test-ModsFolder) -and (Test-Path -LiteralPath (Join-Path $ModsFolder 'ModsDB.ini'))
+    $added = @($Mods.Values | Where-Object { -not $_.Missing -and -not $before.ContainsKey($_.Path) } | ForEach-Object { $_.Title })
+    $gone = @($before.Keys | Where-Object { -not $Mods.ContainsKey($_) -or $Mods[$_].Missing } | ForEach-Object { $before[$_] })
+    Update-ModList
+    $parts = @()
+    if ($added.Count) { $parts += "new: " + (($added | Sort-Object) -join ', ') }
+    if ($gone.Count) { $parts += "removed: " + (($gone | Sort-Object) -join ', ') }
+    if ($parts.Count) { Set-Status ("Mods folder changed (" + ($parts -join '; ') + ").") }
+}
+
+function Update-FromDisk {
+    # Not while a dialog or a drag is open: the list would change under it.
+    if ($State.Dragging -or $window.OwnedWindows.Count -gt 0) { return }
+    $stamp = Get-ModsFolderStamp
+    if ($stamp -ne $State.ModsStamp) {
+        $State.ModsStamp = $stamp
+        Update-ModsFromFolder
+    }
+    $dbStamp = Get-ModsDbStamp
+    if ($dbStamp -ne $State.ModsDbStamp) {
+        $State.ModsDbStamp = $dbStamp
+        $data = Import-ModsDb $ModsDbPath
+        $sig = Get-Signature $data.Enabled $data.Codes
+        if ($sig -eq $State.SavedSignature) { return }
+        if ((Get-Signature $State.Enabled $State.Codes) -eq $State.SavedSignature) {
+            # No unsaved changes here: take the new list.
+            Import-Current
+            Set-Status "The game's mod list was changed outside this window: reloaded it."
+        } else {
+            $State.SavedSignature = $sig
+            Update-Summary
+            Set-Status "The game's mod list was changed outside this window. Undo changes loads it; Save replaces it with what's shown here."
+        }
+    }
+}
+
+$RefreshTimer = New-Object System.Windows.Threading.DispatcherTimer
+$RefreshTimer.Interval = [TimeSpan]::FromSeconds(2)
+$RefreshTimer.Add_Tick({ try { Update-FromDisk } catch { } })
+
 # ---- Drag and drop ------------------------------------------------------------------------------
 function Find-Parent($element, [type]$type) {
     while ($element) {
@@ -1471,7 +1604,9 @@ $ui.ModList.Add_PreviewMouseMove({
         [math]::Abs($pos.X - $State.DragStart.X) -lt [System.Windows.SystemParameters]::MinimumHorizontalDragDistance) { return }
     $path = $State.DragPath
     $State.DragPath = $null
-    [void][System.Windows.DragDrop]::DoDragDrop($ui.ModList, $path, [System.Windows.DragDropEffects]::Move)
+    $State.Dragging = $true
+    try { [void][System.Windows.DragDrop]::DoDragDrop($ui.ModList, $path, [System.Windows.DragDropEffects]::Move) }
+    finally { $State.Dragging = $false }
     Clear-DropMarker
 })
 
@@ -1917,6 +2052,8 @@ function Import-All {
     Update-SetupList
     $State.LastGameCheck = [datetime]::MinValue
     Update-Warnings
+    $State.ModsStamp = Get-ModsFolderStamp
+    $State.ModsDbStamp = Get-ModsDbStamp
 }
 
 function Show-SettingsDialog {
@@ -2304,4 +2441,5 @@ if ($DryRun) {
     Get-ModsDbText
     exit 0
 }
+$RefreshTimer.Start()
 [void]$window.ShowDialog()
