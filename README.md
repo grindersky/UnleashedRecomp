@@ -98,7 +98,7 @@ cd out/build/linux-release/UnleashedRecomp
 ./UnleashedRecomp
 ```
 
-The installer asks for your game, its title update and, optionally, the DLC (see [How to Install](#how-to-install)). Once you reach the title screen, quit the game.
+The installer asks for your game, its title update and, optionally, the DLC (see [How to Install](https://github.com/hedge-dev/UnleashedRecomp#how-to-install) in Unleashed Recompiled's README). Once you reach the title screen, quit the game.
 
 For the game, it's recommended to just select your Xbox 360 `.iso` with **Add Files**. Don't forget the title update ("Patch Update") file as well, for example `TU_19KA20I_0000004000000.00000000000G1`: the game can't be installed without it.
 
@@ -155,8 +155,22 @@ Set these in front of `libTAS`, like `UNLEASHED_TAS_MODE=1`:
 
 - `UNLEASHED_TAS_MODE=1`: turns the TAS mode on. Without it, the game runs like the normal port.
 - `UNLEASHED_TAS_HUD=1`: a HUD, shown in levels. It's drawn into the frames, so it also shows up in encodes.
-  - As Sonic: his speed, his movement mode (free 3D, forward, 2D, running on water or along a wall, on ice, a boss fight's special mode, or diving), his state (on the ground or in the air, sliding, stomping, and whether a jump, stomp, quick step, homing attack (once the game has a target) or boost pressed on the current frame would work, with the boost gauge and countdowns until a stomp is allowed again after a jump or an air boost, and until the next quick step), whether he is out of control (after a dash panel or a run quick step: "OUT OF CONTROL Nf", where presses do nothing for the next N frames; "until landing" when it only ends on the ground, and no number when it has no timer), the stick with the M-Speed zone (in 3D, on the side of the stick Sonic faces: green where it works, red where it doesn't), the D-Speed zone (in 2D, a strip where the stick's part along the path counts on the next frame, which moves as the game turns its stick direction, coloured the same way, with "air brake" when Sonic brakes in the air instead) and the break-jump zone, and the buttons.
-  - As the Werehog: his speed, his state (on the ground or in the air, dashing, attacking, which attack and in how many frames it ends on its own, with and without the stick), whether a guard (LB) pressed on the current frame would work, his Unleash gauge, the stage time, the stick and the buttons.
+  - As Sonic:
+    - His speed and his movement mode: free 3D, forward, 2D, running on water or along a wall, on ice, a boss fight's special mode, or diving.
+    - His state: on the ground or in the air, sliding, stomping.
+    - Whether a jump, stomp, quick step, homing attack or boost pressed on the current frame would work. The homing attack lights once the game has a target.
+    - The boost gauge, and countdowns until a stomp is allowed again (after a jump or an air boost) and until the next quick step.
+    - Whether he is out of control, like after a dash panel or a run quick step. "OUT OF CONTROL Nf" means presses do nothing for the next N frames, "until landing" means it only ends on the ground, and no number means it has no timer.
+    - The stick, with three zones:
+      - M-Speed (in 3D): drawn on the side of the stick Sonic faces, green where it works, red where it doesn't.
+      - D-Speed (in 2D): a strip where the stick's part along the path counts on the next frame. It moves as the game turns its stick direction and is coloured the same way. It says "air brake" when Sonic brakes in the air instead.
+      - Break-jump.
+    - The buttons.
+  - As the Werehog:
+    - His speed and state: on the ground or in the air, dashing, attacking.
+    - Which attack, and in how many frames it ends on its own, with and without the stick.
+    - Whether a guard (LB) pressed on the current frame would work.
+    - His Unleash gauge, the stage time, the stick and the buttons.
   - Over each hint ring on screen: whether touching it now would count. A hint ring ignores touches for 2 seconds after the game creates it (as Sonic gets near) and after its hint closes, so at speed Sonic can go through one without anything happening. The label shows "HINT ready in Nf" (a touch counts from N frames after the current one), "HINT ready" or "HINT touched". Only Sonic's body counts, and the box that has to be touched is much smaller than the ring of orbs: about 1.1 m wide, 1.5 m tall and 0.5 m deep, around the question mark.
   - A radar above the panel, as day Sonic: Sonic seen from above, with the stage's walls and floor edges around his height, the rings, enemies and goal ring around him, and in the air an estimate of where he reaches the next ring's height (without stick input or walls). Press Home to change how far it reaches and M to hide or show it. Under libTAS, both keys are recorded into the movie like the game's keys.
   - A TAS camera: press `\` to switch between the game's camera, a camera behind Sonic along his facing and one looking down on him from above. It only changes what's drawn, not the game, so a movie plays back the same with any of them. Things the game's own camera doesn't see can still be left out. Under libTAS, `\` is recorded into the movie like the game's keys.
@@ -204,7 +218,11 @@ CodeCount=2
   - an arrow at his feet, pointing where he faces,
   - where the views don't already show them, the enemies' collision (red) and the goal ring's (white).
 
-  These are hidden behind walls; press F12 to switch to drawing them over everything, walls included, and back. Under libTAS, F11 and F12 are recorded into the movie like the game's keys. In TAS mode, the views start shown only with `UNLEASHED_TAS_HUD=1` (for example `libTASGPUHUD` or `libTASdozenHUD` from the guides), and the level starts as it normally looks without it (`libTASGPU`, `libTASdozen`): a movie without F11 presses then shows the views with the HUD and the normal level without it. Either way it plays back the same, as F11 only changes what's drawn. Turning the codes themselves off does change sync: keep them as they were when the movie was recorded.
+  These are hidden behind walls. Press F12 to draw them over everything, walls included, and again to switch back.
+
+  In TAS mode, the views start shown only with the TAS HUD on (`UNLEASHED_TAS_HUD=1`). Without the HUD, the level starts as it normally looks, and F11 shows the views. Under libTAS, F11 and F12 are recorded into the movie like the game's keys.
+
+  F11 and F12 only change what's drawn, so a movie plays back the same with the views shown or hidden. **Turning the codes themselves off does change sync**: keep them as they were when the movie was recorded.
 - **Ready... GO! skip**: `RestoreReadyGoSkip` brings back a glitch the title update fixed. Pause during a stage's in-game cutscene and restart: Sonic can move during Ready... GO!
 
 ### Keeping movies in sync
